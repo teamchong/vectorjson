@@ -5,6 +5,7 @@
 ///! a token-by-token iterator for the WAT WasmGC shim to consume.
 const std = @import("std");
 const zimdjson = @import("zimdjson");
+const simd = @import("simd.zig");
 
 // --- Allocator ---
 // WASM linear memory allocator for receiving bytes from JS/WAT shim
@@ -14,7 +15,6 @@ const gpa: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllo
 const DomParser = zimdjson.dom.FullParser(.default);
 
 var parser: DomParser = DomParser.init;
-var current_document: ?DomParser.Document = null;
 var last_error_code: i32 = 0;
 
 // --- Tape iteration state ---
@@ -76,13 +76,10 @@ export fn parse(ptr: [*]const u8, len: u32) i32 {
     last_error_code = 0;
     depth = 0;
 
-    const document = parser.parseFromSlice(gpa, ptr[0..len]) catch |err| {
+    _ = parser.parseFromSlice(gpa, ptr[0..len]) catch |err| {
         last_error_code = mapError(err);
-        current_document = null;
         return 1;
     };
-
-    current_document = document;
 
     // The tape starts at index 0 (root word), real content at index 1.
     // The root opening word at index 0 has data.ptr pointing to the closing root word.
@@ -761,7 +758,7 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
 
         // curr points to a key (string)
         const key_str = readTapeString(p, curr);
-        if (key_str.len == key_len and std.mem.eql(u8, key_str, key_ptr[0..key_len])) {
+        if (key_str.len == key_len and simd.eql(key_str.ptr, key_ptr, key_len)) {
             return curr + 1; // value is immediately after the key
         }
 
@@ -895,6 +892,92 @@ export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
         };
     }
     return count;
+}
+
+// --- Doc stringify: tape → JSON bytes in one WASM call ---
+// Walks the tape recursively, uses the existing Stringifier to produce JSON.
+// Zero cross-module calls. Zero intermediate JS strings.
+
+/// Stringify a document value at the given tape index.
+/// Initializes the stringifier, walks the tape, produces JSON bytes.
+/// Result accessible via stringify_result_ptr/len. Caller must call stringify_free.
+export fn doc_stringify(doc_id: i32, index: u32) i32 {
+    const p = getDocParser(doc_id) orelse return -1;
+    stringifier.init(gpa);
+    docStringifyValue(p, index);
+    if (stringifier.has_error) return -1;
+    return 0;
+}
+
+fn docStringifyValue(p: *DomParser, index: u32) void {
+    const word = p.tape.get(index);
+    switch (word.tag) {
+        .null => stringifier.writeNull(),
+        .true => stringifier.writeBool(1),
+        .false => stringifier.writeBool(0),
+        .unsigned => {
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            const val: f64 = @floatFromInt(@as(u64, next_raw));
+            stringifier.writeNumber(val);
+        },
+        .signed => {
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            const val: f64 = @floatFromInt(@as(i64, @bitCast(next_raw)));
+            stringifier.writeNumber(val);
+        },
+        .double => {
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            stringifier.writeNumber(@bitCast(next_raw));
+        },
+        .string => {
+            const str = readTapeString(p, index);
+            stringifier.writeString(str.ptr, @intCast(str.len));
+        },
+        .array_opening => {
+            stringifier.writeArrayStart();
+            const count = word.data.len;
+            // Walk array elements sequentially
+            var curr: u32 = index + 1;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const w = p.tape.get(curr);
+                if (w.tag == .array_closing) break;
+                docStringifyValue(p, curr);
+                // Advance past current element
+                curr = switch (w.tag) {
+                    .array_opening, .object_opening => w.data.ptr,
+                    .unsigned, .signed, .double => curr + 2,
+                    else => curr + 1,
+                };
+            }
+            stringifier.writeArrayEnd();
+        },
+        .object_opening => {
+            stringifier.writeObjectStart();
+            const count = word.data.len;
+            // Walk key-value pairs sequentially
+            var curr: u32 = index + 1;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const w = p.tape.get(curr);
+                if (w.tag == .object_closing) break;
+                // Write key
+                const key_str = readTapeString(p, curr);
+                stringifier.writeKey(key_str.ptr, @intCast(key_str.len));
+                // Write value
+                docStringifyValue(p, curr + 1);
+                // Advance past key + value
+                const val_w = p.tape.get(curr + 1);
+                curr = switch (val_w.tag) {
+                    .array_opening, .object_opening => val_w.data.ptr,
+                    .unsigned, .signed, .double => curr + 3,
+                    else => curr + 2,
+                };
+            }
+            stringifier.writeObjectEnd();
+        },
+        else => stringifier.writeNull(),
+    }
 }
 
 fn mapError(err: anytype) i32 {

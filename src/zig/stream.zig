@@ -8,6 +8,7 @@
 ///! Actual parsing via zimdjson's FullParser happens lazily when values are queried.
 
 const std = @import("std");
+const simd = @import("simd.zig");
 
 /// Feed status codes returned to JS
 pub const FeedStatus = enum(i32) {
@@ -114,14 +115,25 @@ pub const StreamState = struct {
         const buf = self.buffer orelse return;
         var i = self.scan_offset;
 
-        while (i < self.buffer_len) : (i += 1) {
-            const c = buf[i];
-
+        while (i < self.buffer_len) {
             // Stop scanning once root is complete
             if (self.root_value_completed) break;
 
+            // SIMD fast-skip for string content: scan 16 bytes at a time for '"' or '\'
+            if (self.in_string and !self.escape_next) {
+                while (i + 16 <= self.buffer_len) {
+                    const chunk: @Vector(16, u8) = (buf + i)[0..16].*;
+                    if (simd.anyMatch(&.{ '"', '\\' }, chunk)) break;
+                    i += 16;
+                }
+                if (i >= self.buffer_len) break;
+            }
+
+            const c = buf[i];
+
             if (self.escape_next) {
                 self.escape_next = false;
+                i += 1;
                 continue;
             }
 
@@ -130,11 +142,11 @@ pub const StreamState = struct {
                     self.escape_next = true;
                 } else if (c == '"') {
                     self.in_string = false;
-                    // If this closes a root-level string value
                     if (self.depth == 0 and self.root_is_string) {
                         self.markRootComplete(i + 1);
                     }
                 }
+                i += 1;
                 continue;
             }
 
@@ -198,6 +210,7 @@ pub const StreamState = struct {
                 },
                 else => {},
             }
+            i += 1;
         }
 
         self.scan_offset = i;
@@ -214,6 +227,15 @@ pub const StreamState = struct {
 
         const buf = self.buffer orelse return;
         var remaining = end_offset;
+
+        // SIMD: skip whitespace 16 bytes at a time
+        while (remaining + 16 <= self.buffer_len) {
+            const chunk: @Vector(16, u8) = (buf + remaining)[0..16].*;
+            if (!simd.allMatch(&.{ ' ', '\t', '\n', '\r' }, chunk)) break;
+            remaining += 16;
+        }
+
+        // Scalar tail
         while (remaining < self.buffer_len) : (remaining += 1) {
             const c = buf[remaining];
             if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {

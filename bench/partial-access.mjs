@@ -107,7 +107,7 @@ async function run() {
     bench(() => {
       const r = vj.parse(syntheticJson);
       const v = r.total;
-      r.close();
+      r.free(); // release doc slot for hot-loop reuse
       return v;
     })
   );
@@ -132,7 +132,7 @@ async function run() {
     bench(() => {
       const r = vj.parse(syntheticJson);
       const v = r.items[0].name;
-      r.close();
+      r.free();
       return v;
     })
   );
@@ -166,7 +166,7 @@ async function run() {
         sum += r.items[i].id;
         void r.items[i].name;
       }
-      r.close();
+      r.free();
       return sum;
     })
   );
@@ -203,7 +203,7 @@ async function run() {
         for (let i = 0; i < items.length; i++) {
           sum += items[i].id;
         }
-        r.close();
+        r.free();
         return sum;
       },
       { durationMs: 1500 }
@@ -247,7 +247,7 @@ async function run() {
       bench(() => {
         const r = vj.parse(json);
         const v = r[firstKey];
-        r.close();
+        r.free();
         return v;
       })
     );
@@ -259,7 +259,7 @@ async function run() {
     const speedupVJ = bench(() => {
       const r = vj.parse(json);
       const v = r[firstKey];
-      r.close();
+      r.free();
       return v;
     }).opsPerSec;
     console.log(

@@ -10,6 +10,7 @@
 ///!   minLength, maxLength, minItems, maxItems, enum, const
 
 const std = @import("std");
+const simd = @import("simd.zig");
 const compare_mod = @import("compare.zig");
 const TokenStream = compare_mod.TokenStream;
 const TokenReader = compare_mod.TokenReader;
@@ -728,7 +729,7 @@ fn strEql(a_ptr: [*]const u8, a_len: u32, comptime b: []const u8) bool {
 fn strEqlRaw(a_ptr: [*]const u8, a_len: u32, b_ptr: [*]const u8, b_len: u32) bool {
     if (a_len != b_len) return false;
     if (a_len == 0) return true;
-    return std.mem.eql(u8, a_ptr[0..a_len], b_ptr[0..b_len]);
+    return simd.eql(a_ptr, b_ptr, a_len);
 }
 
 /// Check if a data value matches a schema enum/const value.

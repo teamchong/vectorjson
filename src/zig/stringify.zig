@@ -6,6 +6,36 @@
 ///! and buffer management. Result read out as a flat byte slice.
 
 const std = @import("std");
+const simd = @import("simd.zig");
+
+/// Comptime-generated escape lookup table.
+/// Each byte 0-255 maps to an EscapeAction describing how to escape it.
+const EscapeAction = enum(u8) {
+    none = 0,
+    hex = 1, // \u00XX
+    quote = '"',
+    backslash = '\\',
+    newline = 'n',
+    cr = 'r',
+    tab = 't',
+    backspace = 'b',
+    formfeed = 'f',
+};
+
+const escape_lut: [256]EscapeAction = blk: {
+    var lut: [256]EscapeAction = .{.none} ** 256;
+    for (0..0x20) |i| {
+        lut[i] = .hex;
+    }
+    lut['"'] = .quote;
+    lut['\\'] = .backslash;
+    lut['\n'] = .newline;
+    lut['\r'] = .cr;
+    lut['\t'] = .tab;
+    lut[0x08] = .backspace;
+    lut[0x0C] = .formfeed;
+    break :blk lut;
+};
 
 const MAX_DEPTH = 256;
 const MAX_OUTPUT_SIZE = 64 * 1024 * 1024; // 64 MB
@@ -187,28 +217,46 @@ pub const Stringifier = struct {
     fn writeEscapedString(self: *Stringifier, ptr: [*]const u8, len: u32) void {
         self.appendByte('"');
         const data = ptr[0..len];
-        for (data) |c| {
-            switch (c) {
-                '"' => self.appendSlice("\\\""),
-                '\\' => self.appendSlice("\\\\"),
-                '\n' => self.appendSlice("\\n"),
-                '\r' => self.appendSlice("\\r"),
-                '\t' => self.appendSlice("\\t"),
-                0x08 => self.appendSlice("\\b"),
-                0x0C => self.appendSlice("\\f"),
-                else => {
-                    if (c < 0x20) {
-                        // Control character → \u00XX
-                        self.appendSlice("\\u00");
-                        self.appendHexNibble(c >> 4);
-                        self.appendHexNibble(c & 0x0F);
-                    } else {
-                        self.appendByte(c);
-                    }
-                },
+        var i: u32 = 0;
+
+        // SIMD: scan 16 bytes at a time for characters needing escaping
+        while (i + 16 <= len) {
+            const chunk: @Vector(16, u8) = data[i..][0..16].*;
+            if (simd.anyMatchOrBelow(&.{ '"', '\\' }, 0x20, chunk)) {
+                // At least one byte needs escaping — scalar fallback for this chunk
+                for (data[i..][0..16]) |c| {
+                    self.writeEscapedByte(c);
+                }
+            } else {
+                // All 16 bytes are safe — bulk copy
+                self.appendSlice(data[i..][0..16]);
             }
+            i += 16;
         }
+
+        // Scalar tail
+        while (i < len) : (i += 1) {
+            self.writeEscapedByte(data[i]);
+        }
+
         self.appendByte('"');
+    }
+
+    /// Write a single byte with JSON escaping using comptime LUT
+    fn writeEscapedByte(self: *Stringifier, c: u8) void {
+        const action = escape_lut[c];
+        switch (action) {
+            .none => self.appendByte(c),
+            .hex => {
+                self.appendSlice("\\u00");
+                self.appendHexNibble(c >> 4);
+                self.appendHexNibble(c & 0x0F);
+            },
+            else => {
+                self.appendByte('\\');
+                self.appendByte(@intFromEnum(action));
+            },
+        }
     }
 
     fn appendHexNibble(self: *Stringifier, nibble: u8) void {

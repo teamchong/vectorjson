@@ -12,6 +12,7 @@
 ///! Array comparison is index-based: [1,2,3] vs [1,3] has changes at [1] and removal at [2].
 
 const std = @import("std");
+const simd = @import("simd.zig");
 
 /// Token types in serialized stream
 pub const TokenTag = enum(u8) {
@@ -230,15 +231,7 @@ pub const TokenReader = struct {
         }
     }
 
-    /// Save current position (for backtracking during object key lookup)
-    pub fn savePos(self: *const TokenReader) u32 {
-        return self.pos;
-    }
-
-    /// Restore position
-    pub fn restorePos(self: *TokenReader, saved: u32) void {
-        self.pos = saved;
-    }
+    // savePos/restorePos removed — unused (unordered compare collects keys upfront)
 };
 
 /// Key-value entry for object comparison
@@ -698,5 +691,5 @@ fn classifyType(tag: TokenTag) u8 {
 fn strEqual(a_ptr: [*]const u8, a_len: u32, b_ptr: [*]const u8, b_len: u32) bool {
     if (a_len != b_len) return false;
     if (a_len == 0) return true;
-    return std.mem.eql(u8, a_ptr[0..a_len], b_ptr[0..b_len]);
+    return simd.eql(a_ptr, b_ptr, a_len);
 }

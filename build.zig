@@ -109,6 +109,8 @@ pub fn build(b: *std.Build) void {
         "doc_batch_ptr",
         "doc_array_elements",
         "doc_object_keys",
+        // Doc stringify (tape → JSON bytes, one call)
+        "doc_stringify",
     };
 
     // Install to zig-out/bin/engine.wasm

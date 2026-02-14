@@ -1,0 +1,12 @@
+{
+  "name": "vectorjson-vercel-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun --expose-gc bench.mjs"
+  },
+  "dependencies": {
+    "ai": "latest",
+    "@ai-sdk/openai": "latest"
+  }
+}

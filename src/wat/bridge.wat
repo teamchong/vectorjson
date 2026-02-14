@@ -334,6 +334,139 @@
       (br $loop)))
     (ref.null extern))
 
+  ;; Compare two GC byte arrays for equality (no JS strings created)
+  (func $gc_bytes_equal (param $a (ref $ByteArray)) (param $b (ref $ByteArray)) (result i32)
+    (local $len i32) (local $i i32)
+    (local.set $len (array.len (local.get $a)))
+    (if (i32.ne (local.get $len) (array.len (local.get $b)))
+      (then (return (i32.const 0))))
+    (local.set $i (i32.const 0))
+    (block $done (loop $loop
+      (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+      (if (i32.ne
+            (array.get_u $ByteArray (local.get $a) (local.get $i))
+            (array.get_u $ByteArray (local.get $b) (local.get $i)))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+    (i32.const 1))
+
+  ;; Create a $JsonString GC struct from linear memory bytes.
+  ;; Used by the doc-slot path to wrap string values as WasmString
+  ;; without building the full GC tree. The GC byte array survives
+  ;; even after the doc slot is freed.
+  (func (export "createGCString") (param $ptr i32) (param $len i32) (result externref)
+    (extern.convert_any
+      (struct.new $JsonString
+        (call $copy_to_gc (local.get $ptr) (local.get $len)))))
+
+  ;; Compare two $JsonString externrefs for equality without creating JS strings
+  (func (export "gcStringEquals") (param $ref1 externref) (param $ref2 externref) (result i32)
+    (local $v1 (ref null any)) (local $v2 (ref null any))
+    (local.set $v1 (any.convert_extern (local.get $ref1)))
+    (local.set $v2 (any.convert_extern (local.get $ref2)))
+    (if (i32.eqz (ref.test (ref $JsonString) (local.get $v1)))
+      (then (return (i32.const 0))))
+    (if (i32.eqz (ref.test (ref $JsonString) (local.get $v2)))
+      (then (return (i32.const 0))))
+    (call $gc_bytes_equal
+      (struct.get $JsonString $bytes (ref.cast (ref $JsonString) (local.get $v1)))
+      (struct.get $JsonString $bytes (ref.cast (ref $JsonString) (local.get $v2)))))
+
+  ;; ============================================================
+  ;; GC Stringify — walk GC tree, produce JSON bytes in engine memory
+  ;; Zero JS calls. One WASM call from JS → full JSON output.
+  ;; ============================================================
+
+  (func $gc_stringify_value (param $ref (ref null $JsonValue))
+    (local $arr (ref $JsonArray)) (local $obj (ref $JsonObject))
+    (local $count i32) (local $i i32) (local $str (ref $ByteArray))
+    (local $str_ptr i32) (local $str_len i32)
+
+    ;; null
+    (if (ref.is_null (local.get $ref))
+      (then (call $engine_stringify_null) (return)))
+    (if (ref.test (ref $JsonNull) (local.get $ref))
+      (then (call $engine_stringify_null) (return)))
+
+    ;; bool
+    (if (ref.test (ref $JsonBool) (local.get $ref)) (then
+      (call $engine_stringify_bool
+        (struct.get $JsonBool $val (ref.cast (ref $JsonBool) (local.get $ref))))
+      (return)))
+
+    ;; number
+    (if (ref.test (ref $JsonNumber) (local.get $ref)) (then
+      (call $engine_stringify_number
+        (struct.get $JsonNumber $val (ref.cast (ref $JsonNumber) (local.get $ref))))
+      (return)))
+
+    ;; string — copy GC bytes to linear memory, call stringify_string
+    (if (ref.test (ref $JsonString) (local.get $ref)) (then
+      (local.set $str (struct.get $JsonString $bytes (ref.cast (ref $JsonString) (local.get $ref))))
+      (local.set $str_len (array.len (local.get $str)))
+      (if (i32.eqz (local.get $str_len))
+        (then
+          (call $engine_stringify_string (i32.const 1) (i32.const 0))
+          (return)))
+      (local.set $str_ptr (call $engine_alloc (local.get $str_len)))
+      (call $copy_from_gc (local.get $str) (local.get $str_ptr))
+      (call $engine_stringify_string (local.get $str_ptr) (local.get $str_len))
+      (call $engine_dealloc (local.get $str_ptr) (local.get $str_len))
+      (return)))
+
+    ;; array
+    (if (ref.test (ref $JsonArray) (local.get $ref)) (then
+      (local.set $arr (ref.cast (ref $JsonArray) (local.get $ref)))
+      (local.set $count (struct.get $JsonArray $count (local.get $arr)))
+      (call $engine_stringify_array_start)
+      (local.set $i (i32.const 0))
+      (block $done (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+        (call $gc_stringify_value
+          (array.get $ValueArray (struct.get $JsonArray $items (local.get $arr)) (local.get $i)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+      (call $engine_stringify_array_end)
+      (return)))
+
+    ;; object
+    (if (ref.test (ref $JsonObject) (local.get $ref)) (then
+      (local.set $obj (ref.cast (ref $JsonObject) (local.get $ref)))
+      (local.set $count (struct.get $JsonObject $count (local.get $obj)))
+      (call $engine_stringify_object_start)
+      (local.set $i (i32.const 0))
+      (block $done (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+        ;; Write key: copy key bytes to linear memory
+        (local.set $str (struct.get $KeyEntry $bytes (ref.cast (ref $KeyEntry)
+          (array.get $KeyArray (struct.get $JsonObject $keys (local.get $obj)) (local.get $i)))))
+        (local.set $str_len (array.len (local.get $str)))
+        (if (i32.eqz (local.get $str_len))
+          (then (call $engine_stringify_key (i32.const 1) (i32.const 0)))
+          (else
+            (local.set $str_ptr (call $engine_alloc (local.get $str_len)))
+            (call $copy_from_gc (local.get $str) (local.get $str_ptr))
+            (call $engine_stringify_key (local.get $str_ptr) (local.get $str_len))
+            (call $engine_dealloc (local.get $str_ptr) (local.get $str_len))))
+        ;; Write value
+        (call $gc_stringify_value
+          (array.get $ValueArray (struct.get $JsonObject $values (local.get $obj)) (local.get $i)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)))
+      (call $engine_stringify_object_end)
+      (return)))
+
+    ;; fallback
+    (call $engine_stringify_null))
+
+  ;; Public export: stringify a GC value tree → JSON bytes
+  ;; Call stringify_result_ptr/len to get the result. Caller must call stringify_free.
+  (func (export "gcStringify") (param $ref externref)
+    (call $engine_stringify_init)
+    (call $gc_stringify_value
+      (ref.cast (ref null $JsonValue) (any.convert_extern (local.get $ref)))))
+
   ;; ============================================================
   ;; Memory management
   ;; ============================================================
