@@ -1,0 +1,37 @@
+{
+  "name": "vectorjson",
+  "version": "0.1.0",
+  "description": "SIMD-accelerated JSON parser with WasmGC bridge — streaming, zero-copy, GC-managed results",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build:zig": "zig build -Doptimize=ReleaseFast",
+    "build:wat": "wasm-tools parse src/wat/bridge.wat -o dist/bridge.wasm",
+    "build:js": "bun x tsc",
+    "build": "bun run build:zig && bun run build:wat && bun run build:js",
+    "test": "bun test/basic.mjs",
+    "bench": "bun --expose-gc bench/parse-stream.mjs && bun --expose-gc bench/stringify-loop.mjs && bun --expose-gc bench/deep-compare.mjs",
+    "bench:parse": "bun --expose-gc bench/parse-stream.mjs",
+    "bench:stringify": "bun --expose-gc bench/stringify-loop.mjs",
+    "bench:compare": "bun --expose-gc bench/deep-compare.mjs",
+    "bench:stress": "bun --expose-gc bench/stress-test.mjs",
+    "bench:all": "bun --expose-gc bench/parse-stream.mjs && bun --expose-gc bench/stringify-loop.mjs && bun --expose-gc bench/deep-compare.mjs && bun --expose-gc bench/stress-test.mjs"
+  },
+  "keywords": [
+    "json",
+    "parser",
+    "wasm",
+    "simd",
+    "streaming",
+    "wasmgc"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.7.0"
+  }
+}

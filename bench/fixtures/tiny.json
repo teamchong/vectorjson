@@ -1,0 +1,1 @@
+{"host":"localhost","port":8080,"debug":false,"maxRetries":3,"timeout":30000,"logLevel":"info"}
