@@ -2,13 +2,21 @@
  * VectorJSON — SIMD-accelerated JSON parser with WasmGC bridge
  *
  * Architecture:
- *   JS bytes → [WAT bridge] → [Zig + zimdjson SIMD] → tape → WasmGC tree → JS Proxy
+ *   JS bytes → [Zig + zimdjson SIMD] → tape → lazy Proxy over doc slots
+ *   Streaming: JS chunks → [WAT bridge] → GC tree → lazy Proxy over externref
  *
  * The Zig engine (engine.wasm) parses JSON bytes into an internal tape format
- * using SIMD-accelerated algorithms from zimdjson. The WAT bridge (bridge.wasm)
- * reads the tape and builds a GC-managed object tree (struct.new / array.new).
- * JS receives lazy Proxy objects backed by WasmGC — values materialize only
- * when accessed. No .dispose(), no dual paths. One code path: GC only.
+ * using SIMD-accelerated algorithms from zimdjson.
+ *
+ * Primary parse path: doc-slot (tape-direct navigation via Zig exports).
+ *   FinalizationRegistry auto-frees doc slots when the Proxy is GC'd.
+ *   Users CAN call .free() to release immediately if desired.
+ *
+ * Streaming path: WAT bridge builds a GC-managed object tree from tape.
+ *
+ * String values are returned as WasmString objects — bytes stay in WasmGC
+ * memory (array i8), never creating intermediate JS strings unless
+ * explicitly requested via .toString().
  */
 
 import { readFile } from "node:fs/promises";
@@ -57,14 +65,17 @@ export interface StreamingParser {
 
 export interface VectorJSON {
   /**
-   * Parse a JSON string or Uint8Array into a lazy zero-copy value backed by WasmGC.
-   * Primitives (null, boolean, number, string) are returned directly.
+   * Parse a JSON string or Uint8Array into a value.
+   * Primitives (null, boolean, number) are returned directly as JS values.
+   * Strings are returned as WasmString objects (bytes stay in WasmGC memory).
    * Objects and arrays return Proxy objects — values materialize only when accessed.
-   * Supports natural JS syntax: result.items[0].name
+   * Call .free() on the result to release resources immediately, or let
+   * FinalizationRegistry handle it automatically when the Proxy is GC'd.
    */
   parse(input: string | Uint8Array): unknown;
   /**
    * Eagerly materialize a lazy proxy into plain JS objects.
+   * WasmString values are converted to JS strings.
    * If the value is already a plain JS value, returns it as-is.
    */
   materialize(value: unknown): unknown;
@@ -80,6 +91,8 @@ export interface VectorJSON {
   ): DiffEntry[];
   /** Create a streaming parser for incremental parsing. */
   createParser(): StreamingParser;
+  /** Check if a value is a WasmString */
+  isWasmString(value: unknown): value is WasmString;
 }
 
 // --- Error codes from Zig engine ---
@@ -207,6 +220,12 @@ interface BridgeExports {
   gcCopyObjectKey(ref: unknown, idx: number, dst: number): void;
   gcGetObjectValue(ref: unknown, idx: number): unknown;
   gcFindProperty(ref: unknown, keyPtr: number, keyLen: number): unknown;
+  // GC String creation (from linear memory bytes → GC $JsonString)
+  createGCString(ptr: number, len: number): unknown;
+  // GC String equality (no JS strings created)
+  gcStringEquals(ref1: unknown, ref2: unknown): number;
+  // GC Stringify (walk GC tree → JSON bytes in one WASM call)
+  gcStringify(ref: unknown): void;
   // Streaming
   streamCreate(): number;
   streamDestroy(id: number): void;
@@ -247,6 +266,102 @@ interface BridgeExports {
   compareDiffPathLen(index: number): number;
   compareDiffType(index: number): number;
   compareFree(): void;
+}
+
+// --- WasmString: string data stays in WasmGC memory ---
+
+const WASM_STRING_BRAND = Symbol("vectorjson.WasmString");
+
+/**
+ * A string backed by WasmGC memory (array i8).
+ * No JS string is created at parse time — bytes stay in WASM.
+ * Call .toString() to materialize a JS string when needed.
+ * Supports automatic coercion via Symbol.toPrimitive for
+ * template literals, loose comparison, and console.log.
+ */
+export class WasmString {
+  /** @internal WasmGC externref to a $JsonString struct */
+  readonly _ref: unknown;
+  /** @internal Cached byte length */
+  readonly _len: number;
+  /** @internal Cached JS string (created lazily on first toString()) */
+  _cached: string | null = null;
+  /** @internal Brand for instanceof-free type checking */
+  readonly [WASM_STRING_BRAND] = true;
+
+  /** @internal */
+  constructor(
+    ref: unknown,
+    len: number,
+    private _bridge: BridgeExports,
+    private _engine: EngineExports,
+    private _decoder: TextDecoder,
+  ) {
+    this._ref = ref;
+    this._len = len;
+  }
+
+  /** Byte length of the UTF-8 string data */
+  get byteLength(): number {
+    return this._len;
+  }
+
+  /** Raw UTF-8 bytes (copies from WasmGC to a new Uint8Array) */
+  get bytes(): Uint8Array {
+    if (this._len === 0) return new Uint8Array(0);
+    const ptr = this._bridge.alloc(this._len);
+    if (ptr === 0) throw new Error("VectorJSON: Failed to allocate for bytes");
+    try {
+      this._bridge.gcCopyString(this._ref, ptr);
+      const result = new Uint8Array(this._len);
+      result.set(new Uint8Array(this._engine.memory.buffer, ptr, this._len));
+      return result;
+    } finally {
+      this._bridge.dealloc(ptr, this._len);
+    }
+  }
+
+  /** Materialize a JS string. Cached after first call. */
+  toString(): string {
+    if (this._cached !== null) return this._cached;
+    if (this._len === 0) {
+      this._cached = "";
+      return "";
+    }
+    const ptr = this._bridge.alloc(this._len);
+    if (ptr === 0) throw new Error("VectorJSON: Failed to allocate for string");
+    try {
+      this._bridge.gcCopyString(this._ref, ptr);
+      this._cached = this._decoder.decode(
+        new Uint8Array(this._engine.memory.buffer, ptr, this._len),
+      );
+      return this._cached;
+    } finally {
+      this._bridge.dealloc(ptr, this._len);
+    }
+  }
+
+  /** Compare two WasmStrings in WASM without creating JS strings */
+  equals(other: WasmString): boolean {
+    if (!(WASM_STRING_BRAND in other)) return false;
+    if (this._len !== other._len) return false;
+    if (this._len === 0) return true;
+    return this._bridge.gcStringEquals(this._ref, other._ref) !== 0;
+  }
+
+  /** Auto-coerce to JS string for template literals, loose comparison, etc. */
+  [Symbol.toPrimitive](_hint: string): string {
+    return this.toString();
+  }
+
+  /** For JSON.stringify compatibility */
+  toJSON(): string {
+    return this.toString();
+  }
+
+  valueOf(): string {
+    return this.toString();
+  }
 }
 
 let _instance: VectorJSON | null = null;
@@ -403,6 +518,24 @@ export async function init(options?: {
       return;
     }
 
+    // Handle WasmString — write its bytes directly without creating JS string
+    if (value instanceof WasmString) {
+      const ws = value;
+      if (ws._len === 0) {
+        bridge.stringifyString(1, 0);
+        return;
+      }
+      const ptr = bridge.alloc(ws._len);
+      if (ptr === 0) throw new Error("VectorJSON: allocation failed");
+      try {
+        bridge.gcCopyString(ws._ref, ptr);
+        bridge.stringifyString(ptr, ws._len);
+      } finally {
+        bridge.dealloc(ptr, ws._len);
+      }
+      return;
+    }
+
     switch (typeof value) {
       case "boolean":
         bridge.stringifyBool(value ? 1 : 0);
@@ -527,7 +660,47 @@ export async function init(options?: {
     const len = engine.doc_get_string_len(docId, index);
     if (len === 0) return "";
     const ptr = engine.doc_get_string_ptr(docId, index);
+    // Guard: if the doc was freed between the len/ptr calls (race with
+    // FinalizationRegistry), the pointer may be stale/out-of-bounds.
+    if (ptr < 0 || ptr + len > engine.memory.buffer.byteLength) return "";
     return readString(ptr, len);
+  }
+
+  // --- Read a doc string → WasmGC $JsonString externref → WasmString ---
+  // Copies bytes from doc slot into GC memory so the WasmString survives doc_free.
+  function docStringToGC(docId: number, index: number): WasmString {
+    const len = engine.doc_get_string_len(docId, index);
+    if (len === 0) {
+      const ref = bridge.createGCString(1, 0);
+      return new WasmString(ref, 0, bridge, engine, decoder);
+    }
+    const ptr = engine.doc_get_string_ptr(docId, index);
+    // Guard: stale pointer after doc was freed between len/ptr calls
+    if (ptr < 0 || ptr + len > engine.memory.buffer.byteLength) {
+      const ref = bridge.createGCString(1, 0);
+      return new WasmString(ref, 0, bridge, engine, decoder);
+    }
+    const ref = bridge.createGCString(ptr, len);
+    return new WasmString(ref, len, bridge, engine, decoder);
+  }
+
+  // --- Config interfaces for shared proxy factories ---
+
+  interface ArrayProxyConfig {
+    length: number;
+    getItem(idx: number): unknown;
+    materialize(): unknown;
+    lazyHandle: unknown;
+    free?: () => void;
+  }
+
+  interface ObjectProxyConfig {
+    getKeys(): string[];
+    getProp(key: string): unknown;
+    hasProp(key: string): boolean;
+    materialize(): unknown;
+    lazyHandle: unknown;
+    free?: () => void;
   }
 
   // --- Deep materialize from document tape ---
@@ -545,17 +718,10 @@ export async function init(options?: {
       case TAG_STRING:
         return docReadString(docId, index);
       case TAG_ARRAY: {
-        // Batch-read all element indices in one WASM call
         const count = engine.doc_array_elements(docId, index);
         const batchPtr = engine.doc_batch_ptr();
-        const indices = new Uint32Array(
-          engine.memory.buffer,
-          batchPtr,
-          count,
-        );
-        // Copy indices before recursive calls (batch buffer is shared)
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(indices);
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         const arr: unknown[] = [];
         for (let i = 0; i < count; i++) {
           arr.push(deepMaterializeDoc(docId, idxCopy[i]));
@@ -563,27 +729,112 @@ export async function init(options?: {
         return arr;
       }
       case TAG_OBJECT: {
-        // Batch-read all key indices in one WASM call
         const count = engine.doc_object_keys(docId, index);
         const batchPtr = engine.doc_batch_ptr();
-        const indices = new Uint32Array(
-          engine.memory.buffer,
-          batchPtr,
-          count,
-        );
-        // Copy indices before recursive calls (batch buffer is shared)
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(indices);
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         const obj: Record<string, unknown> = {};
         for (let i = 0; i < count; i++) {
-          const key = docReadString(docId, idxCopy[i]);
-          obj[key] = deepMaterializeDoc(docId, idxCopy[i] + 1);
+          obj[docReadString(docId, idxCopy[i])] = deepMaterializeDoc(docId, idxCopy[i] + 1);
         }
         return obj;
       }
       default:
         return null;
     }
+  }
+
+  // --- Shared Proxy factories ---
+
+  function createArrayProxy(config: ArrayProxyConfig): unknown[] {
+    return new Proxy([] as unknown[], {
+      get(_target, prop, _receiver) {
+        if (prop === "free" || prop === Symbol.dispose) {
+          return config.free;
+        }
+        if (prop === LAZY_PROXY) return config.lazyHandle;
+        if (prop === "length") return config.length;
+        if (prop === Symbol.iterator) {
+          return function* () {
+            for (let i = 0; i < config.length; i++) {
+              yield config.getItem(i);
+            }
+          };
+        }
+        if (prop === Symbol.toPrimitive) return undefined;
+        if (prop === "toJSON") return () => config.materialize();
+        if (typeof prop === "string") {
+          const idx = Number(prop);
+          if (Number.isInteger(idx) && idx >= 0 && idx < config.length) {
+            return config.getItem(idx);
+          }
+        }
+        if (prop === Symbol.toStringTag) return "Array";
+        if (typeof prop === "string" && prop in Array.prototype) {
+          const materialized = config.materialize() as unknown[];
+          return (materialized as unknown as Record<string, unknown>)[prop];
+        }
+        return undefined;
+      },
+      has(_target, prop) {
+        if (prop === LAZY_PROXY) return true;
+        if (prop === "length") return true;
+        if (typeof prop === "string") {
+          const idx = Number(prop);
+          if (Number.isInteger(idx) && idx >= 0 && idx < config.length) return true;
+        }
+        return false;
+      },
+      ownKeys() {
+        const keys: string[] = [];
+        for (let i = 0; i < config.length; i++) keys.push(String(i));
+        keys.push("length");
+        return keys;
+      },
+      getOwnPropertyDescriptor(_target, prop) {
+        if (prop === "length") {
+          return { value: config.length, writable: false, enumerable: false, configurable: false };
+        }
+        if (typeof prop === "string") {
+          const idx = Number(prop);
+          if (Number.isInteger(idx) && idx >= 0 && idx < config.length) {
+            return { value: config.getItem(idx), writable: false, enumerable: true, configurable: true };
+          }
+        }
+        return undefined;
+      },
+    });
+  }
+
+  function createObjectProxy(config: ObjectProxyConfig): Record<string, unknown> {
+    return new Proxy({} as Record<string, unknown>, {
+      get(_target, prop, _receiver) {
+        if (prop === "free" || prop === Symbol.dispose) {
+          return config.free;
+        }
+        if (prop === LAZY_PROXY) return config.lazyHandle;
+        if (prop === Symbol.toPrimitive) return undefined;
+        if (prop === Symbol.toStringTag) return "Object";
+        if (prop === "toJSON") return () => config.materialize();
+        if (typeof prop === "string") {
+          return config.getProp(prop);
+        }
+        return undefined;
+      },
+      has(_target, prop) {
+        if (prop === LAZY_PROXY) return true;
+        if (typeof prop !== "string") return false;
+        return config.hasProp(prop);
+      },
+      ownKeys() {
+        return config.getKeys();
+      },
+      getOwnPropertyDescriptor(_target, prop) {
+        if (typeof prop !== "string") return undefined;
+        if (!config.hasProp(prop)) return undefined;
+        return { value: config.getProp(prop), writable: false, enumerable: true, configurable: true };
+      },
+    });
   }
 
   // --- Wrap a document tape value in a lazy Proxy ---
@@ -603,132 +854,60 @@ export async function init(options?: {
     if (tag === TAG_TRUE) return true;
     if (tag === TAG_FALSE) return false;
     if (tag === TAG_NUMBER) return engine.doc_get_number(docId, index);
-    if (tag === TAG_STRING) return docReadString(docId, index);
+    if (tag === TAG_STRING) return docStringToGC(docId, index);
 
-    // Array — return lazy Proxy with batch element index precomputation
+    const freeFn = () => {
+      void keepAlive; // prevent GC of sentinel
+      if (docGenerations.get(docId) !== generation) return;
+      docGenerations.delete(docId);
+      engine.doc_free(docId);
+      docRegistry.unregister(keepAlive);
+    };
+
     if (tag === TAG_ARRAY) {
       const length = engine.doc_get_count(docId, index);
 
-      // Batch-read all element tape indices in ONE WASM call (O(N) total)
+      // Batch-read element tape indices lazily in ONE WASM call
       let elemIndices: Uint32Array | null = null;
       const getElemIndices = (): Uint32Array => {
         if (elemIndices === null) {
           const count = engine.doc_array_elements(docId, index);
           const batchPtr = engine.doc_batch_ptr();
-          // Copy from WASM memory (buffer may be reused by next batch call)
           elemIndices = new Uint32Array(count);
-          elemIndices.set(
-            new Uint32Array(engine.memory.buffer, batchPtr, count),
-          );
+          elemIndices.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         }
         return elemIndices;
       };
 
       const elemCache = new Map<number, unknown>();
 
-      const getElem = (idx: number): unknown => {
-        let cached = elemCache.get(idx);
-        if (cached !== undefined) return cached;
-        const indices = getElemIndices();
-        if (idx < indices.length) {
-          cached = wrapDoc(docId, indices[idx], keepAlive, generation);
-        } else {
-          // Fallback for arrays > 16K elements
-          const elemIdx = engine.doc_array_at(docId, index, idx);
-          if (elemIdx === 0) return undefined;
-          cached = wrapDoc(docId, elemIdx, keepAlive, generation);
-        }
-        elemCache.set(idx, cached);
-        return cached;
-      };
-
-      const proxy = new Proxy([] as unknown[], {
-        get(_target, prop, _receiver) {
-          void keepAlive; // prevent GC of sentinel
-          if (prop === "close" || prop === Symbol.dispose) {
-            return () => freeDocIfCurrent(docId, generation);
-          }
-          if (prop === LAZY_PROXY) return { docId, index };
-          if (prop === "length") return length;
-          if (prop === Symbol.iterator) {
-            return function* () {
-              for (let i = 0; i < length; i++) {
-                yield getElem(i);
-              }
-            };
-          }
-          if (prop === Symbol.toPrimitive) return undefined;
-          if (prop === "toJSON") {
-            return () => deepMaterializeDoc(docId, index);
-          }
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) {
-              return getElem(idx);
-            }
-          }
-          // Support Array.isArray check
-          if (prop === Symbol.toStringTag) return "Array";
-          // For Array methods (map, filter, etc.), materialize first
-          if (typeof prop === "string" && prop in Array.prototype) {
-            const materialized = deepMaterializeDoc(docId, index) as unknown[];
-            return (materialized as unknown as Record<string, unknown>)[prop];
-          }
-          return undefined;
-        },
-        has(_target, prop) {
+      return createArrayProxy({
+        length,
+        getItem(idx: number): unknown {
           void keepAlive;
-          if (prop === LAZY_PROXY) return true;
-          if (prop === "length") return true;
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) return true;
+          let cached = elemCache.get(idx);
+          if (cached !== undefined) return cached;
+          const indices = getElemIndices();
+          if (idx < indices.length) {
+            cached = wrapDoc(docId, indices[idx], keepAlive, generation);
+          } else {
+            const elemIdx = engine.doc_array_at(docId, index, idx);
+            if (elemIdx === 0) return undefined;
+            cached = wrapDoc(docId, elemIdx, keepAlive, generation);
           }
-          return false;
+          elemCache.set(idx, cached);
+          return cached;
         },
-        ownKeys() {
-          void keepAlive;
-          const keys: string[] = [];
-          for (let i = 0; i < length; i++) keys.push(String(i));
-          keys.push("length");
-          return keys;
-        },
-        getOwnPropertyDescriptor(_target, prop) {
-          void keepAlive;
-          if (prop === "length") {
-            return {
-              value: length,
-              writable: false,
-              enumerable: false,
-              configurable: false,
-            };
-          }
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) {
-              return {
-                value: getElem(idx),
-                writable: false,
-                enumerable: true,
-                configurable: true,
-              };
-            }
-          }
-          return undefined;
-        },
+        materialize: () => deepMaterializeDoc(docId, index),
+        lazyHandle: { docId, index },
+        free: freeFn,
       });
-      return proxy;
     }
 
-    // Object — return lazy Proxy with batch key index precomputation
     if (tag === TAG_OBJECT) {
-      const count = engine.doc_get_count(docId, index);
       const propCache = new Map<string, unknown>();
-      // Sentinel for "key not found" (distinct from undefined values)
       const NOT_FOUND = Symbol();
 
-      // Batch-read all key tape indices in ONE WASM call
-      let keyIndices: Uint32Array | null = null;
       let _keys: string[] | null = null;
       let _keyToValIdx: Map<string, number> | null = null;
 
@@ -736,82 +915,44 @@ export async function init(options?: {
         if (_keyToValIdx !== null) return;
         const kCount = engine.doc_object_keys(docId, index);
         const batchPtr = engine.doc_batch_ptr();
-        keyIndices = new Uint32Array(kCount);
-        keyIndices.set(
-          new Uint32Array(engine.memory.buffer, batchPtr, kCount),
-        );
+        const keyIndices = new Uint32Array(kCount);
+        keyIndices.set(new Uint32Array(engine.memory.buffer, batchPtr, kCount));
         _keys = [];
         _keyToValIdx = new Map();
         for (let i = 0; i < kCount; i++) {
           const k = docReadString(docId, keyIndices[i]);
           _keys.push(k);
-          _keyToValIdx.set(k, keyIndices[i] + 1); // value is key + 1
+          _keyToValIdx.set(k, keyIndices[i] + 1);
         }
       };
 
-      const getKeys = (): string[] => {
-        buildKeyMap();
-        return _keys!;
-      };
-
-      const getProp = (key: string): unknown => {
-        const cached = propCache.get(key);
-        if (cached !== undefined) return cached === NOT_FOUND ? undefined : cached;
-        buildKeyMap();
-        const valIdx = _keyToValIdx!.get(key);
-        if (valIdx === undefined) {
-          propCache.set(key, NOT_FOUND);
-          return undefined;
-        }
-        const wrapped = wrapDoc(docId, valIdx, keepAlive, generation);
-        propCache.set(key, wrapped);
-        return wrapped;
-      };
-
-      const proxy = new Proxy({} as Record<string, unknown>, {
-        get(_target, prop, _receiver) {
-          void keepAlive;
-          if (prop === "close" || prop === Symbol.dispose) {
-            return () => freeDocIfCurrent(docId, generation);
-          }
-          if (prop === LAZY_PROXY) return { docId, index };
-          if (prop === Symbol.toPrimitive) return undefined;
-          if (prop === Symbol.toStringTag) return "Object";
-          if (prop === "toJSON") {
-            return () => deepMaterializeDoc(docId, index);
-          }
-          if (typeof prop === "string") {
-            return getProp(prop);
-          }
-          return undefined;
-        },
-        has(_target, prop) {
-          void keepAlive;
-          if (prop === LAZY_PROXY) return true;
-          if (typeof prop !== "string") return false;
-          // Use the batch key map — no WASM call for known keys
+      return createObjectProxy({
+        getKeys(): string[] {
           buildKeyMap();
-          return _keyToValIdx!.has(prop);
+          return _keys!;
         },
-        ownKeys() {
+        getProp(key: string): unknown {
           void keepAlive;
-          return getKeys();
+          const cached = propCache.get(key);
+          if (cached !== undefined) return cached === NOT_FOUND ? undefined : cached;
+          buildKeyMap();
+          const valIdx = _keyToValIdx!.get(key);
+          if (valIdx === undefined) {
+            propCache.set(key, NOT_FOUND);
+            return undefined;
+          }
+          const wrapped = wrapDoc(docId, valIdx, keepAlive, generation);
+          propCache.set(key, wrapped);
+          return wrapped;
         },
-        getOwnPropertyDescriptor(_target, prop) {
-          void keepAlive;
-          if (typeof prop !== "string") return undefined;
-          const val = getProp(prop);
-          // getProp caches NOT_FOUND for missing keys
-          if (propCache.get(prop) === NOT_FOUND) return undefined;
-          return {
-            value: val,
-            writable: false,
-            enumerable: true,
-            configurable: true,
-          };
+        hasProp(key: string): boolean {
+          buildKeyMap();
+          return _keyToValIdx!.has(key);
         },
+        materialize: () => deepMaterializeDoc(docId, index),
+        lazyHandle: { docId, index },
+        free: freeFn,
       });
-      return proxy;
     }
 
     return null;
@@ -847,6 +988,7 @@ export async function init(options?: {
     }
   }
 
+  // --- Deep materialize from GC tree ---
   function deepMaterialize(ref: unknown): unknown {
     if (ref === null || ref === undefined) return null;
     const tag = bridge.gcGetTag(ref);
@@ -871,8 +1013,7 @@ export async function init(options?: {
         const count = bridge.gcGetObjectLen(ref);
         const obj: Record<string, unknown> = {};
         for (let i = 0; i < count; i++) {
-          const key = gcReadObjectKey(ref, i);
-          obj[key] = deepMaterialize(bridge.gcGetObjectValue(ref, i));
+          obj[gcReadObjectKey(ref, i)] = deepMaterialize(bridge.gcGetObjectValue(ref, i));
         }
         return obj;
       }
@@ -887,109 +1028,43 @@ export async function init(options?: {
     if (tag === GC_NULL) return null;
     if (tag === GC_BOOL) return bridge.gcGetBool(ref) !== 0;
     if (tag === GC_NUMBER) return bridge.gcGetNumber(ref);
-    if (tag === GC_STRING) return gcReadString(ref);
-    if (tag === GC_ARRAY) {
-      const length = bridge.gcGetArrayLen(ref);
-      const proxy = new Proxy([] as unknown[], {
-        get(_target, prop, _receiver) {
-          if (prop === LAZY_PROXY) return { gcRef: ref };
-          if (prop === "length") return length;
-          if (prop === Symbol.iterator) {
-            return function* () {
-              for (let i = 0; i < length; i++) {
-                yield wrapGC(bridge.gcGetArrayItem(ref, i));
-              }
-            };
-          }
-          if (prop === Symbol.toPrimitive) return undefined;
-          if (prop === "toJSON") return () => deepMaterialize(ref);
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) {
-              return wrapGC(bridge.gcGetArrayItem(ref, idx));
-            }
-          }
-          if (prop === Symbol.toStringTag) return "Array";
-          if (typeof prop === "string" && prop in Array.prototype) {
-            const materialized = deepMaterialize(ref) as unknown[];
-            return (materialized as unknown as Record<string, unknown>)[prop];
-          }
-          return undefined;
-        },
-        has(_target, prop) {
-          if (prop === LAZY_PROXY) return true;
-          if (prop === "length") return true;
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) return true;
-          }
-          return false;
-        },
-        ownKeys() {
-          const keys: string[] = [];
-          for (let i = 0; i < length; i++) keys.push(String(i));
-          keys.push("length");
-          return keys;
-        },
-        getOwnPropertyDescriptor(_target, prop) {
-          if (prop === "length") {
-            return {
-              value: length,
-              writable: false,
-              enumerable: false,
-              configurable: false,
-            };
-          }
-          if (typeof prop === "string") {
-            const idx = Number(prop);
-            if (Number.isInteger(idx) && idx >= 0 && idx < length) {
-              return {
-                value: wrapGC(bridge.gcGetArrayItem(ref, idx)),
-                writable: false,
-                enumerable: true,
-                configurable: true,
-              };
-            }
-          }
-          return undefined;
-        },
-      });
-      return proxy;
+    if (tag === GC_STRING) {
+      return new WasmString(ref, bridge.gcGetStringLen(ref), bridge, engine, decoder);
     }
+
+    if (tag === GC_ARRAY) {
+      return createArrayProxy({
+        length: bridge.gcGetArrayLen(ref),
+        getItem: (idx) => wrapGC(bridge.gcGetArrayItem(ref, idx)),
+        materialize: () => deepMaterialize(ref),
+        lazyHandle: { gcRef: ref },
+      });
+    }
+
     if (tag === GC_OBJECT) {
       const count = bridge.gcGetObjectLen(ref);
       let _keys: string[] | null = null;
-      const getKeys = (): string[] => {
-        if (_keys === null) {
-          _keys = [];
-          for (let i = 0; i < count; i++) {
-            _keys.push(gcReadObjectKey(ref, i));
+
+      return createObjectProxy({
+        getKeys(): string[] {
+          if (_keys === null) {
+            _keys = [];
+            for (let i = 0; i < count; i++) _keys.push(gcReadObjectKey(ref, i));
           }
-        }
-        return _keys;
-      };
-      const proxy = new Proxy({} as Record<string, unknown>, {
-        get(_target, prop, _receiver) {
-          if (prop === LAZY_PROXY) return { gcRef: ref };
-          if (prop === Symbol.toPrimitive) return undefined;
-          if (prop === Symbol.toStringTag) return "Object";
-          if (prop === "toJSON") return () => deepMaterialize(ref);
-          if (typeof prop === "string") {
-            const { ptr, len } = writeStringToMemory(prop);
-            try {
-              const valRef = bridge.gcFindProperty(ref, ptr, len);
-              if (valRef === null || valRef === undefined) return undefined;
-              return wrapGC(valRef);
-            } finally {
-              if (len > 0) bridge.dealloc(ptr, len);
-            }
-          }
-          return undefined;
+          return _keys;
         },
-        has(_target, prop) {
-          if (prop === LAZY_PROXY) return true;
-          if (typeof prop !== "string") return false;
-          const { ptr, len } = writeStringToMemory(prop);
+        getProp(key: string): unknown {
+          const { ptr, len } = writeStringToMemory(key);
+          try {
+            const valRef = bridge.gcFindProperty(ref, ptr, len);
+            if (valRef === null || valRef === undefined) return undefined;
+            return wrapGC(valRef);
+          } finally {
+            if (len > 0) bridge.dealloc(ptr, len);
+          }
+        },
+        hasProp(key: string): boolean {
+          const { ptr, len } = writeStringToMemory(key);
           try {
             const valRef = bridge.gcFindProperty(ref, ptr, len);
             return valRef !== null && valRef !== undefined;
@@ -997,28 +1072,11 @@ export async function init(options?: {
             if (len > 0) bridge.dealloc(ptr, len);
           }
         },
-        ownKeys() {
-          return getKeys();
-        },
-        getOwnPropertyDescriptor(_target, prop) {
-          if (typeof prop !== "string") return undefined;
-          const { ptr, len } = writeStringToMemory(prop);
-          try {
-            const valRef = bridge.gcFindProperty(ref, ptr, len);
-            if (valRef === null || valRef === undefined) return undefined;
-            return {
-              value: wrapGC(valRef),
-              writable: false,
-              enumerable: true,
-              configurable: true,
-            };
-          } finally {
-            if (len > 0) bridge.dealloc(ptr, len);
-          }
-        },
+        materialize: () => deepMaterialize(ref),
+        lazyHandle: { gcRef: ref },
       });
-      return proxy;
     }
+
     return null;
   }
 
@@ -1048,7 +1106,7 @@ export async function init(options?: {
       try {
         new Uint8Array(engine.memory.buffer, ptr, len).set(bytes);
 
-        // Path B: parse into tape, get document handle
+        // Primary path: parse into tape via doc slots (fast, lazy)
         let docId = engine.doc_parse(ptr, len);
         if (docId < 0) {
           const errCode = engine.get_error_code();
@@ -1060,64 +1118,72 @@ export async function init(options?: {
             docId = engine.doc_parse(ptr, len);
           }
         }
-        if (docId < 0) {
-          const errorCode = engine.get_error_code();
+
+        if (docId >= 0) {
+          // Doc-slot path succeeded
+          const rootTag = engine.doc_get_tag(docId, 1);
+          if (rootTag <= TAG_STRING) {
+            // Primitive — extract and free immediately
+            let result: unknown;
+            switch (rootTag) {
+              case TAG_NULL:
+                result = null;
+                break;
+              case TAG_TRUE:
+                result = true;
+                break;
+              case TAG_FALSE:
+                result = false;
+                break;
+              case TAG_NUMBER:
+                result = engine.doc_get_number(docId, 1);
+                break;
+              case TAG_STRING:
+                result = docStringToGC(docId, 1);
+                break;
+              default:
+                result = null;
+            }
+            engine.doc_free(docId);
+            return result;
+          }
+
+          // Container — register with FinalizationRegistry
+          const generation = (docGenerations.get(docId) ?? 0) + 1;
+          docGenerations.set(docId, generation);
+
+          const keepAlive = { docId };
+          docRegistry.register(keepAlive, { docId, generation }, keepAlive);
+
+          return wrapDoc(docId, 1, keepAlive, generation);
+        }
+
+        // Fallback path: doc slots exhausted (Bun's JSC defers FinalizationRegistry
+        // callbacks, so gc() retry may not free slots). Use the GC tree path instead.
+        // This builds the full tree eagerly but has no slot limit.
+        const gcRef = bridge.parseJSON(ptr, len);
+        if (gcRef === null || gcRef === undefined) {
+          const errorCode = bridge.getError();
           const msg =
             ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
           throw new SyntaxError(`VectorJSON: ${msg}`);
         }
-
-        // Check root value type — primitives don't need the document alive
-        const rootTag = engine.doc_get_tag(docId, 1);
-        if (rootTag <= TAG_STRING) {
-          // Primitive (null, bool, number, string) — extract and free immediately
-          let result: unknown;
-          switch (rootTag) {
-            case TAG_NULL:
-              result = null;
-              break;
-            case TAG_TRUE:
-              result = true;
-              break;
-            case TAG_FALSE:
-              result = false;
-              break;
-            case TAG_NUMBER:
-              result = engine.doc_get_number(docId, 1);
-              break;
-            case TAG_STRING:
-              result = docReadString(docId, 1);
-              break;
-            default:
-              result = null;
-          }
-          engine.doc_free(docId);
-          return result;
-        }
-
-        // Assign a generation number for this docId usage
-        const generation = (docGenerations.get(docId) ?? 0) + 1;
-        docGenerations.set(docId, generation);
-
-        // Container (object/array) — create keepAlive sentinel registered
-        // with FinalizationRegistry. As long as any Proxy from this document
-        // is alive (capturing keepAlive in its closure), the slot won't be freed.
-        const keepAlive = { docId };
-        docRegistry.register(keepAlive, { docId, generation });
-
-        // Root value is at tape index 1 (index 0 is the root opening word)
-        return wrapDoc(docId, 1, keepAlive, generation);
+        return wrapGC(gcRef);
       } finally {
         engine.dealloc(ptr, len);
       }
     },
 
     materialize(value: unknown): unknown {
+      // WasmString → JS string
+      if (value instanceof WasmString) {
+        return value.toString();
+      }
       if (isLazyProxy(value)) {
         const handle = (value as Record<symbol, unknown>)[LAZY_PROXY] as
           | { docId: number; index: number }
           | { gcRef: unknown };
-        // Doc-backed proxy (Path B)
+        // Doc-backed proxy
         if ("docId" in handle) {
           return deepMaterializeDoc(handle.docId, handle.index);
         }
@@ -1131,11 +1197,37 @@ export async function init(options?: {
     },
 
     stringify(value: unknown): string {
-      bridge.stringifyInit();
+      // Fast path: GC-backed proxy → gcStringify (one WASM call, zero JS)
+      if (isLazyProxy(value)) {
+        const handle = (value as Record<symbol, unknown>)[LAZY_PROXY] as {
+          gcRef?: unknown;
+        };
+        if ("gcRef" in handle) {
+          bridge.gcStringify(handle.gcRef);
+          try {
+            const rPtr = bridge.stringifyResultPtr();
+            const rLen = bridge.stringifyResultLen();
+            return readString(rPtr, rLen);
+          } finally {
+            bridge.stringifyFree();
+          }
+        }
+      }
 
+      // WasmString → materialize and stringify
+      if (value instanceof WasmString) {
+        return JSON.stringify(value.toString());
+      }
+
+      // Plain JS values → built-in JSON.stringify (native C++, unbeatable)
+      if (!isLazyProxy(value)) {
+        return JSON.stringify(value);
+      }
+
+      // Doc-backed proxy or mixed → WASM token-by-token stringify
+      bridge.stringifyInit();
       try {
         writeValue(value);
-
         const rPtr = bridge.stringifyResultPtr();
         const rLen = bridge.stringifyResultLen();
         return readString(rPtr, rLen);
@@ -1353,6 +1445,10 @@ export async function init(options?: {
           }
         },
       };
+    },
+
+    isWasmString(value: unknown): value is WasmString {
+      return value instanceof WasmString;
     },
   };
 
