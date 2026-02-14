@@ -21,3 +21,6 @@ deps/
 
 # Log files
 *.log
+
+# Generated benchmark files
+bench/vercel-sdk/ai-patched.mjs
