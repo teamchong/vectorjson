@@ -182,6 +182,10 @@ interface EngineExports {
   doc_array_at(docId: number, arrIndex: number, n: number): number;
   doc_obj_key_at(docId: number, objIndex: number, n: number): number;
   doc_obj_val_at(docId: number, objIndex: number, n: number): number;
+  // Batch iteration
+  doc_batch_ptr(): number;
+  doc_array_elements(docId: number, arrIndex: number): number;
+  doc_object_keys(docId: number, objIndex: number): number;
 }
 
 interface BridgeExports {
@@ -541,23 +545,39 @@ export async function init(options?: {
       case TAG_STRING:
         return docReadString(docId, index);
       case TAG_ARRAY: {
-        const count = engine.doc_get_count(docId, index);
+        // Batch-read all element indices in one WASM call
+        const count = engine.doc_array_elements(docId, index);
+        const batchPtr = engine.doc_batch_ptr();
+        const indices = new Uint32Array(
+          engine.memory.buffer,
+          batchPtr,
+          count,
+        );
+        // Copy indices before recursive calls (batch buffer is shared)
+        const idxCopy = new Uint32Array(count);
+        idxCopy.set(indices);
         const arr: unknown[] = [];
         for (let i = 0; i < count; i++) {
-          const elemIdx = engine.doc_array_at(docId, index, i);
-          if (elemIdx === 0) break;
-          arr.push(deepMaterializeDoc(docId, elemIdx));
+          arr.push(deepMaterializeDoc(docId, idxCopy[i]));
         }
         return arr;
       }
       case TAG_OBJECT: {
-        const count = engine.doc_get_count(docId, index);
+        // Batch-read all key indices in one WASM call
+        const count = engine.doc_object_keys(docId, index);
+        const batchPtr = engine.doc_batch_ptr();
+        const indices = new Uint32Array(
+          engine.memory.buffer,
+          batchPtr,
+          count,
+        );
+        // Copy indices before recursive calls (batch buffer is shared)
+        const idxCopy = new Uint32Array(count);
+        idxCopy.set(indices);
         const obj: Record<string, unknown> = {};
         for (let i = 0; i < count; i++) {
-          const keyIdx = engine.doc_obj_key_at(docId, index, i);
-          if (keyIdx === 0) break;
-          const key = docReadString(docId, keyIdx);
-          obj[key] = deepMaterializeDoc(docId, keyIdx + 1);
+          const key = docReadString(docId, idxCopy[i]);
+          obj[key] = deepMaterializeDoc(docId, idxCopy[i] + 1);
         }
         return obj;
       }
@@ -585,17 +605,39 @@ export async function init(options?: {
     if (tag === TAG_NUMBER) return engine.doc_get_number(docId, index);
     if (tag === TAG_STRING) return docReadString(docId, index);
 
-    // Array — return lazy Proxy with element cache
+    // Array — return lazy Proxy with batch element index precomputation
     if (tag === TAG_ARRAY) {
       const length = engine.doc_get_count(docId, index);
+
+      // Batch-read all element tape indices in ONE WASM call (O(N) total)
+      let elemIndices: Uint32Array | null = null;
+      const getElemIndices = (): Uint32Array => {
+        if (elemIndices === null) {
+          const count = engine.doc_array_elements(docId, index);
+          const batchPtr = engine.doc_batch_ptr();
+          // Copy from WASM memory (buffer may be reused by next batch call)
+          elemIndices = new Uint32Array(count);
+          elemIndices.set(
+            new Uint32Array(engine.memory.buffer, batchPtr, count),
+          );
+        }
+        return elemIndices;
+      };
+
       const elemCache = new Map<number, unknown>();
 
       const getElem = (idx: number): unknown => {
         let cached = elemCache.get(idx);
         if (cached !== undefined) return cached;
-        const elemIdx = engine.doc_array_at(docId, index, idx);
-        if (elemIdx === 0) return undefined;
-        cached = wrapDoc(docId, elemIdx, keepAlive, generation);
+        const indices = getElemIndices();
+        if (idx < indices.length) {
+          cached = wrapDoc(docId, indices[idx], keepAlive, generation);
+        } else {
+          // Fallback for arrays > 16K elements
+          const elemIdx = engine.doc_array_at(docId, index, idx);
+          if (elemIdx === 0) return undefined;
+          cached = wrapDoc(docId, elemIdx, keepAlive, generation);
+        }
         elemCache.set(idx, cached);
         return cached;
       };
@@ -678,43 +720,52 @@ export async function init(options?: {
       return proxy;
     }
 
-    // Object — return lazy Proxy with property cache
+    // Object — return lazy Proxy with batch key index precomputation
     if (tag === TAG_OBJECT) {
       const count = engine.doc_get_count(docId, index);
       const propCache = new Map<string, unknown>();
       // Sentinel for "key not found" (distinct from undefined values)
       const NOT_FOUND = Symbol();
 
-      // Cache key list (read once)
+      // Batch-read all key tape indices in ONE WASM call
+      let keyIndices: Uint32Array | null = null;
       let _keys: string[] | null = null;
-      const getKeys = (): string[] => {
-        if (_keys === null) {
-          _keys = [];
-          for (let i = 0; i < count; i++) {
-            const keyIdx = engine.doc_obj_key_at(docId, index, i);
-            if (keyIdx === 0) break;
-            _keys.push(docReadString(docId, keyIdx));
-          }
+      let _keyToValIdx: Map<string, number> | null = null;
+
+      const buildKeyMap = () => {
+        if (_keyToValIdx !== null) return;
+        const kCount = engine.doc_object_keys(docId, index);
+        const batchPtr = engine.doc_batch_ptr();
+        keyIndices = new Uint32Array(kCount);
+        keyIndices.set(
+          new Uint32Array(engine.memory.buffer, batchPtr, kCount),
+        );
+        _keys = [];
+        _keyToValIdx = new Map();
+        for (let i = 0; i < kCount; i++) {
+          const k = docReadString(docId, keyIndices[i]);
+          _keys.push(k);
+          _keyToValIdx.set(k, keyIndices[i] + 1); // value is key + 1
         }
-        return _keys;
+      };
+
+      const getKeys = (): string[] => {
+        buildKeyMap();
+        return _keys!;
       };
 
       const getProp = (key: string): unknown => {
         const cached = propCache.get(key);
         if (cached !== undefined) return cached === NOT_FOUND ? undefined : cached;
-        const { ptr, len } = writeStringToMemory(key);
-        try {
-          const valIdx = engine.doc_find_field(docId, index, ptr, len);
-          if (valIdx === 0) {
-            propCache.set(key, NOT_FOUND);
-            return undefined;
-          }
-          const wrapped = wrapDoc(docId, valIdx, keepAlive, generation);
-          propCache.set(key, wrapped);
-          return wrapped;
-        } finally {
-          if (len > 0) bridge.dealloc(ptr, len);
+        buildKeyMap();
+        const valIdx = _keyToValIdx!.get(key);
+        if (valIdx === undefined) {
+          propCache.set(key, NOT_FOUND);
+          return undefined;
         }
+        const wrapped = wrapDoc(docId, valIdx, keepAlive, generation);
+        propCache.set(key, wrapped);
+        return wrapped;
       };
 
       const proxy = new Proxy({} as Record<string, unknown>, {
@@ -738,16 +789,9 @@ export async function init(options?: {
           void keepAlive;
           if (prop === LAZY_PROXY) return true;
           if (typeof prop !== "string") return false;
-          // getProp caches the result, so even `has` benefits
-          const cached = propCache.get(prop);
-          if (cached !== undefined) return cached !== NOT_FOUND;
-          const { ptr, len } = writeStringToMemory(prop);
-          try {
-            const valIdx = engine.doc_find_field(docId, index, ptr, len);
-            return valIdx !== 0;
-          } finally {
-            if (len > 0) bridge.dealloc(ptr, len);
-          }
+          // Use the batch key map — no WASM call for known keys
+          buildKeyMap();
+          return _keyToValIdx!.has(prop);
         },
         ownKeys() {
           void keepAlive;

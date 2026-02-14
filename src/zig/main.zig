@@ -832,6 +832,71 @@ export fn doc_obj_val_at(doc_id: i32, obj_index: u32, n: u32) u32 {
     return key_idx + 1; // value is immediately after key
 }
 
+// --- Batch iteration exports ---
+// These walk a container ONCE and return all child tape indices,
+// turning O(N²) sequential access into O(N).
+
+/// Static batch buffer: 64KB = 16384 u32 indices.
+/// Covers arrays/objects up to 16K elements in one batch call.
+var batch_buffer: [16384]u32 = undefined;
+
+/// Get a pointer to the batch buffer (for JS to read results).
+export fn doc_batch_ptr() [*]u32 {
+    return &batch_buffer;
+}
+
+/// Walk an array once, writing element tape indices into batch_buffer.
+/// Returns the number of elements written (capped at 1024).
+export fn doc_array_elements(doc_id: i32, arr_index: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    var curr: u32 = arr_index + 1;
+    var count: u32 = 0;
+    while (count < 16384) {
+        const w = p.tape.get(curr);
+        if (w.tag == .array_closing) break;
+        batch_buffer[count] = curr;
+        count += 1;
+
+        // Advance to next element
+        curr = switch (w.tag) {
+            .array_opening, .object_opening => w.data.ptr,
+            .unsigned, .signed, .double => curr + 2,
+            else => curr + 1,
+        };
+    }
+    return count;
+}
+
+/// Walk an object once, writing key tape indices into batch_buffer.
+/// Value index = key_index + 1.
+/// Returns the number of entries written (capped at 1024).
+export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(obj_index);
+    if (word.tag != .object_opening) return 0;
+
+    var curr: u32 = obj_index + 1;
+    var count: u32 = 0;
+    while (count < 16384) {
+        const w = p.tape.get(curr);
+        if (w.tag == .object_closing) break;
+        batch_buffer[count] = curr; // key index
+        count += 1;
+
+        // Skip past key + value
+        const val_w = p.tape.get(curr + 1);
+        curr = switch (val_w.tag) {
+            .array_opening, .object_opening => val_w.data.ptr,
+            .unsigned, .signed, .double => curr + 3,
+            else => curr + 2,
+        };
+    }
+    return count;
+}
+
 fn mapError(err: anytype) i32 {
     return switch (err) {
         error.ExceededDepth => 1,

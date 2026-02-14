@@ -105,6 +105,10 @@ pub fn build(b: *std.Build) void {
         "doc_array_at",
         "doc_obj_key_at",
         "doc_obj_val_at",
+        // Batch iteration exports
+        "doc_batch_ptr",
+        "doc_array_elements",
+        "doc_object_keys",
     };
 
     // Install to zig-out/bin/engine.wasm
