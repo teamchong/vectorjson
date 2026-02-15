@@ -239,6 +239,7 @@ interface EngineExports {
   doc_read_column_f64(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_bool(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_str_raw(docId: number, arrIndex: number, fieldIdx: number): number;
+  doc_read_column_str_slices(docId: number, arrIndex: number, fieldIdx: number): number;
   get_utf16_ptr(): number;
 }
 
@@ -721,10 +722,13 @@ export async function init(options?: {
   // Track generation per docId to prevent stale FinalizationRegistry callbacks
   // from freeing a reused slot. Each parse increments the generation.
   const docGenerations = new Map<number, number>();
+  // Original input string per doc — enables zero-copy string slicing
+  const docInputStrings = new Map<number, { str: string; isAscii: boolean }>();
 
   function freeDocIfCurrent(docId: number, generation: number): void {
     if (docGenerations.get(docId) !== generation) return; // stale callback
     engine.doc_free(docId);
+    docInputStrings.delete(docId);
   }
 
   // --- FinalizationRegistry for auto-cleanup of document slots ---
@@ -843,14 +847,17 @@ export async function init(options?: {
         if (prop === Symbol.iterator) {
           // Fast iterator — calls getItem directly, bypassing Proxy get trap.
           // for...of uses this path: 1 Proxy call (Symbol.iterator) instead of N.
+          // Reuses result object to avoid allocation per .next() call.
           const len = config.length;
           const getItem = config.getItem.bind(config);
           return function () {
             let i = 0;
+            const result = { done: false, value: undefined as unknown };
             return {
-              next(): { done: boolean; value: unknown } {
-                if (i >= len) return { done: true, value: undefined };
-                return { done: false, value: getItem(i++) };
+              next() {
+                if (i >= len) { result.done = true; result.value = undefined; return result; }
+                result.value = getItem(i++);
+                return result;
               },
             };
           };
@@ -1041,6 +1048,7 @@ export async function init(options?: {
       if (docGenerations.get(docId) !== generation) return;
       docGenerations.delete(docId);
       engine.doc_free(docId);
+      docInputStrings.delete(docId);
       docRegistry.unregister(keepAlive);
     };
 
@@ -1099,25 +1107,72 @@ export async function init(options?: {
 
         // Build the cursor: one object with OWN getters per key.
         // Own getters are visible to JSON.stringify (no toJSON needed).
+        // keepAlive is captured by getItem/freeFn closures — no need in getters.
         rowView = Object.create(null);
         for (let fi = 0; fi < kCount; fi++) {
           const key = columnarKeys[fi];
           const fieldIdx = fi;
           const expectedType = fieldTypes[fi];
-          // Cache column ref in closure — eliminates Map.get on every access
-          let cachedCol: unknown[] | null = null;
-          Object.defineProperty(rowView, key, {
-            get(): unknown {
-              void keepAlive;
-              if (cachedCol === null) {
-                cachedCol = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
-                columns!.set(key, cachedCol);
-              }
-              return cachedCol[rowViewIdx];
-            },
-            enumerable: true,
-            configurable: true,
-          });
+
+          if (expectedType === TAG_STRING) {
+            // String column: zero-copy input slicing when possible.
+            // For ASCII inputs without escapes, slice directly from the original JSON string.
+            // Fallback: copy bytes from WASM string_buffer + TextDecoder.
+            let strSlices: { offsets: Uint32Array; lengths: Uint32Array; inputStr: string } | null = null;
+            let strFallback: unknown[] | null = null;
+            Object.defineProperty(rowView, key, {
+              get(): unknown {
+                if (strSlices === null && strFallback === null) {
+                  const inputInfo = docInputStrings.get(docId);
+                  if (inputInfo && inputInfo.isAscii) {
+                    const result = engine.doc_read_column_str_slices(docId, index, fieldIdx);
+                    if (result === 1) {
+                      const bp = engine.doc_batch_ptr() as unknown as number;
+                      const rc = new Uint32Array(engine.memory.buffer, bp, 1)[0];
+                      if (rc > 0) {
+                        const pairs = new Uint32Array(rc * 2);
+                        pairs.set(new Uint32Array(engine.memory.buffer, bp + 4, rc * 2));
+                        const offsets = new Uint32Array(rc);
+                        const lengths = new Uint32Array(rc);
+                        for (let i = 0; i < rc; i++) {
+                          offsets[i] = pairs[i * 2];
+                          lengths[i] = pairs[i * 2 + 1];
+                        }
+                        strSlices = { offsets, lengths, inputStr: inputInfo.str };
+                      }
+                    }
+                  }
+                  if (strSlices === null) {
+                    // Fallback: pre-slice via TextDecoder
+                    strFallback = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
+                  }
+                  columns!.set(key, []); // placeholder for columns map
+                }
+                if (strSlices !== null) {
+                  const o = strSlices.offsets[rowViewIdx];
+                  const l = strSlices.lengths[rowViewIdx];
+                  return l === 0 ? '' : strSlices.inputStr.slice(o, o + l);
+                }
+                return strFallback![rowViewIdx];
+              },
+              enumerable: true,
+              configurable: true,
+            });
+          } else {
+            // Number/boolean column: cache array ref in closure
+            let cachedCol: unknown[] | null = null;
+            Object.defineProperty(rowView, key, {
+              get(): unknown {
+                if (cachedCol === null) {
+                  cachedCol = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
+                  columns!.set(key, cachedCol);
+                }
+                return cachedCol[rowViewIdx];
+              },
+              enumerable: true,
+              configurable: true,
+            });
+          }
         }
 
         Object.defineProperty(rowView, 'free', {
@@ -1386,6 +1441,11 @@ export async function init(options?: {
       }
 
       if (docId >= 0) {
+        // Store original input for zero-copy string slicing.
+        // isAscii: byte length = char length means byte offsets = char offsets.
+        if (typeof input === "string") {
+          docInputStrings.set(docId, { str: input, isAscii: input.length === len });
+        }
         // Doc-slot path succeeded
         const rootTag = engine.doc_get_tag(docId, 1);
         if (rootTag <= TAG_STRING) {

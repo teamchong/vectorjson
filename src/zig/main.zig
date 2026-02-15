@@ -158,14 +158,14 @@ export fn get_next_token() i32 {
             break :blk .number_double;
         },
         .string => blk: {
-            // Read string from the string buffer
+            // Read string from the string buffer (skip u32 input-offset prefix)
             const native_endian = @import("builtin").cpu.arch.endian();
             const str_ptr_offset = word.data.ptr;
             const strings = parser.tape.string_buffer.strings.items();
-            const low_bits = std.mem.readInt(u16, strings.ptr[str_ptr_offset..][0..@sizeOf(u16)], native_endian);
+            const low_bits = std.mem.readInt(u16, strings.ptr[str_ptr_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
             const high_bits: u64 = word.data.len;
             const str_len: u32 = @intCast(high_bits << 16 | low_bits);
-            current_string_ptr = strings.ptr[str_ptr_offset + @sizeOf(u16) ..];
+            current_string_ptr = strings.ptr[str_ptr_offset + STR_HEADER_SIZE ..];
             current_string_len = str_len;
             tape_index += 1;
 
@@ -642,15 +642,41 @@ fn getDocParser(doc_id: i32) ?*DomParser {
 
 /// Read a string value from a parser's tape at the given index.
 /// Returns the raw byte slice pointing into the parser's string buffer.
+/// String buffer layout per string: [u32 packed_input_offset][u16 len_low][string_bytes]
+const STR_HEADER_SIZE: u32 = @sizeOf(u32) + @sizeOf(u16); // 6
+
 fn readTapeString(p: *DomParser, index: u32) []const u8 {
     const native_endian = @import("builtin").cpu.arch.endian();
     const word = p.tape.get(index);
     const str_offset = word.data.ptr;
     const strings = p.tape.string_buffer.strings.items();
-    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset..][0..@sizeOf(u16)], native_endian);
+    // Skip the u32 packed_input_offset, then read u16 len_low
+    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
     const high_bits: u64 = word.data.len;
     const str_len: u32 = @intCast(high_bits << 16 | low_bits);
-    return strings.ptr[str_offset + @sizeOf(u16) ..][0..str_len];
+    return strings.ptr[str_offset + STR_HEADER_SIZE ..][0..str_len];
+}
+
+/// Read the packed input offset for a string tape entry.
+/// Returns: bits 0-30 = byte offset of string content start in original input,
+///          bit 31 = has_escapes flag.
+fn readTapeStringPackedOffset(p: *DomParser, index: u32) u32 {
+    const native_endian = @import("builtin").cpu.arch.endian();
+    const word = p.tape.get(index);
+    const str_offset = word.data.ptr;
+    const strings = p.tape.string_buffer.strings.items();
+    return std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
+}
+
+/// Get the string length from a tape entry (without reading string_buffer).
+fn readTapeStringLen(p: *DomParser, index: u32) u32 {
+    const native_endian = @import("builtin").cpu.arch.endian();
+    const word = p.tape.get(index);
+    const str_offset = word.data.ptr;
+    const strings = p.tape.string_buffer.strings.items();
+    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
+    const high_bits: u64 = word.data.len;
+    return @intCast(high_bits << 16 | low_bits);
 }
 
 /// Parse JSON bytes and store the result in a document slot.
@@ -1220,8 +1246,9 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
     return out / 2; // total char count
 }
 
-/// Batch-read a string column as raw UTF-8 bytes — skip SIMD UTF-16 conversion.
-/// Layout same as doc_read_column_str_utf16:
+/// Batch-read a string column as raw UTF-8 bytes — single-pass, no SIMD UTF-16 conversion.
+/// Uses parser's string_buffer size as upper bound to skip the counting pass.
+/// Layout:
 ///   - batch_buffer: [elem_count, charOff_0, charOff_1, ..., charOff_N]
 ///     charOff = UTF-16 code unit offset (for JS String.slice)
 ///   - utf16_buffer: raw UTF-8 bytes (read via get_utf16_ptr)
@@ -1231,61 +1258,27 @@ export fn doc_read_column_str_raw(doc_id: i32, arr_index: u32, field_idx: u32) u
     const word = p.tape.get(arr_index);
     if (word.tag != .array_opening) return 0;
 
-    // First pass: count elements and total UTF-8 bytes
-    var total_bytes: u32 = 0;
-    var elem_count: u32 = 0;
-    {
-        var ec: u32 = arr_index + 1;
-        while (true) {
-            const ew = p.tape.get(ec);
-            if (ew.tag == .array_closing) break;
-            if (ew.tag == .object_opening) {
-                var fc: u32 = ec + 1;
-                var fi: u32 = 0;
-                while (fi < field_idx) : (fi += 1) {
-                    const kw = p.tape.get(fc);
-                    if (kw.tag == .object_closing) break;
-                    const vw = p.tape.get(fc + 1);
-                    fc = switch (vw.tag) {
-                        .array_opening, .object_opening => vw.data.ptr,
-                        .unsigned, .signed, .double => fc + 3,
-                        else => fc + 2,
-                    };
-                }
-                const str = readTapeString(p, fc + 1);
-                total_bytes += @intCast(str.len);
-            }
-            elem_count += 1;
-            ec = switch (ew.tag) {
-                .array_opening, .object_opening => ew.data.ptr,
-                .unsigned, .signed, .double => ec + 2,
-                else => ec + 1,
-            };
-        }
-    }
+    // Use string_buffer total size as upper bound — avoids a counting pass.
+    // getUtf16Buf retains capacity, so after first call this is free.
+    const sb_len: u32 = @intCast(p.tape.string_buffer.strings.items().len);
+    if (sb_len == 0) return 0;
+    const buf = getUtf16Buf(sb_len) orelse return 0;
 
-    if (elem_count == 0) return 0;
-
-    // Allocate buffer for raw UTF-8 bytes (exact size, no 2x for UTF-16)
-    const buf = getUtf16Buf(total_bytes) orelse return 0;
-
-    // batch_buffer layout: [elem_count, charOff_0, charOff_1, ..., charOff_N]
-    // charOff = cumulative UTF-16 code unit count (for JS String.slice)
-    batch_buffer[0] = elem_count;
-    var out: u32 = 0; // byte offset into buf
-    var char_offset: u32 = 0; // cumulative UTF-16 code units
+    // Single pass: memcpy each string, compute offsets and element count
+    batch_buffer[0] = 0; // will be set to elem_count at end
+    var out: u32 = 0;
+    var char_offset: u32 = 0;
     var row: u32 = 0;
 
-    // Second pass: memcpy each string, compute UTF-16 code unit offsets
-    var ec2: u32 = arr_index + 1;
+    var ec: u32 = arr_index + 1;
     while (true) {
-        const ew = p.tape.get(ec2);
+        const ew = p.tape.get(ec);
         if (ew.tag == .array_closing) break;
 
         batch_buffer[1 + row] = char_offset;
 
         if (ew.tag == .object_opening) {
-            var fc: u32 = ec2 + 1;
+            var fc: u32 = ec + 1;
             var fi: u32 = 0;
             while (fi < field_idx) : (fi += 1) {
                 const kw = p.tape.get(fc);
@@ -1299,32 +1292,98 @@ export fn doc_read_column_str_raw(doc_id: i32, arr_index: u32, field_idx: u32) u
             }
             const str = readTapeString(p, fc + 1);
             if (str.len > 0) {
-                // memcpy: just copy raw bytes, no conversion
                 @memcpy(buf[out .. out + @as(u32, @intCast(str.len))], str);
                 out += @intCast(str.len);
 
-                // Count UTF-16 code units for JS String.slice offsets
                 for (str) |b| {
-                    // Non-continuation bytes = new codepoint
                     if (b & 0xC0 != 0x80) char_offset += 1;
-                    // 4-byte sequences (non-BMP) produce 2 UTF-16 code units
                     if (b & 0xF8 == 0xF0) char_offset += 1;
                 }
             }
         }
 
         row += 1;
-        ec2 = switch (ew.tag) {
+        ec = switch (ew.tag) {
             .array_opening, .object_opening => ew.data.ptr,
-            .unsigned, .signed, .double => ec2 + 2,
-            else => ec2 + 1,
+            .unsigned, .signed, .double => ec + 2,
+            else => ec + 1,
         };
     }
 
-    // Sentinel
+    batch_buffer[0] = row;
     batch_buffer[1 + row] = char_offset;
 
-    return out; // total byte count
+    return out;
+}
+
+/// Read a string column as input-slice offsets — ZERO string copying.
+/// For each string in the column, outputs (input_byte_offset, byte_length) pairs.
+/// Returns 1 if ALL strings are escape-free (safe for JS input.slice()),
+/// Returns 0 if any string has escapes (caller should fall back to doc_read_column_str_raw).
+///
+/// batch_buffer layout on success (return 1):
+///   [elem_count, offset_0, len_0, offset_1, len_1, ..., offset_N-1, len_N-1]
+export fn doc_read_column_str_slices(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    batch_buffer[0] = 0;
+    var row: u32 = 0;
+    var has_any_escapes = false;
+
+    var elem_curr: u32 = arr_index + 1;
+    while (row < 8191) { // 1 + 2*8191 = 16383, fits in batch_buffer
+        const ew = p.tape.get(elem_curr);
+        if (ew.tag == .array_closing) break;
+
+        if (ew.tag != .object_opening) {
+            // Non-object element: output zero-length placeholder
+            batch_buffer[1 + row * 2] = 0;
+            batch_buffer[1 + row * 2 + 1] = 0;
+            elem_curr = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => elem_curr + 2,
+                else => elem_curr + 1,
+            };
+            row += 1;
+            continue;
+        }
+
+        // Navigate to field_idx within this object
+        var field_curr: u32 = elem_curr + 1;
+        var fi: u32 = 0;
+        while (fi < field_idx) : (fi += 1) {
+            const kw = p.tape.get(field_curr);
+            if (kw.tag == .object_closing) break;
+            const vw = p.tape.get(field_curr + 1);
+            field_curr = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => field_curr + 3,
+                else => field_curr + 2,
+            };
+        }
+
+        // Read the packed input offset and string length from the value at field_curr + 1
+        const val_idx = field_curr + 1;
+        const packed_off = readTapeStringPackedOffset(p, val_idx);
+        const str_len = readTapeStringLen(p, val_idx);
+        const input_offset = packed_off & 0x7FFFFFFF;
+        const is_escaped = packed_off >> 31 != 0;
+
+        if (is_escaped) has_any_escapes = true;
+
+        batch_buffer[1 + row * 2] = input_offset;
+        batch_buffer[1 + row * 2 + 1] = str_len;
+
+        elem_curr = ew.data.ptr;
+        row += 1;
+    }
+
+    batch_buffer[0] = row;
+
+    if (has_any_escapes) return 0; // Caller should fall back
+    return 1; // All strings safe for input.slice()
 }
 
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
