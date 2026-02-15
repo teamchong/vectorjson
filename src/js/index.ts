@@ -100,6 +100,10 @@ export interface VectorJSON {
    *
    * // ❌ Storing cursor references — all point to the same object
    * const a = data[0]; const b = data[1]; // a === b (same cursor)
+   *
+   * // ❌ structuredClone — Proxy objects cannot be cloned
+   * structuredClone(result); // throws "object can not be cloned"
+   * // Use materialize() first: structuredClone(vj.materialize(result))
    * ```
    */
   parse(input: string | Uint8Array): unknown;
@@ -1115,16 +1119,12 @@ export async function init(options?: {
       // we bulk-materialize entire columns lazily. data[i].name reads columns.name[i]
       // — a direct JS array lookup after initial column build.
       //
-      // Row view objects are plain objects with defineProperty getters that V8 can
-      // inline-cache (no Proxy). Each getter reads from its pre-materialized column
-      // array, so after first access of a property, ALL subsequent row accesses of
-      // that property are pure JS with zero WASM overhead.
+      // Uses a single cursor object with defineProperty getters (V8 inline-cacheable,
+      // ~5ns per access). The cursor repositions on each data[i] access.
       let columnarInitialized = false;
       let columnarKeys: string[] | null = null;
       let columns: Map<string, unknown[]> | null = null;
       let fieldTypes: number[] | null = null;
-      // Single cursor: ONE reusable row view object. data[i] repositions it.
-      // Fast (~5ns per access) but references are NOT safe to store.
       let rowView: Record<string, unknown> | null = null;
       let rowViewIdx = 0;
 
@@ -1152,8 +1152,8 @@ export async function init(options?: {
         // Lazy column storage — each column materializes on first access
         columns = new Map();
 
-        // Build the cursor: one object with getters per key.
-        // Each getter lazily materializes its column, then reads column[rowViewIdx].
+        // Build the cursor: one object with OWN getters per key.
+        // Own getters are visible to JSON.stringify (no toJSON needed).
         rowView = Object.create(null);
         for (let fi = 0; fi < kCount; fi++) {
           const key = columnarKeys[fi];
