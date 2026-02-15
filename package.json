@@ -9,10 +9,11 @@
     "dist/"
   ],
   "scripts": {
-    "build:zig": "zig build -Doptimize=ReleaseFast",
+    "build:zig": "zig build -Doptimize=ReleaseSmall",
     "build:wat": "wasm-tools parse src/wat/bridge.wat -o dist/bridge.wasm",
+    "build:opt": "npx wasm-opt -O3 dist/engine.wasm -o dist/engine.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals",
     "build:js": "bun x tsc",
-    "build": "bun run build:zig && bun run build:wat && bun run build:js",
+    "build": "bun run build:zig && bun run build:wat && bun run build:opt && bun run build:js",
     "test": "bun test/basic.mjs",
     "bench": "bun --expose-gc bench/parse-stream.mjs && bun --expose-gc bench/stringify-loop.mjs && bun --expose-gc bench/deep-compare.mjs",
     "bench:parse": "bun --expose-gc bench/parse-stream.mjs",

@@ -17,6 +17,7 @@
   ;; ============================================================
 
   (type $ByteArray (array (mut i8)))
+  (type $ExternArray (array (mut externref)))
   (type $JsonValue (sub (struct)))
   (type $JsonNull (sub final $JsonValue (struct)))
   (type $JsonBool (sub final $JsonValue (struct (field $val i32))))
@@ -96,6 +97,10 @@
   (import "engine" "stringify_result_ptr" (func $engine_stringify_result_ptr (result i32)))
   (import "engine" "stringify_result_len" (func $engine_stringify_result_len (result i32)))
   (import "engine" "stringify_free" (func $engine_stringify_free))
+
+  ;; Batch column string slicing — JS provides string creation/slicing
+  (import "jsstr" "makeString" (func $js_make_string (param i32 i32) (result externref)))
+  (import "jsstr" "sliceString" (func $js_slice_string (param externref i32 i32) (result externref)))
 
   ;; ============================================================
   ;; Helpers
@@ -550,4 +555,80 @@
   (func (export "validateErrorMsgPtr") (param $i i32) (result i32) (call $engine_validate_error_msg_ptr (local.get $i)))
   (func (export "validateErrorMsgLen") (param $i i32) (result i32) (call $engine_validate_error_msg_len (local.get $i)))
   (func (export "validateFree") (call $engine_validate_free))
+
+  ;; ============================================================
+  ;; Batch Column Strings — loop inside WASM
+  ;; ============================================================
+  ;; JS provides two imports: makeString creates a JS string from
+  ;; UTF-16 memory, sliceString extracts a substring. The loop runs
+  ;; in WASM to avoid JS interpreter overhead for N iterations.
+
+  ;; batchSliceStrings(utf16_ptr, total_chars, offsets_ptr, count) -> externref
+  ;; Reads contiguous UTF-16 buffer from engine memory, creates ONE big JS string,
+  ;; then slices N substrings in a tight WASM loop. Returns a GC ExternArray.
+  (func (export "batchSliceStrings")
+    (param $utf16_ptr i32)
+    (param $total_chars i32)
+    (param $offsets_ptr i32)
+    (param $count i32)
+    (result externref)
+    (local $big_str externref)
+    (local $result (ref $ExternArray))
+    (local $i i32)
+    (local $start i32)
+    (local $end i32)
+
+    ;; Create ONE big JS string from contiguous UTF-16 buffer
+    (local.set $big_str
+      (call $js_make_string (local.get $utf16_ptr) (local.get $total_chars)))
+
+    ;; Allocate GC array for results
+    (local.set $result
+      (array.new $ExternArray (ref.null extern) (local.get $count)))
+
+    ;; Slice loop — tight WASM loop, no JS interpreter overhead
+    (local.set $i (i32.const 0))
+    (block $done (loop $loop
+      (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+
+      ;; Read char offsets from engine memory (u32 array at offsets_ptr)
+      (local.set $start
+        (i32.load (i32.add (local.get $offsets_ptr)
+          (i32.mul (local.get $i) (i32.const 4)))))
+      (local.set $end
+        (i32.load (i32.add (local.get $offsets_ptr)
+          (i32.mul (i32.add (local.get $i) (i32.const 1)) (i32.const 4)))))
+
+      ;; Slice substring and store in GC array
+      (array.set $ExternArray (local.get $result) (local.get $i)
+        (if (result externref) (i32.eq (local.get $start) (local.get $end))
+          (then (ref.null extern))
+          (else (call $js_slice_string
+            (local.get $big_str) (local.get $start) (local.get $end)))))
+
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+
+    ;; Return GC array as externref
+    (extern.convert_any (local.get $result)))
+
+  ;; Read element from ExternArray by index
+  (func (export "externArrayGet")
+    (param $ref externref) (param $idx i32) (result externref)
+    (local $arr (ref null $ExternArray))
+    (local.set $arr
+      (ref.cast (ref null $ExternArray) (any.convert_extern (local.get $ref))))
+    (if (ref.is_null (local.get $arr))
+      (then (return (ref.null extern))))
+    (array.get $ExternArray (ref.as_non_null (local.get $arr)) (local.get $idx)))
+
+  ;; Get length of ExternArray
+  (func (export "externArrayLen")
+    (param $ref externref) (result i32)
+    (local $arr (ref null $ExternArray))
+    (local.set $arr
+      (ref.cast (ref null $ExternArray) (any.convert_extern (local.get $ref))))
+    (if (ref.is_null (local.get $arr))
+      (then (return (i32.const 0))))
+    (array.len (ref.as_non_null (local.get $arr))))
 )

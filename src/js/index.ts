@@ -280,6 +280,10 @@ interface BridgeExports {
   compareDiffPathLen(index: number): number;
   compareDiffType(index: number): number;
   compareFree(): void;
+  // Batch column string slicing (loop inside WASM)
+  batchSliceStrings(utf16Ptr: number, totalChars: number, offsetsPtr: number, count: number): unknown;
+  externArrayGet(ref: unknown, idx: number): unknown;
+  externArrayLen(ref: unknown): number;
 }
 
 // --- UTF-16 string helpers (module-level) ---
@@ -497,6 +501,17 @@ export async function init(options?: {
   // --- Instantiate WAT bridge, linking to engine ---
   const bridgeModule = await WebAssembly.compile(bridgeBytes);
   const bridgeInstance = await WebAssembly.instantiate(bridgeModule, {
+    jsstr: {
+      // Create a JS string from UTF-16LE code units in WASM memory
+      makeString(ptr: number, charCount: number): string {
+        const codes = new Uint16Array(engine.memory.buffer, ptr, charCount);
+        return utf16BulkToString(codes);
+      },
+      // Slice a substring (V8 creates a SlicedString — zero char copying)
+      sliceString(str: string, start: number, end: number): string {
+        return str.slice(start, end);
+      },
+    },
     engine: {
       memory: engine.memory,
       alloc: engine.alloc,
@@ -975,8 +990,6 @@ export async function init(options?: {
       //
       // JS creates ONE big string, then .slice() each substring.
       // Sliced strings reference the parent's backing store — zero char copying.
-      // When strings are actually consumed (which they always are in real code),
-      // this is 2.7x faster than WasmString's deferred per-string conversion.
       const totalChars = engine.doc_read_column_str_utf16(docId, arrIndex, fieldIdx);
       const batchPtr = engine.doc_batch_ptr();
       const rowCount = new Uint32Array(engine.memory.buffer, batchPtr, 1)[0];
@@ -996,7 +1009,7 @@ export async function init(options?: {
       const codes = new Uint16Array(engine.memory.buffer, bufPtr, totalChars);
       const bigStr = utf16BulkToString(codes);
 
-      // Slice each substring
+      // Slice each substring — V8 creates SlicedString objects (zero char copy)
       const col: unknown[] = new Array(rowCount);
       for (let i = 0; i < rowCount; i++) {
         const start = offsets[i];
