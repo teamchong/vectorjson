@@ -621,7 +621,7 @@ export fn stringify_free() void {
 // Document Slot System — "True Lazy" tape-direct navigation
 // ============================================================
 //
-// Instead of building a WasmGC tree eagerly, we parse into a tape and
+// Instead of building a WasmGC tree upfront, we parse into a tape and
 // return a document handle (i32 slot ID). JS navigates the tape on
 // demand via doc_get_tag, doc_find_field, doc_array_at, etc.
 //
@@ -1558,7 +1558,7 @@ fn matWriteBytes(data: []const u8) void {
     mat_len += len;
 }
 
-// --- UTF-8 → UTF-16LE conversion for eager materialization ---
+// --- UTF-8 → UTF-16LE conversion for full materialization ---
 
 /// Count the number of UTF-16 code units needed to represent a UTF-8 byte slice.
 /// For ASCII (the common case in JSON), each byte maps to exactly one u16.

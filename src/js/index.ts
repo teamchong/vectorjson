@@ -1496,7 +1496,7 @@ export async function init(options?: {
 
       // Fallback path: doc slots exhausted (Bun's JSC defers FinalizationRegistry
       // callbacks, so gc() retry may not free slots). Use the GC tree path instead.
-      // This builds the full tree eagerly but has no slot limit.
+      // This builds the full tree upfront but has no slot limit.
       const gcRef = bridge.parseJSON(ptr, len);
       if (gcRef === null || gcRef === undefined) {
         const errorCode = bridge.getError();
