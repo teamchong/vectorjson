@@ -1115,10 +1115,11 @@ export async function init(options?: {
           const expectedType = fieldTypes[fi];
 
           if (expectedType === TAG_STRING) {
-            // String column: zero-copy input slicing when possible.
-            // For ASCII inputs without escapes, slice directly from the original JSON string.
-            // Fallback: copy bytes from WASM string_buffer + TextDecoder.
-            let strSlices: { offsets: Uint32Array; lengths: Uint32Array; inputStr: string } | null = null;
+            // String column: zero-copy input slicing with per-string escape handling.
+            // Unescaped strings: slice directly from original JS input string (zero-copy).
+            // Escaped strings: JSON.parse(input.slice(offset-1, offset+rawLen+1)) — V8-native unescape.
+            // Fallback (non-ASCII input): WASM string_buffer + TextDecoder.
+            let strSlices: { offsets: Uint32Array; rawLens: Uint32Array; escapeBits: Uint32Array; inputStr: string } | null = null;
             let strFallback: unknown[] | null = null;
             Object.defineProperty(rowView, key, {
               get(): unknown {
@@ -1133,12 +1134,15 @@ export async function init(options?: {
                         const pairs = new Uint32Array(rc * 2);
                         pairs.set(new Uint32Array(engine.memory.buffer, bp + 4, rc * 2));
                         const offsets = new Uint32Array(rc);
-                        const lengths = new Uint32Array(rc);
+                        const rawLens = new Uint32Array(rc);
+                        const escapeBits = new Uint32Array(rc);
                         for (let i = 0; i < rc; i++) {
                           offsets[i] = pairs[i * 2];
-                          lengths[i] = pairs[i * 2 + 1];
+                          const rawWithBit = pairs[i * 2 + 1];
+                          rawLens[i] = rawWithBit & 0x7FFFFFFF;
+                          escapeBits[i] = rawWithBit >>> 31;
                         }
-                        strSlices = { offsets, lengths, inputStr: inputInfo.str };
+                        strSlices = { offsets, rawLens, escapeBits, inputStr: inputInfo.str };
                       }
                     }
                   }
@@ -1150,8 +1154,14 @@ export async function init(options?: {
                 }
                 if (strSlices !== null) {
                   const o = strSlices.offsets[rowViewIdx];
-                  const l = strSlices.lengths[rowViewIdx];
-                  return l === 0 ? '' : strSlices.inputStr.slice(o, o + l);
+                  const rl = strSlices.rawLens[rowViewIdx];
+                  if (rl === 0) return '';
+                  if (strSlices.escapeBits[rowViewIdx]) {
+                    // Escaped string: slice including quotes from original input, let JSON.parse unescape
+                    return JSON.parse(strSlices.inputStr.slice(o - 1, o + rl + 1));
+                  }
+                  // Unescaped string: direct slice (V8 SlicedString, zero character copy)
+                  return strSlices.inputStr.slice(o, o + rl);
                 }
                 return strFallback![rowViewIdx];
               },

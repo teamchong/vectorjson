@@ -211,6 +211,9 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
             try self.ensureTotalCapacityForSlice(allocator, document.len);
             try self.tape.buildFromSlice(allocator, document);
+            // Update string_buffer length: strings_ptr tracks how far we wrote,
+            // but the list length isn't updated by advanceString in non-streaming mode.
+            self.tape.string_buffer.strings.list.items.len = @intFromPtr(self.tape.strings_ptr) - @intFromPtr(self.tape.string_buffer.strings.list.items.ptr);
             return .{
                 .tape = &self.tape,
                 .index = 1,
@@ -1233,22 +1236,26 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 }
                 const string_parser = @import("parsers/string.zig");
                 const curr_str = self.currentString();
-                // Layout: [u32 packed_input_offset][u16 len_low][string_bytes]
-                const header_size = @sizeOf(u32) + @sizeOf(u16);
+                // Layout: [u32 packed_input_offset][u32 raw_input_len][u16 len_low][string_bytes]
+                const header_size = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u16); // 10
                 const next_str = curr_str + header_size;
                 const result = try string_parser.writeString(ptr, next_str);
                 const next_len = result.dst_end - next_str;
 
-                // Compute input byte offset and escape flag
-                const content_start = @intFromPtr(ptr) + 1; // after opening quote
-                const doc_base = @intFromPtr(self.tokens.document.ptr);
-                const input_offset: u32 = @intCast(content_start - doc_base);
-                const raw_len = result.src_end - (ptr + 1);
+                // Compute input byte offset from the structural token index.
+                // We use the token index (not pointer arithmetic) because ptr may
+                // point into a padding buffer rather than the original document.
+                // After next() consumed this token, the previous entry is at token[-1].
+                const prev_token: [*]const u32 = @ptrFromInt(@intFromPtr(self.tokens.token) - @sizeOf(u32));
+                const quote_byte_offset: u32 = prev_token[0]; // byte offset of '"' in original document
+                const input_offset: u32 = quote_byte_offset + 1; // skip opening quote
+                const raw_len: u32 = @intCast(result.src_end - (ptr + 1));
                 const has_escapes: bool = next_len != raw_len;
                 const packed_offset: u32 = input_offset | (if (has_escapes) @as(u32, 1) << 31 else 0);
 
-                // Write packed input offset before the length prefix
+                // Write packed input offset + raw input length before the length prefix
                 std.mem.writeInt(u32, curr_str[0..@sizeOf(u32)], packed_offset, native_endian);
+                std.mem.writeInt(u32, curr_str[@sizeOf(u32)..][0..@sizeOf(u32)], raw_len, native_endian);
 
                 self.appendWordAssumeCapacity(.{
                     .tag = .string,
@@ -1257,7 +1264,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                         .len = @intCast(next_len >> 16),
                     },
                 });
-                std.mem.writeInt(u16, curr_str[@sizeOf(u32)..][0..@sizeOf(u16)], @truncate(next_len), native_endian);
+                std.mem.writeInt(u16, curr_str[@sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], @truncate(next_len), native_endian);
                 self.advanceString(next_len + header_size);
             }
 

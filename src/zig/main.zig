@@ -158,11 +158,11 @@ export fn get_next_token() i32 {
             break :blk .number_double;
         },
         .string => blk: {
-            // Read string from the string buffer (skip u32 input-offset prefix)
+            // Read string from the string buffer (skip u32 packed_offset + u32 raw_input_len prefix)
             const native_endian = @import("builtin").cpu.arch.endian();
             const str_ptr_offset = word.data.ptr;
             const strings = parser.tape.string_buffer.strings.items();
-            const low_bits = std.mem.readInt(u16, strings.ptr[str_ptr_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
+            const low_bits = std.mem.readInt(u16, strings.ptr[str_ptr_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
             const high_bits: u64 = word.data.len;
             const str_len: u32 = @intCast(high_bits << 16 | low_bits);
             current_string_ptr = strings.ptr[str_ptr_offset + STR_HEADER_SIZE ..];
@@ -642,16 +642,16 @@ fn getDocParser(doc_id: i32) ?*DomParser {
 
 /// Read a string value from a parser's tape at the given index.
 /// Returns the raw byte slice pointing into the parser's string buffer.
-/// String buffer layout per string: [u32 packed_input_offset][u16 len_low][string_bytes]
-const STR_HEADER_SIZE: u32 = @sizeOf(u32) + @sizeOf(u16); // 6
+/// String buffer layout per string: [u32 packed_input_offset][u32 raw_input_len][u16 len_low][string_bytes]
+const STR_HEADER_SIZE: u32 = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u16); // 10
 
 fn readTapeString(p: *DomParser, index: u32) []const u8 {
     const native_endian = @import("builtin").cpu.arch.endian();
     const word = p.tape.get(index);
     const str_offset = word.data.ptr;
     const strings = p.tape.string_buffer.strings.items();
-    // Skip the u32 packed_input_offset, then read u16 len_low
-    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
+    // Skip u32 packed_input_offset + u32 raw_input_len, then read u16 len_low
+    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
     const high_bits: u64 = word.data.len;
     const str_len: u32 = @intCast(high_bits << 16 | low_bits);
     return strings.ptr[str_offset + STR_HEADER_SIZE ..][0..str_len];
@@ -668,13 +668,22 @@ fn readTapeStringPackedOffset(p: *DomParser, index: u32) u32 {
     return std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
 }
 
-/// Get the string length from a tape entry (without reading string_buffer).
+/// Read the raw input length for a string tape entry (bytes consumed from original input, excluding quotes).
+fn readTapeStringRawInputLen(p: *DomParser, index: u32) u32 {
+    const native_endian = @import("builtin").cpu.arch.endian();
+    const word = p.tape.get(index);
+    const str_offset = word.data.ptr;
+    const strings = p.tape.string_buffer.strings.items();
+    return std.mem.readInt(u32, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u32)], native_endian);
+}
+
+/// Get the unescaped string length from a tape entry.
 fn readTapeStringLen(p: *DomParser, index: u32) u32 {
     const native_endian = @import("builtin").cpu.arch.endian();
     const word = p.tape.get(index);
     const str_offset = word.data.ptr;
     const strings = p.tape.string_buffer.strings.items();
-    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
+    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
     const high_bits: u64 = word.data.len;
     return @intCast(high_bits << 16 | low_bits);
 }
@@ -1317,12 +1326,13 @@ export fn doc_read_column_str_raw(doc_id: i32, arr_index: u32, field_idx: u32) u
 }
 
 /// Read a string column as input-slice offsets — ZERO string copying.
-/// For each string in the column, outputs (input_byte_offset, byte_length) pairs.
-/// Returns 1 if ALL strings are escape-free (safe for JS input.slice()),
-/// Returns 0 if any string has escapes (caller should fall back to doc_read_column_str_raw).
+/// For each string in the column, outputs (input_byte_offset, raw_input_len | escape_bit) pairs.
+/// The raw_input_len is the number of bytes in the original input (excluding quotes).
+/// Bit 31 of the second u32 = has_escapes flag for that specific string.
+/// Always returns 1 on success. Returns 0 only on error (bad doc_id/tag).
 ///
-/// batch_buffer layout on success (return 1):
-///   [elem_count, offset_0, len_0, offset_1, len_1, ..., offset_N-1, len_N-1]
+/// batch_buffer layout:
+///   [elem_count, offset_0, rawLen_0|escapeBit, offset_1, rawLen_1|escapeBit, ...]
 export fn doc_read_column_str_slices(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const word = p.tape.get(arr_index);
@@ -1330,7 +1340,6 @@ export fn doc_read_column_str_slices(doc_id: i32, arr_index: u32, field_idx: u32
 
     batch_buffer[0] = 0;
     var row: u32 = 0;
-    var has_any_escapes = false;
 
     var elem_curr: u32 = arr_index + 1;
     while (row < 8191) { // 1 + 2*8191 = 16383, fits in batch_buffer
@@ -1364,26 +1373,22 @@ export fn doc_read_column_str_slices(doc_id: i32, arr_index: u32, field_idx: u32
             };
         }
 
-        // Read the packed input offset and string length from the value at field_curr + 1
+        // Read the packed input offset and raw input length from the value at field_curr + 1
         const val_idx = field_curr + 1;
         const packed_off = readTapeStringPackedOffset(p, val_idx);
-        const str_len = readTapeStringLen(p, val_idx);
+        const raw_input_len = readTapeStringRawInputLen(p, val_idx);
         const input_offset = packed_off & 0x7FFFFFFF;
-        const is_escaped = packed_off >> 31 != 0;
-
-        if (is_escaped) has_any_escapes = true;
+        const escape_bit: u32 = packed_off & 0x80000000; // preserve bit 31
 
         batch_buffer[1 + row * 2] = input_offset;
-        batch_buffer[1 + row * 2 + 1] = str_len;
+        batch_buffer[1 + row * 2 + 1] = raw_input_len | escape_bit;
 
         elem_curr = ew.data.ptr;
         row += 1;
     }
 
     batch_buffer[0] = row;
-
-    if (has_any_escapes) return 0; // Caller should fall back
-    return 1; // All strings safe for input.slice()
+    return 1;
 }
 
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
