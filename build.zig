@@ -111,6 +111,16 @@ pub fn build(b: *std.Build) void {
         "doc_object_keys",
         // Doc stringify (tape → JSON bytes, one call)
         "doc_stringify",
+        // Eager materialization (tape → flat binary buffer, one call)
+        "doc_materialize",
+        "doc_materialize_ptr",
+        "doc_materialize_len",
+        "doc_materialize_free",
+        // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
+        "utf8_to_utf16",
+        "get_utf16_ptr",
+        "get_utf16_ptr_addr",
+        "doc_read_string_utf16",
     };
 
     // Install to zig-out/bin/engine.wasm

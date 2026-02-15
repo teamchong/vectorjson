@@ -568,11 +568,12 @@ export async function init(options?: {
   }
 
   // --- Stringify helper: copy a JS string into engine memory ---
-  function writeStringToMemory(str: string): { ptr: number; len: number } {
+  // Returns ptr, len (actual UTF-8 bytes), and allocLen (allocated size for dealloc).
+  function writeStringToMemory(str: string): { ptr: number; len: number; allocLen: number } {
     if (str.length === 0) {
       // Zero-length alloc returns null — use a dummy pointer since
       // the callee won't read any bytes anyway.
-      return { ptr: 1, len: 0 };
+      return { ptr: 1, len: 0, allocLen: 0 };
     }
     // Worst case: 3 bytes per UTF-16 code unit
     const maxBytes = str.length * 3;
@@ -583,7 +584,7 @@ export async function init(options?: {
     const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
     const result = encoder.encodeInto(str, target);
     const len = result.written!;
-    return { ptr, len };
+    return { ptr, len, allocLen: maxBytes };
   }
 
   // --- Stringify helper: recursively write a JS value ---
@@ -628,11 +629,11 @@ export async function init(options?: {
         break;
 
       case "string": {
-        const { ptr, len } = writeStringToMemory(value);
+        const { ptr, len, allocLen } = writeStringToMemory(value);
         try {
           bridge.stringifyString(ptr, len);
         } finally {
-          if (len > 0) bridge.dealloc(ptr, len);
+          if (allocLen > 0) bridge.dealloc(ptr, allocLen);
         }
         break;
       }
@@ -679,11 +680,11 @@ export async function init(options?: {
             ) {
               continue;
             }
-            const { ptr, len } = writeStringToMemory(key);
+            const { ptr, len, allocLen } = writeStringToMemory(key);
             try {
               bridge.stringifyKey(ptr, len);
             } finally {
-              if (len > 0) bridge.dealloc(ptr, len);
+              if (allocLen > 0) bridge.dealloc(ptr, allocLen);
             }
             writeValue(val);
           }
@@ -954,6 +955,7 @@ export async function init(options?: {
       },
       has(_target, prop) {
         if (prop === LAZY_PROXY) return true;
+        if (prop === "free" || prop === Symbol.dispose) return true;
         if (prop === "length") return true;
         if (typeof prop === "string") {
           const idx = Number(prop);
@@ -999,6 +1001,7 @@ export async function init(options?: {
       },
       has(_target, prop) {
         if (prop === LAZY_PROXY) return true;
+        if (prop === "free" || prop === Symbol.dispose) return true;
         if (typeof prop !== "string") return false;
         return config.hasProp(prop);
       },
@@ -1230,22 +1233,22 @@ export async function init(options?: {
           return _keys;
         },
         getProp(key: string): unknown {
-          const { ptr, len } = writeStringToMemory(key);
+          const { ptr, len, allocLen } = writeStringToMemory(key);
           try {
             const valRef = bridge.gcFindProperty(ref, ptr, len);
             if (valRef === null || valRef === undefined) return undefined;
             return wrapGC(valRef);
           } finally {
-            if (len > 0) bridge.dealloc(ptr, len);
+            if (allocLen > 0) bridge.dealloc(ptr, allocLen);
           }
         },
         hasProp(key: string): boolean {
-          const { ptr, len } = writeStringToMemory(key);
+          const { ptr, len, allocLen } = writeStringToMemory(key);
           try {
             const valRef = bridge.gcFindProperty(ref, ptr, len);
             return valRef !== null && valRef !== undefined;
           } finally {
-            if (len > 0) bridge.dealloc(ptr, len);
+            if (allocLen > 0) bridge.dealloc(ptr, allocLen);
           }
         },
         materialize: () => deepMaterialize(ref),
