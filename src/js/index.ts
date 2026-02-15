@@ -75,23 +75,31 @@ export interface VectorJSON {
    * **Cursor pattern**: When iterating arrays of objects, VectorJSON returns a
    * shared cursor object that repositions on each access. This enables columnar
    * reads (one WASM call per field instead of per row) but means array elements
-   * are **not safe to store by reference**:
+   * should **not be stored by reference** — use destructuring to capture values:
    *
    * ```js
-   * // ✅ Sequential access — works perfectly
+   * // ✅ Destructure — captures plain values, safe to store (recommended)
+   * for (const item of data) {
+   *   const { id, name, score } = item;  // id=number, name=string, score=number
+   * }
+   *
+   * // ✅ Destructure + map — each iteration captures its own values
+   * const rows = data.map(item => {
+   *   const { id, name, score } = item;
+   *   return { id, name: String(name), score };
+   * });
+   *
+   * // ✅ Sequential property access — cursor is at correct position
    * for (const item of data) { use(item.id, item.name); }
    *
    * // ✅ JSON.stringify — processes elements sequentially
    * JSON.stringify(result);
    *
-   * // ✅ Destructure immediately — captures values
-   * const items = data.map(item => ({ ...item }));
-   *
-   * // ✅ Materialize — converts to plain JS objects
+   * // ✅ Materialize — converts entire tree to plain JS objects
    * const plain = vj.materialize(result);
    *
-   * // ❌ Storing references — all point to the same cursor
-   * const a = data[0]; const b = data[1]; // a === b
+   * // ❌ Storing cursor references — all point to the same object
+   * const a = data[0]; const b = data[1]; // a === b (same cursor)
    * ```
    */
   parse(input: string | Uint8Array): unknown;
