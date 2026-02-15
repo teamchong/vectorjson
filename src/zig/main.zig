@@ -8,8 +8,10 @@ const zimdjson = @import("zimdjson");
 const simd = @import("simd.zig");
 
 // --- Allocator ---
-// WASM linear memory allocator for receiving bytes from JS/WAT shim
-const gpa: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllocator.vtable };
+// WASM linear memory page allocator (child allocator for arena)
+const page_alloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllocator.vtable };
+// General-purpose allocator (used for long-lived allocs like alloc/dealloc exports)
+const gpa = page_alloc;
 
 // --- Parser state ---
 const DomParser = zimdjson.dom.FullParser(.default);
@@ -680,13 +682,13 @@ export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     return slot_id;
 }
 
-/// Free a document slot, releasing its internal buffers.
-/// The slot is reset to a fresh state and can be reused.
+/// Free a document slot, marking it available for reuse.
+/// Parser buffers are retained — parseFromSlice reuses them automatically:
+///   string_buffer.reset() clears data, retains capacity
+///   ensureTotalCapacityForSlice only grows, never shrinks
 export fn doc_free(doc_id: i32) void {
     if (doc_id < 0 or doc_id >= MAX_DOC_SLOTS) return;
     const uid: usize = @intCast(doc_id);
-    doc_parsers[uid].deinit(gpa);
-    doc_parsers[uid] = DomParser.init;
     doc_active[uid] = false;
 }
 
@@ -978,6 +980,353 @@ fn docStringifyValue(p: *DomParser, index: u32) void {
         },
         else => stringifier.writeNull(),
     }
+}
+
+// --- Eager materialization: tape → flat binary buffer in one WASM call ---
+//
+// Uses an arena allocator: all materialization allocations are pointer bumps,
+// and doc_materialize_free() resets the entire arena instantly.
+//
+// Buffer format (depth-first traversal):
+//   TAG_NULL(0):   [0]
+//   TAG_TRUE(1):   [1]
+//   TAG_FALSE(2):  [2]
+//   TAG_NUMBER(3): [3][f64 LE 8 bytes]
+//   TAG_STRING(4): [4][u32 LE char_count][pad?][...utf16le code units]
+//   TAG_ARRAY(5):  [5][u32 LE count][...children]
+//   TAG_OBJECT(6): [6][u32 LE count][u32 key_char_count][pad?][key utf16le]...[child value]...
+//
+// Strings are encoded as UTF-16LE code units. A 1-byte alignment pad is
+// inserted before the u16 data when the current offset is odd, so that
+// JS can construct a Uint16Array view directly (requires 2-byte alignment).
+// JS reads this buffer linearly via String.fromCharCode — zero TextDecoder,
+// zero FFI calls needed.
+
+var mat_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(page_alloc);
+var mat_buffer: ?[*]u8 = null;
+var mat_len: u32 = 0;
+var mat_cap: u32 = 0;
+var mat_error: bool = false;
+
+fn matEnsure(need: u32) void {
+    if (mat_error) return;
+    const required = mat_len + need;
+    if (required <= mat_cap) return;
+    var new_cap = if (mat_cap == 0) @as(u32, 4096) else mat_cap;
+    while (new_cap < required) new_cap *|= 2;
+    const allocator = mat_arena.allocator();
+    if (mat_buffer) |buf| {
+        const new = allocator.realloc(buf[0..mat_cap], new_cap) catch {
+            mat_error = true;
+            return;
+        };
+        mat_buffer = new.ptr;
+    } else {
+        const new = allocator.alloc(u8, new_cap) catch {
+            mat_error = true;
+            return;
+        };
+        mat_buffer = new.ptr;
+    }
+    mat_cap = new_cap;
+}
+
+fn matWriteByte(b: u8) void {
+    matEnsure(1);
+    if (mat_error) return;
+    mat_buffer.?[mat_len] = b;
+    mat_len += 1;
+}
+
+fn matWriteU32(v: u32) void {
+    matEnsure(4);
+    if (mat_error) return;
+    const buf = mat_buffer.?;
+    std.mem.writeInt(u32, buf[mat_len..][0..4], v, .little);
+    mat_len += 4;
+}
+
+fn matWriteF64(v: f64) void {
+    matEnsure(8);
+    if (mat_error) return;
+    const buf = mat_buffer.?;
+    const bytes: [8]u8 = @bitCast(v);
+    @memcpy(buf[mat_len..][0..8], &bytes);
+    mat_len += 8;
+}
+
+fn matWriteBytes(data: []const u8) void {
+    const len: u32 = @intCast(data.len);
+    matEnsure(len);
+    if (mat_error) return;
+    @memcpy(mat_buffer.?[mat_len..][0..len], data);
+    mat_len += len;
+}
+
+// --- UTF-8 → UTF-16LE conversion for eager materialization ---
+
+/// Count the number of UTF-16 code units needed to represent a UTF-8 byte slice.
+/// For ASCII (the common case in JSON), each byte maps to exactly one u16.
+fn utf8Utf16Len(src: []const u8) u32 {
+    var i: usize = 0;
+    var count: u32 = 0;
+    while (i < src.len) {
+        const b = src[i];
+        if (b < 0x80) {
+            count += 1;
+            i += 1;
+        } else if (b < 0xE0) {
+            count += 1;
+            i += 2;
+        } else if (b < 0xF0) {
+            count += 1;
+            i += 3;
+        } else {
+            count += 2; // surrogate pair
+            i += 4;
+        }
+    }
+    return count;
+}
+
+/// Convert UTF-8 bytes to UTF-16LE, writing directly into a byte buffer.
+/// For ASCII bytes, this is just widening: byte → [byte, 0x00].
+/// For multi-byte sequences, decodes the codepoint and writes u16 LE.
+/// For codepoints above U+FFFF, writes a UTF-16 surrogate pair (2 × u16).
+fn utf8ToUtf16Le(src: []const u8, dst: [*]u8, start: u32) void {
+    var i: usize = 0;
+    var out: u32 = start;
+    while (i < src.len) {
+        const b = src[i];
+        if (b < 0x80) {
+            // ASCII — most common case in JSON keys/values
+            dst[out] = b;
+            dst[out + 1] = 0;
+            out += 2;
+            i += 1;
+        } else if (b < 0xE0) {
+            // 2-byte UTF-8 → 1 BMP code unit
+            const cp: u32 = (@as(u32, b & 0x1F) << 6) | @as(u32, src[i + 1] & 0x3F);
+            dst[out] = @truncate(cp);
+            dst[out + 1] = @truncate(cp >> 8);
+            out += 2;
+            i += 2;
+        } else if (b < 0xF0) {
+            // 3-byte UTF-8 → 1 BMP code unit
+            const cp: u32 = (@as(u32, b & 0x0F) << 12) | (@as(u32, src[i + 1] & 0x3F) << 6) | @as(u32, src[i + 2] & 0x3F);
+            dst[out] = @truncate(cp);
+            dst[out + 1] = @truncate(cp >> 8);
+            out += 2;
+            i += 3;
+        } else {
+            // 4-byte UTF-8 → surrogate pair (2 × u16)
+            const cp: u32 = (@as(u32, b & 0x07) << 18) | (@as(u32, src[i + 1] & 0x3F) << 12) | (@as(u32, src[i + 2] & 0x3F) << 6) | @as(u32, src[i + 3] & 0x3F);
+            const adj = cp - 0x10000;
+            const high: u16 = @intCast(0xD800 + (adj >> 10));
+            const low: u16 = @intCast(0xDC00 + (adj & 0x3FF));
+            dst[out] = @truncate(high);
+            dst[out + 1] = @truncate(high >> 8);
+            dst[out + 2] = @truncate(low);
+            dst[out + 3] = @truncate(low >> 8);
+            out += 4;
+            i += 4;
+        }
+    }
+}
+
+/// Write a UTF-8 string as UTF-16LE into the materialization buffer.
+/// Format: [u32 char_count][pad?][...utf16le code units]
+/// A 1-byte pad is inserted when the current offset is odd, ensuring
+/// the u16 data starts at an even offset for Uint16Array compatibility.
+fn matWriteStringUtf16(str: []const u8) void {
+    if (mat_error) return;
+    const char_count = utf8Utf16Len(str);
+    matWriteU32(char_count);
+    if (char_count == 0) return;
+    // Pad to 2-byte alignment for Uint16Array on JS side
+    if (mat_len & 1 != 0) matWriteByte(0);
+    matEnsure(char_count * 2);
+    if (mat_error) return;
+    utf8ToUtf16Le(str, mat_buffer.?, mat_len);
+    mat_len += char_count * 2;
+}
+
+noinline fn docMaterializeValue(p: *DomParser, index: u32) void {
+    if (mat_error) return;
+    const word = p.tape.get(index);
+    switch (word.tag) {
+        .null => matWriteByte(0),
+        .true => matWriteByte(1),
+        .false => matWriteByte(2),
+        .unsigned => {
+            matWriteByte(3);
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            matWriteF64(@floatFromInt(@as(u64, next_raw)));
+        },
+        .signed => {
+            matWriteByte(3);
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            matWriteF64(@floatFromInt(@as(i64, @bitCast(next_raw))));
+        },
+        .double => {
+            matWriteByte(3);
+            const next_raw: u64 = @bitCast(p.tape.get(index + 1));
+            matWriteF64(@bitCast(next_raw));
+        },
+        .string => {
+            matWriteByte(4);
+            const str = readTapeString(p, index);
+            matWriteStringUtf16(str);
+        },
+        .array_opening => {
+            matWriteByte(5);
+            const count = word.data.len;
+            matWriteU32(count);
+            var curr: u32 = index + 1;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const w = p.tape.get(curr);
+                if (w.tag == .array_closing) break;
+                docMaterializeValue(p, curr);
+                curr = switch (w.tag) {
+                    .array_opening, .object_opening => w.data.ptr,
+                    .unsigned, .signed, .double => curr + 2,
+                    else => curr + 1,
+                };
+            }
+        },
+        .object_opening => {
+            matWriteByte(6);
+            const count = word.data.len;
+            matWriteU32(count);
+            var curr: u32 = index + 1;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const w = p.tape.get(curr);
+                if (w.tag == .object_closing) break;
+                // Write key as UTF-16LE
+                const key_str = readTapeString(p, curr);
+                matWriteStringUtf16(key_str);
+                // Write value
+                docMaterializeValue(p, curr + 1);
+                // Advance past key + value
+                const val_w = p.tape.get(curr + 1);
+                curr = switch (val_w.tag) {
+                    .array_opening, .object_opening => val_w.data.ptr,
+                    .unsigned, .signed, .double => curr + 3,
+                    else => curr + 2,
+                };
+            }
+        },
+        else => matWriteByte(0), // unknown → null
+    }
+}
+
+/// Materialize a document value to a flat binary buffer.
+/// Returns 0 on success, -1 on error.
+/// Read result via doc_materialize_ptr/len. Free with doc_materialize_free.
+export fn doc_materialize(doc_id: i32, index: u32) i32 {
+    const p = getDocParser(doc_id) orelse return -1;
+    mat_len = 0;
+    mat_error = false;
+    docMaterializeValue(p, index);
+    if (mat_error) return -1;
+    return 0;
+}
+
+/// Get pointer to materialization result buffer.
+export fn doc_materialize_ptr() u32 {
+    return if (mat_buffer) |buf| @intFromPtr(buf) else 0;
+}
+
+/// Get length of materialization result.
+export fn doc_materialize_len() u32 {
+    return mat_len;
+}
+
+/// Free the materialization buffer (resets arena — instant).
+export fn doc_materialize_free() void {
+    _ = mat_arena.reset(.retain_capacity);
+    mat_buffer = null;
+    mat_len = 0;
+    mat_cap = 0;
+}
+
+// --- General UTF-8 → UTF-16LE conversion export ---
+//
+// Used by JS to convert ANY UTF-8 string in linear memory to UTF-16LE,
+// replacing TextDecoder entirely. The buffer grows dynamically and is
+// retained between calls (typical JSON strings are small, so the first
+// allocation serves most subsequent calls without re-allocating).
+
+var str_utf16_buf: ?[*]u8 = null;
+var str_utf16_cap: u32 = 0;
+var str_utf16_char_count: u32 = 0;
+
+// Fixed-address cache: JS reads this directly via DataView instead of
+// calling get_utf16_ptr(). Updated after every conversion.
+var str_utf16_ptr_cache: u32 = 0;
+
+fn getUtf16Buf(needed: u32) ?[*]u8 {
+    if (needed <= str_utf16_cap) return str_utf16_buf;
+    // Free old buffer and allocate larger one
+    if (str_utf16_buf) |buf| {
+        gpa.free(buf[0..str_utf16_cap]);
+    }
+    var new_cap = if (str_utf16_cap == 0) @as(u32, 1024) else str_utf16_cap;
+    while (new_cap < needed) new_cap *|= 2;
+    const new_buf = gpa.alloc(u8, new_cap) catch return null;
+    str_utf16_buf = new_buf.ptr;
+    str_utf16_cap = @intCast(new_buf.len);
+    // Update fixed-address cache so JS can read the pointer directly
+    str_utf16_ptr_cache = @intFromPtr(new_buf.ptr);
+    return new_buf.ptr;
+}
+
+/// Convert UTF-8 bytes at (ptr, len) to UTF-16LE in a shared buffer.
+/// Returns the number of u16 code units. Read result via get_utf16_ptr().
+/// This is the Zig-side replacement for JS TextDecoder — one WASM call,
+/// then JS reads Uint16Array + String.fromCharCode.
+export fn utf8_to_utf16(ptr: [*]const u8, len: u32) u32 {
+    if (len == 0) {
+        str_utf16_char_count = 0;
+        return 0;
+    }
+    const src = ptr[0..len];
+    const char_count = utf8Utf16Len(src);
+    const needed = char_count * 2;
+    const buf = getUtf16Buf(needed) orelse return 0;
+    utf8ToUtf16Le(src, buf, 0);
+    str_utf16_char_count = char_count;
+    return char_count;
+}
+
+/// Get pointer to the UTF-16 conversion result buffer.
+export fn get_utf16_ptr() u32 {
+    return if (str_utf16_buf) |buf| @intFromPtr(buf) else 0;
+}
+
+/// Return the fixed address of str_utf16_ptr_cache.
+/// JS calls this ONCE at init, then reads the pointer directly from
+/// memory via DataView — zero WASM calls to get the buffer location.
+export fn get_utf16_ptr_addr() u32 {
+    return @intFromPtr(&str_utf16_ptr_cache);
+}
+
+/// Read a doc string at tape index and convert to UTF-16LE — ONE WASM call.
+/// Replaces the 4-call sequence: doc_get_string_len + doc_get_string_ptr +
+/// utf8_to_utf16 + get_utf16_ptr.
+/// Returns char_count (number of u16 code units). Read result via get_utf16_ptr().
+export fn doc_read_string_utf16(doc_id: i32, index: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const str = readTapeString(p, index);
+    if (str.len == 0) return 0;
+    const char_count = utf8Utf16Len(str);
+    const needed = char_count * 2;
+    const buf = getUtf16Buf(needed) orelse return 0;
+    utf8ToUtf16Le(str, buf, 0);
+    str_utf16_char_count = char_count;
+    return char_count;
 }
 
 fn mapError(err: anytype) i32 {

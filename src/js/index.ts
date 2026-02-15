@@ -72,7 +72,7 @@ export interface VectorJSON {
    * Call .free() on the result to release resources immediately, or let
    * FinalizationRegistry handle it automatically when the Proxy is GC'd.
    */
-  parse(input: string | Uint8Array): unknown;
+  parse(input: string | Uint8Array, options?: { mode?: "lazy" | "eager" }): unknown;
   /**
    * Eagerly materialize a lazy proxy into plain JS objects.
    * WasmString values are converted to JS strings.
@@ -199,6 +199,18 @@ interface EngineExports {
   doc_batch_ptr(): number;
   doc_array_elements(docId: number, arrIndex: number): number;
   doc_object_keys(docId: number, objIndex: number): number;
+  // Eager materialization (tape → flat binary buffer, one WASM call)
+  doc_materialize(docId: number, index: number): number;
+  doc_materialize_ptr(): number;
+  doc_materialize_len(): number;
+  doc_materialize_free(): void;
+  // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
+  utf8_to_utf16(ptr: number, len: number): number;
+  get_utf16_ptr(): number;
+  // Single-call doc string → UTF-16LE (replaces 4-call ping-pong)
+  doc_read_string_utf16(docId: number, index: number): number;
+  // Fixed address of the UTF-16 buffer pointer (call once at init, then DataView read)
+  get_utf16_ptr_addr(): number;
 }
 
 interface BridgeExports {
@@ -268,6 +280,25 @@ interface BridgeExports {
   compareFree(): void;
 }
 
+// --- UTF-16 string helpers (module-level, no TextDecoder) ---
+
+/**
+ * Convert a Uint16Array of UTF-16 code units to a JS string.
+ * Uses chunked fromCharCode.apply to avoid argument-count limits
+ * in some JS engines (~65536 max args).
+ */
+function utf16ToString(codes: Uint16Array): string {
+  if (codes.length <= 8192) {
+    return String.fromCharCode.apply(null, codes as unknown as number[]);
+  }
+  let result = '';
+  for (let i = 0; i < codes.length; i += 8192) {
+    const chunk = codes.subarray(i, Math.min(i + 8192, codes.length));
+    result += String.fromCharCode.apply(null, chunk as unknown as number[]);
+  }
+  return result;
+}
+
 // --- WasmString: string data stays in WasmGC memory ---
 
 const WASM_STRING_BRAND = Symbol("vectorjson.WasmString");
@@ -295,7 +326,6 @@ export class WasmString {
     len: number,
     private _bridge: BridgeExports,
     private _engine: EngineExports,
-    private _decoder: TextDecoder,
   ) {
     this._ref = ref;
     this._len = len;
@@ -321,7 +351,7 @@ export class WasmString {
     }
   }
 
-  /** Materialize a JS string. Cached after first call. */
+  /** Materialize a JS string. Cached after first call. Uses Zig UTF-8→UTF-16 conversion. */
   toString(): string {
     if (this._cached !== null) return this._cached;
     if (this._len === 0) {
@@ -332,9 +362,18 @@ export class WasmString {
     if (ptr === 0) throw new Error("VectorJSON: Failed to allocate for string");
     try {
       this._bridge.gcCopyString(this._ref, ptr);
-      this._cached = this._decoder.decode(
-        new Uint8Array(this._engine.memory.buffer, ptr, this._len),
+      // Zig converts UTF-8 → UTF-16LE in a shared buffer, then JS reads via fromCharCode.
+      // Buffer pointer is at a fixed address — read directly, no extra WASM call.
+      const charCount = this._engine.utf8_to_utf16(ptr, this._len);
+      if (charCount === 0) {
+        this._cached = "";
+        return "";
+      }
+      const u16ptr = new DataView(this._engine.memory.buffer).getUint32(
+        this._engine.get_utf16_ptr_addr(), true,
       );
+      const codes = new Uint16Array(this._engine.memory.buffer, u16ptr, charCount);
+      this._cached = utf16ToString(codes);
       return this._cached;
     } finally {
       this._bridge.dealloc(ptr, this._len);
@@ -415,11 +454,32 @@ export async function init(options?: {
   const engineInstance = await WebAssembly.instantiate(engineModule, {});
   const engine = engineInstance.exports as unknown as EngineExports;
 
-  // --- Text decoder for reading strings from engine memory ---
-  const decoder = new TextDecoder("utf-8");
+  // --- Read strings from engine memory via Zig UTF-8→UTF-16 conversion ---
+  // No TextDecoder — Zig converts UTF-8 to UTF-16LE, JS reads via fromCharCode.
+  // The UTF-16 buffer pointer lives at a fixed address in WASM memory.
+  // JS reads it directly via DataView — zero WASM calls to locate the buffer.
+  const utf16PtrAddr = engine.get_utf16_ptr_addr(); // one-time init
 
+  /** Read UTF-16 result from the shared Zig buffer (zero WASM calls — direct memory read). */
+  function readUtf16Result(charCount: number): string {
+    const ptr = new DataView(engine.memory.buffer).getUint32(utf16PtrAddr, true);
+    const codes = new Uint16Array(engine.memory.buffer, ptr, charCount);
+    return utf16ToString(codes);
+  }
+
+  /** Convert arbitrary UTF-8 bytes in linear memory to a JS string (1 WASM call). */
   function readString(ptr: number, len: number): string {
-    return decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
+    if (len === 0) return "";
+    const charCount = engine.utf8_to_utf16(ptr, len);
+    if (charCount === 0) return "";
+    return readUtf16Result(charCount);
+  }
+
+  /** Read a doc tape string as JS string (1 WASM call — no ping-pong). */
+  function docReadStringUtf16(docId: number, index: number): string {
+    const charCount = engine.doc_read_string_utf16(docId, index);
+    if (charCount === 0) return "";
+    return readUtf16Result(charCount);
   }
 
   // --- Instantiate WAT bridge, linking to engine ---
@@ -487,20 +547,40 @@ export async function init(options?: {
   const bridge = bridgeInstance.exports as unknown as BridgeExports;
   const encoder = new TextEncoder();
 
+  // --- Persistent input buffer — grows to accommodate largest input, never shrinks ---
+  let inputBufPtr = 0;
+  let inputBufLen = 0;
+
+  function ensureInputBuffer(needed: number): number {
+    if (needed <= inputBufLen) return inputBufPtr;
+    // Free old buffer
+    if (inputBufPtr !== 0) engine.dealloc(inputBufPtr, inputBufLen);
+    // Allocate with doubling strategy (minimum 4KB)
+    let cap = inputBufLen === 0 ? 4096 : inputBufLen;
+    while (cap < needed) cap *= 2;
+    const ptr = engine.alloc(cap);
+    if (ptr === 0) throw new Error("VectorJSON: Failed to allocate input buffer");
+    inputBufPtr = ptr;
+    inputBufLen = cap;
+    return ptr;
+  }
+
   // --- Stringify helper: copy a JS string into engine memory ---
   function writeStringToMemory(str: string): { ptr: number; len: number } {
-    const bytes = encoder.encode(str);
-    const len = bytes.byteLength;
-    if (len === 0) {
+    if (str.length === 0) {
       // Zero-length alloc returns null — use a dummy pointer since
       // the callee won't read any bytes anyway.
       return { ptr: 1, len: 0 };
     }
-    const ptr = bridge.alloc(len);
+    // Worst case: 3 bytes per UTF-16 code unit
+    const maxBytes = str.length * 3;
+    const ptr = bridge.alloc(maxBytes);
     if (ptr === 0) {
       throw new Error("VectorJSON: Failed to allocate memory for string");
     }
-    new Uint8Array(engine.memory.buffer, ptr, len).set(bytes);
+    const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
+    const result = encoder.encodeInto(str, target);
+    const len = result.written!;
     return { ptr, len };
   }
 
@@ -656,14 +736,9 @@ export async function init(options?: {
   );
 
   // --- Read a doc string at a tape index into a JS string ---
+  // Single WASM call: doc_read_string_utf16 reads tape + converts to UTF-16LE.
   function docReadString(docId: number, index: number): string {
-    const len = engine.doc_get_string_len(docId, index);
-    if (len === 0) return "";
-    const ptr = engine.doc_get_string_ptr(docId, index);
-    // Guard: if the doc was freed between the len/ptr calls (race with
-    // FinalizationRegistry), the pointer may be stale/out-of-bounds.
-    if (ptr < 0 || ptr + len > engine.memory.buffer.byteLength) return "";
-    return readString(ptr, len);
+    return docReadStringUtf16(docId, index);
   }
 
   // --- Read a doc string → WasmGC $JsonString externref → WasmString ---
@@ -672,16 +747,16 @@ export async function init(options?: {
     const len = engine.doc_get_string_len(docId, index);
     if (len === 0) {
       const ref = bridge.createGCString(1, 0);
-      return new WasmString(ref, 0, bridge, engine, decoder);
+      return new WasmString(ref, 0, bridge, engine);
     }
     const ptr = engine.doc_get_string_ptr(docId, index);
     // Guard: stale pointer after doc was freed between len/ptr calls
     if (ptr < 0 || ptr + len > engine.memory.buffer.byteLength) {
       const ref = bridge.createGCString(1, 0);
-      return new WasmString(ref, 0, bridge, engine, decoder);
+      return new WasmString(ref, 0, bridge, engine);
     }
     const ref = bridge.createGCString(ptr, len);
-    return new WasmString(ref, len, bridge, engine, decoder);
+    return new WasmString(ref, len, bridge, engine);
   }
 
   // --- Config interfaces for shared proxy factories ---
@@ -741,6 +816,80 @@ export async function init(options?: {
       }
       default:
         return null;
+    }
+  }
+
+  // --- Eager materialization: read flat binary buffer from WASM ---
+  // Buffer format: [tag][payload...] depth-first (see main.zig for spec)
+  // Strings are UTF-16LE code units — JS reads them via String.fromCharCode.
+  // One WASM call produces the buffer, then JS reads it linearly — zero
+  // TextDecoder, zero FFI calls needed.
+
+  // Read a UTF-16LE string from the materialization buffer.
+  // Format: [u32 char_count][pad?][...utf16le code units]
+  // A 1-byte alignment pad exists when the offset after char_count is odd.
+  function readUtf16String(): string {
+    const charCount = dv!.getUint32(matOffset, true); matOffset += 4;
+    if (charCount === 0) return '';
+    // Skip alignment padding (Zig inserts a pad byte when offset is odd)
+    if (matOffset % 2 !== 0) matOffset++;
+    const codes = new Uint16Array(engine.memory.buffer, matBufPtr + matOffset, charCount);
+    matOffset += charCount * 2;
+    return utf16ToString(codes);
+  }
+
+  // Shared state for materializeFromBuffer (avoids passing through recursion)
+  let matBufPtr = 0;
+  let matOffset = 0;
+  let matBuf: Uint8Array | null = null;
+  let dv: DataView | null = null;
+
+  function materializeFromBuffer(): unknown {
+    matBufPtr = engine.doc_materialize_ptr();
+    const bufLen = engine.doc_materialize_len();
+    if (matBufPtr === 0 || bufLen === 0) return null;
+
+    matBuf = new Uint8Array(engine.memory.buffer, matBufPtr, bufLen);
+    dv = new DataView(engine.memory.buffer, matBufPtr, bufLen);
+    matOffset = 0;
+
+    const result = readValue();
+
+    // Release references to avoid retaining WASM memory views
+    matBuf = null;
+    dv = null;
+    return result;
+  }
+
+  function readValue(): unknown {
+    const tag = matBuf![matOffset++];
+    switch (tag) {
+      case 0: return null;  // TAG_NULL
+      case 1: return true;  // TAG_TRUE
+      case 2: return false; // TAG_FALSE
+      case 3: { // TAG_NUMBER
+        const v = dv!.getFloat64(matOffset, true);
+        matOffset += 8;
+        return v;
+      }
+      case 4: // TAG_STRING — UTF-16LE code units, NO TextDecoder
+        return readUtf16String();
+      case 5: { // TAG_ARRAY
+        const count = dv!.getUint32(matOffset, true); matOffset += 4;
+        const arr = new Array(count);
+        for (let i = 0; i < count; i++) arr[i] = readValue();
+        return arr;
+      }
+      case 6: { // TAG_OBJECT
+        const count = dv!.getUint32(matOffset, true); matOffset += 4;
+        const obj: Record<string, unknown> = {};
+        for (let i = 0; i < count; i++) {
+          const key = readUtf16String();
+          obj[key] = readValue();
+        }
+        return obj;
+      }
+      default: return null;
     }
   }
 
@@ -1029,7 +1178,7 @@ export async function init(options?: {
     if (tag === GC_BOOL) return bridge.gcGetBool(ref) !== 0;
     if (tag === GC_NUMBER) return bridge.gcGetNumber(ref);
     if (tag === GC_STRING) {
-      return new WasmString(ref, bridge.gcGetStringLen(ref), bridge, engine, decoder);
+      return new WasmString(ref, bridge.gcGetStringLen(ref), bridge, engine);
     }
 
     if (tag === GC_ARRAY) {
@@ -1093,85 +1242,101 @@ export async function init(options?: {
 
   // --- Public API ---
   _instance = {
-    parse(input: string | Uint8Array): unknown {
-      const bytes = typeof input === "string" ? encoder.encode(input) : input;
-      const len = bytes.byteLength;
+    parse(input: string | Uint8Array, options?: { mode?: "lazy" | "eager" }): unknown {
+      const eager = options?.mode === "eager";
 
-      // Allocate in engine memory and copy input bytes
-      const ptr = engine.alloc(len);
-      if (ptr === 0) {
-        throw new Error("VectorJSON: Failed to allocate memory for input");
+      // Write input into reusable WASM buffer (no per-parse alloc/dealloc)
+      let ptr: number;
+      let len: number;
+      if (typeof input === "string") {
+        // Worst case: 3 bytes per UTF-16 code unit
+        const maxBytes = input.length * 3;
+        ptr = ensureInputBuffer(maxBytes);
+        const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
+        const result = encoder.encodeInto(input, target);
+        len = result.written!;
+      } else {
+        len = input.byteLength;
+        ptr = ensureInputBuffer(len);
+        new Uint8Array(engine.memory.buffer, ptr, len).set(input);
       }
 
-      try {
-        new Uint8Array(engine.memory.buffer, ptr, len).set(bytes);
-
-        // Primary path: parse into tape via doc slots (fast, lazy)
-        let docId = engine.doc_parse(ptr, len);
-        if (docId < 0) {
-          const errCode = engine.get_error_code();
-          // Slot exhaustion (2) or OOM (13) — try to reclaim via GC and retry
-          if (errCode === 2 || errCode === 13) {
-            if (typeof globalThis.gc === "function") {
-              globalThis.gc();
-            }
-            docId = engine.doc_parse(ptr, len);
+      // Primary path: parse into tape via doc slots (fast, lazy)
+      let docId = engine.doc_parse(ptr, len);
+      if (docId < 0) {
+        const errCode = engine.get_error_code();
+        // Slot exhaustion (2) or OOM (13) — try to reclaim via GC and retry
+        if (errCode === 2 || errCode === 13) {
+          if (typeof globalThis.gc === "function") {
+            globalThis.gc();
           }
+          docId = engine.doc_parse(ptr, len);
         }
-
-        if (docId >= 0) {
-          // Doc-slot path succeeded
-          const rootTag = engine.doc_get_tag(docId, 1);
-          if (rootTag <= TAG_STRING) {
-            // Primitive — extract and free immediately
-            let result: unknown;
-            switch (rootTag) {
-              case TAG_NULL:
-                result = null;
-                break;
-              case TAG_TRUE:
-                result = true;
-                break;
-              case TAG_FALSE:
-                result = false;
-                break;
-              case TAG_NUMBER:
-                result = engine.doc_get_number(docId, 1);
-                break;
-              case TAG_STRING:
-                result = docStringToGC(docId, 1);
-                break;
-              default:
-                result = null;
-            }
-            engine.doc_free(docId);
-            return result;
-          }
-
-          // Container — register with FinalizationRegistry
-          const generation = (docGenerations.get(docId) ?? 0) + 1;
-          docGenerations.set(docId, generation);
-
-          const keepAlive = { docId };
-          docRegistry.register(keepAlive, { docId, generation }, keepAlive);
-
-          return wrapDoc(docId, 1, keepAlive, generation);
-        }
-
-        // Fallback path: doc slots exhausted (Bun's JSC defers FinalizationRegistry
-        // callbacks, so gc() retry may not free slots). Use the GC tree path instead.
-        // This builds the full tree eagerly but has no slot limit.
-        const gcRef = bridge.parseJSON(ptr, len);
-        if (gcRef === null || gcRef === undefined) {
-          const errorCode = bridge.getError();
-          const msg =
-            ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-          throw new SyntaxError(`VectorJSON: ${msg}`);
-        }
-        return wrapGC(gcRef);
-      } finally {
-        engine.dealloc(ptr, len);
       }
+
+      if (docId >= 0) {
+        // Doc-slot path succeeded
+        const rootTag = engine.doc_get_tag(docId, 1);
+        if (rootTag <= TAG_STRING) {
+          // Primitive — extract and free immediately
+          let result: unknown;
+          switch (rootTag) {
+            case TAG_NULL:
+              result = null;
+              break;
+            case TAG_TRUE:
+              result = true;
+              break;
+            case TAG_FALSE:
+              result = false;
+              break;
+            case TAG_NUMBER:
+              result = engine.doc_get_number(docId, 1);
+              break;
+            case TAG_STRING:
+              result = docStringToGC(docId, 1);
+              break;
+            default:
+              result = null;
+          }
+          engine.doc_free(docId);
+          return result;
+        }
+
+        // Eager mode: SIMD parse → flat buffer → POJOs (one WASM call, zero Proxy overhead)
+        if (eager) {
+          const rc = engine.doc_materialize(docId, 1);
+          engine.doc_free(docId);
+          if (rc < 0) {
+            throw new Error("VectorJSON: eager materialization failed");
+          }
+          const result = materializeFromBuffer();
+          engine.doc_materialize_free();
+          return result;
+        }
+
+        // Container — register with FinalizationRegistry
+        const generation = (docGenerations.get(docId) ?? 0) + 1;
+        docGenerations.set(docId, generation);
+
+        const keepAlive = { docId };
+        docRegistry.register(keepAlive, { docId, generation }, keepAlive);
+
+        return wrapDoc(docId, 1, keepAlive, generation);
+      }
+
+      // Fallback path: doc slots exhausted (Bun's JSC defers FinalizationRegistry
+      // callbacks, so gc() retry may not free slots). Use the GC tree path instead.
+      // This builds the full tree eagerly but has no slot limit.
+      const gcRef = bridge.parseJSON(ptr, len);
+      if (gcRef === null || gcRef === undefined) {
+        const errorCode = bridge.getError();
+        const msg =
+          ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+        throw new SyntaxError(`VectorJSON: ${msg}`);
+      }
+      return wrapGC(gcRef);
+      // No dealloc — input buffer is persistent and reused across parses
     },
 
     materialize(value: unknown): unknown {
@@ -1241,16 +1406,16 @@ export async function init(options?: {
       schema: Record<string, unknown>,
     ): ValidationResult {
       // Stringify schema and load it
-      const schemaJson = encoder.encode(JSON.stringify(schema));
-      const sPtr = bridge.alloc(schemaJson.byteLength);
+      const schemaStr = JSON.stringify(schema);
+      const sMaxBytes = schemaStr.length * 3;
+      const sPtr = bridge.alloc(sMaxBytes);
       if (sPtr === 0) {
         throw new Error("VectorJSON: Failed to allocate memory for schema");
       }
-      new Uint8Array(engine.memory.buffer, sPtr, schemaJson.byteLength).set(
-        schemaJson,
-      );
-      const sRes = bridge.validateLoadSchema(sPtr, schemaJson.byteLength);
-      bridge.dealloc(sPtr, schemaJson.byteLength);
+      const sResult = encoder.encodeInto(schemaStr, new Uint8Array(engine.memory.buffer, sPtr, sMaxBytes));
+      const sLen = sResult.written!;
+      const sRes = bridge.validateLoadSchema(sPtr, sLen);
+      bridge.dealloc(sPtr, sMaxBytes);
       if (sRes !== 0) {
         throw new SyntaxError(
           `VectorJSON: Failed to compile schema (code ${sRes})`,
@@ -1258,16 +1423,16 @@ export async function init(options?: {
       }
 
       // Stringify data and validate
-      const dataJson = encoder.encode(JSON.stringify(data));
-      const dPtr = bridge.alloc(dataJson.byteLength);
+      const dataStr = JSON.stringify(data);
+      const dMaxBytes = dataStr.length * 3;
+      const dPtr = bridge.alloc(dMaxBytes);
       if (dPtr === 0) {
         throw new Error("VectorJSON: Failed to allocate memory for data");
       }
-      new Uint8Array(engine.memory.buffer, dPtr, dataJson.byteLength).set(
-        dataJson,
-      );
-      const dRes = bridge.validateCheck(dPtr, dataJson.byteLength);
-      bridge.dealloc(dPtr, dataJson.byteLength);
+      const dResult = encoder.encodeInto(dataStr, new Uint8Array(engine.memory.buffer, dPtr, dMaxBytes));
+      const dLen = dResult.written!;
+      const dRes = bridge.validateCheck(dPtr, dLen);
+      bridge.dealloc(dPtr, dMaxBytes);
 
       if (dRes === 2) {
         throw new Error("VectorJSON: No schema loaded");
@@ -1309,24 +1474,27 @@ export async function init(options?: {
         3: "type_changed",
       };
 
-      // Convert inputs to JSON bytes.
-      // Uint8Array → use as-is (raw JSON).
-      // Anything else → JSON.stringify to get valid JSON bytes.
-      const toJsonBytes = (val: unknown): Uint8Array => {
-        if (val instanceof Uint8Array) return val;
-        return encoder.encode(JSON.stringify(val));
+      // Encode input to WASM memory using encodeInto (no intermediate Uint8Array).
+      // Uint8Array → copy directly. Anything else → JSON.stringify + encodeInto.
+      const encodeToWasm = (val: unknown): { ptr: number; len: number; allocLen: number } => {
+        if (val instanceof Uint8Array) {
+          const ptr = bridge.alloc(val.byteLength);
+          if (ptr === 0) throw new Error("VectorJSON: Failed to allocate memory for compare");
+          new Uint8Array(engine.memory.buffer, ptr, val.byteLength).set(val);
+          return { ptr, len: val.byteLength, allocLen: val.byteLength };
+        }
+        const str = JSON.stringify(val);
+        const maxBytes = str.length * 3;
+        const ptr = bridge.alloc(maxBytes);
+        if (ptr === 0) throw new Error("VectorJSON: Failed to allocate memory for compare");
+        const result = encoder.encodeInto(str, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+        return { ptr, len: result.written!, allocLen: maxBytes };
       };
-      const jsonA = toJsonBytes(a);
-      const jsonB = toJsonBytes(b);
 
       // Allocate and copy A
-      const ptrA = bridge.alloc(jsonA.byteLength);
-      if (ptrA === 0) {
-        throw new Error("VectorJSON: Failed to allocate memory for compare A");
-      }
-      new Uint8Array(engine.memory.buffer, ptrA, jsonA.byteLength).set(jsonA);
-      const resA = bridge.compareParseA(ptrA, jsonA.byteLength);
-      bridge.dealloc(ptrA, jsonA.byteLength);
+      const encA = encodeToWasm(a);
+      const resA = bridge.compareParseA(encA.ptr, encA.len);
+      bridge.dealloc(encA.ptr, encA.allocLen);
       if (resA !== 0) {
         throw new SyntaxError("VectorJSON: Failed to parse first argument");
       }
@@ -1335,13 +1503,9 @@ export async function init(options?: {
       bridge.compareSetOrdered(options?.ordered ? 1 : 0);
 
       // Allocate and copy B
-      const ptrB = bridge.alloc(jsonB.byteLength);
-      if (ptrB === 0) {
-        throw new Error("VectorJSON: Failed to allocate memory for compare B");
-      }
-      new Uint8Array(engine.memory.buffer, ptrB, jsonB.byteLength).set(jsonB);
-      const resB = bridge.compareParseB(ptrB, jsonB.byteLength);
-      bridge.dealloc(ptrB, jsonB.byteLength);
+      const encB = encodeToWasm(b);
+      const resB = bridge.compareParseB(encB.ptr, encB.len);
+      bridge.dealloc(encB.ptr, encB.allocLen);
       if (resB !== 0) {
         throw new SyntaxError("VectorJSON: Failed to parse second argument");
       }
