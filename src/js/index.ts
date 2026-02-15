@@ -205,6 +205,7 @@ interface EngineExports {
   doc_read_column_tags(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_bool(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_str(docId: number, arrIndex: number, fieldIdx: number): number;
+  doc_read_column_str_utf16(docId: number, arrIndex: number, fieldIdx: number): number;
   // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
   utf8_to_utf16(ptr: number, len: number): number;
   get_utf16_ptr(): number;
@@ -958,8 +959,8 @@ export async function init(options?: {
     }
 
     if (expectedType === TAG_STRING) {
-      // Batch read: ONE WASM call gets all (ptr, len) pairs.
-      // Then N createGCString calls create WasmString wrappers.
+      // Batch read: ONE WASM call gets all (ptr, len) pairs via doc_read_column_str.
+      // Then N createGCString calls create WasmString wrappers (deferred conversion).
       // Total: 1 + N WASM calls instead of 3N (docStringToGC does 3 per string).
       const n = engine.doc_read_column_str(docId, arrIndex, fieldIdx);
       const batchPtr = engine.doc_batch_ptr();

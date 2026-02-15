@@ -1108,6 +1108,112 @@ export fn doc_read_column_str(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
     return row;
 }
 
+/// Batch string column → UTF-16LE: reads ALL strings at field_idx across an array,
+/// SIMD-converts each to UTF-16, and packs them into the UTF-16 buffer as:
+///   [u32 char_count_0][utf16 data_0][u32 char_count_1][utf16 data_1]...
+/// Returns total byte length written. JS reads via get_utf16_ptr().
+/// ONE WASM call replaces N individual doc_read_string_utf16 calls.
+export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    // First pass: calculate total buffer needed (sum of string lengths × 2 + 4 per string)
+    var total_bytes: u32 = 0;
+    var elem_count: u32 = 0;
+    {
+        var ec: u32 = arr_index + 1;
+        while (true) {
+            const ew = p.tape.get(ec);
+            if (ew.tag == .array_closing) break;
+            if (ew.tag == .object_opening) {
+                var fc: u32 = ec + 1;
+                var fi: u32 = 0;
+                while (fi < field_idx) : (fi += 1) {
+                    const kw = p.tape.get(fc);
+                    if (kw.tag == .object_closing) break;
+                    const vw = p.tape.get(fc + 1);
+                    fc = switch (vw.tag) {
+                        .array_opening, .object_opening => vw.data.ptr,
+                        .unsigned, .signed, .double => fc + 3,
+                        else => fc + 2,
+                    };
+                }
+                const str = readTapeString(p, fc + 1);
+                total_bytes += 4 + @as(u32, @intCast(str.len)) * 2; // u32 prefix + worst case UTF-16
+            } else {
+                total_bytes += 4; // empty string (just count prefix)
+            }
+            elem_count += 1;
+            ec = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => ec + 2,
+                else => ec + 1,
+            };
+        }
+    }
+
+    const buf = getUtf16Buf(total_bytes) orelse return 0;
+    var out: u32 = 0;
+
+    // Second pass: convert strings
+    var ec2: u32 = arr_index + 1;
+    while (true) {
+        const ew = p.tape.get(ec2);
+        if (ew.tag == .array_closing) break;
+        if (ew.tag == .object_opening) {
+            var fc: u32 = ec2 + 1;
+            var fi: u32 = 0;
+            while (fi < field_idx) : (fi += 1) {
+                const kw = p.tape.get(fc);
+                if (kw.tag == .object_closing) break;
+                const vw = p.tape.get(fc + 1);
+                fc = switch (vw.tag) {
+                    .array_opening, .object_opening => vw.data.ptr,
+                    .unsigned, .signed, .double => fc + 3,
+                    else => fc + 2,
+                };
+            }
+            const str = readTapeString(p, fc + 1);
+            if (str.len == 0) {
+                // Write 0 char count
+                buf[out] = 0;
+                buf[out + 1] = 0;
+                buf[out + 2] = 0;
+                buf[out + 3] = 0;
+                out += 4;
+            } else {
+                // Reserve space for char count (will fill after conversion)
+                const count_offset = out;
+                out += 4;
+                const bytes_written = utf8ToUtf16Le(str, buf, out);
+                const char_count = bytes_written / 2;
+                // Write char count as little-endian u32
+                buf[count_offset] = @truncate(char_count);
+                buf[count_offset + 1] = @truncate(char_count >> 8);
+                buf[count_offset + 2] = @truncate(char_count >> 16);
+                buf[count_offset + 3] = @truncate(char_count >> 24);
+                out += bytes_written;
+            }
+        } else {
+            buf[out] = 0;
+            buf[out + 1] = 0;
+            buf[out + 2] = 0;
+            buf[out + 3] = 0;
+            out += 4;
+        }
+        ec2 = switch (ew.tag) {
+            .array_opening, .object_opening => ew.data.ptr,
+            .unsigned, .signed, .double => ec2 + 2,
+            else => ec2 + 1,
+        };
+    }
+
+    // Store row count in batch_buffer[0] for JS to read
+    batch_buffer[0] = elem_count;
+    return out; // total bytes written
+}
+
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
 // Walks the tape recursively, uses the existing Stringifier to produce JSON.
 // Zero cross-module calls. Zero intermediate JS strings.
