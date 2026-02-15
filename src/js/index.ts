@@ -562,6 +562,8 @@ export async function init(options?: {
     if (ptr === 0) throw new Error("VectorJSON: Failed to allocate input buffer");
     inputBufPtr = ptr;
     inputBufLen = cap;
+    // WASM memory may have grown — invalidate cached DataView
+    memDV = null;
     return ptr;
   }
 
@@ -829,59 +831,84 @@ export async function init(options?: {
   // Format: [u32 char_count][pad?][...utf16le code units]
   // A 1-byte alignment pad exists when the offset after char_count is odd.
   function readUtf16String(): string {
-    const charCount = dv!.getUint32(matOffset, true); matOffset += 4;
+    const charCount = memDV!.getUint32(matOffset, true); matOffset += 4;
     if (charCount === 0) return '';
     // Skip alignment padding (Zig inserts a pad byte when offset is odd)
     if (matOffset % 2 !== 0) matOffset++;
-    const codes = new Uint16Array(engine.memory.buffer, matBufPtr + matOffset, charCount);
+    if (charCount <= 64) {
+      // Small strings: read char-by-char via DataView (avoids Uint16Array view creation).
+      // JSON keys are typically 3-20 chars — this eliminates a typed array constructor
+      // call + alignment validation per string.
+      if (charCount <= 8) {
+        // Tiny strings: inline fromCharCode args (no intermediate array)
+        let s = '';
+        for (let i = 0; i < charCount; i++) {
+          s += String.fromCharCode(memDV!.getUint16(matOffset + i * 2, true));
+        }
+        matOffset += charCount * 2;
+        return s;
+      }
+      const chars = new Array<number>(charCount);
+      for (let i = 0; i < charCount; i++) {
+        chars[i] = memDV!.getUint16(matOffset + i * 2, true);
+      }
+      matOffset += charCount * 2;
+      return String.fromCharCode.apply(null, chars);
+    }
+    // Large strings: Uint16Array view is efficient for bulk conversion
+    const codes = new Uint16Array(engine.memory.buffer, matOffset, charCount);
     matOffset += charCount * 2;
     return utf16ToString(codes);
   }
 
   // Shared state for materializeFromBuffer (avoids passing through recursion)
-  let matBufPtr = 0;
   let matOffset = 0;
-  let matBuf: Uint8Array | null = null;
-  let dv: DataView | null = null;
+
+  // Cached full-memory DataView — recreated only when WASM memory grows.
+  let memDV: DataView | null = null;
+  let memDVLen = 0;
+
+  function getMemoryDataView(): DataView {
+    const buf = engine.memory.buffer;
+    if (memDV === null || buf.byteLength !== memDVLen) {
+      memDV = new DataView(buf);
+      memDVLen = buf.byteLength;
+    }
+    return memDV;
+  }
 
   function materializeFromBuffer(): unknown {
-    matBufPtr = engine.doc_materialize_ptr();
+    const bufPtr = engine.doc_materialize_ptr();
     const bufLen = engine.doc_materialize_len();
-    if (matBufPtr === 0 || bufLen === 0) return null;
+    if (bufPtr === 0 || bufLen === 0) return null;
 
-    matBuf = new Uint8Array(engine.memory.buffer, matBufPtr, bufLen);
-    dv = new DataView(engine.memory.buffer, matBufPtr, bufLen);
-    matOffset = 0;
+    getMemoryDataView();
+    matOffset = bufPtr;
 
-    const result = readValue();
-
-    // Release references to avoid retaining WASM memory views
-    matBuf = null;
-    dv = null;
-    return result;
+    return readValue();
   }
 
   function readValue(): unknown {
-    const tag = matBuf![matOffset++];
+    const tag = memDV!.getUint8(matOffset++);
     switch (tag) {
       case 0: return null;  // TAG_NULL
       case 1: return true;  // TAG_TRUE
       case 2: return false; // TAG_FALSE
       case 3: { // TAG_NUMBER
-        const v = dv!.getFloat64(matOffset, true);
+        const v = memDV!.getFloat64(matOffset, true);
         matOffset += 8;
         return v;
       }
       case 4: // TAG_STRING — UTF-16LE code units, NO TextDecoder
         return readUtf16String();
       case 5: { // TAG_ARRAY
-        const count = dv!.getUint32(matOffset, true); matOffset += 4;
+        const count = memDV!.getUint32(matOffset, true); matOffset += 4;
         const arr = new Array(count);
         for (let i = 0; i < count; i++) arr[i] = readValue();
         return arr;
       }
       case 6: { // TAG_OBJECT
-        const count = dv!.getUint32(matOffset, true); matOffset += 4;
+        const count = memDV!.getUint32(matOffset, true); matOffset += 4;
         const obj: Record<string, unknown> = {};
         for (let i = 0; i < count; i++) {
           const key = readUtf16String();

@@ -1093,9 +1093,39 @@ fn utf8Utf16Len(src: []const u8) u32 {
 /// For ASCII bytes, this is just widening: byte → [byte, 0x00].
 /// For multi-byte sequences, decodes the codepoint and writes u16 LE.
 /// For codepoints above U+FFFF, writes a UTF-16 surrogate pair (2 × u16).
-fn utf8ToUtf16Le(src: []const u8, dst: [*]u8, start: u32) void {
+/// Returns the number of bytes written (= char_count * 2).
+/// SIMD fast path: process 16 ASCII bytes → 16 u16 (32 bytes) at once.
+fn utf8ToUtf16Le(src: []const u8, dst: [*]u8, start: u32) u32 {
     var i: usize = 0;
     var out: u32 = start;
+
+    // SIMD fast path: process 16 ASCII bytes at a time.
+    // JSON keys/values are almost always ASCII — this is the common case.
+    const V16 = @Vector(16, u8);
+    const high_bit: V16 = @splat(0x80);
+    while (i + 16 <= src.len) {
+        const chunk: V16 = src[i..][0..16].*;
+        // Check if ALL 16 bytes are ASCII (< 0x80)
+        if (@reduce(.Or, chunk & high_bit) == 0) {
+            // All ASCII — zero-extend each byte to u16 LE
+            // Low half: bytes 0-7 → u16 positions 0-7
+            inline for (0..8) |j| {
+                dst[out + j * 2] = chunk[j];
+                dst[out + j * 2 + 1] = 0;
+            }
+            // High half: bytes 8-15 → u16 positions 8-15
+            inline for (0..8) |j| {
+                dst[out + 16 + j * 2] = chunk[8 + j];
+                dst[out + 16 + j * 2 + 1] = 0;
+            }
+            out += 32;
+            i += 16;
+            continue;
+        }
+        // Non-ASCII chunk — fall through to scalar loop
+        break;
+    }
+
     while (i < src.len) {
         const b = src[i];
         if (b < 0x80) {
@@ -1132,23 +1162,38 @@ fn utf8ToUtf16Le(src: []const u8, dst: [*]u8, start: u32) void {
             i += 4;
         }
     }
+    return out - start;
 }
 
 /// Write a UTF-8 string as UTF-16LE into the materialization buffer.
 /// Format: [u32 char_count][pad?][...utf16le code units]
-/// A 1-byte pad is inserted when the current offset is odd, ensuring
-/// the u16 data starts at an even offset for Uint16Array compatibility.
+/// Single-pass: allocates upper-bound space, converts, then patches char_count.
+/// Upper bound: each UTF-8 byte → at most 1 UTF-16 code unit (src.len u16s).
 fn matWriteStringUtf16(str: []const u8) void {
     if (mat_error) return;
-    const char_count = utf8Utf16Len(str);
-    matWriteU32(char_count);
-    if (char_count == 0) return;
-    // Pad to 2-byte alignment for Uint16Array on JS side
-    if (mat_len & 1 != 0) matWriteByte(0);
-    matEnsure(char_count * 2);
+    if (str.len == 0) {
+        matWriteU32(0);
+        return;
+    }
+    // Single matEnsure for: u32 header(4) + pad(1) + data(src.len * 2)
+    const max_data_bytes: u32 = @intCast(str.len * 2);
+    matEnsure(5 + max_data_bytes);
     if (mat_error) return;
-    utf8ToUtf16Le(str, mat_buffer.?, mat_len);
-    mat_len += char_count * 2;
+    // Write placeholder char_count (patched after conversion)
+    const count_pos = mat_len;
+    const buf = mat_buffer.?;
+    std.mem.writeInt(u32, buf[mat_len..][0..4], 0, .little);
+    mat_len += 4;
+    // Pad to 2-byte alignment for Uint16Array on JS side
+    if (mat_len & 1 != 0) {
+        buf[mat_len] = 0;
+        mat_len += 1;
+    }
+    // Convert UTF-8 → UTF-16LE in one pass (no separate length scan)
+    const bytes_written = utf8ToUtf16Le(str, buf, mat_len);
+    mat_len += bytes_written;
+    // Patch actual char_count
+    std.mem.writeInt(u32, buf[count_pos..][0..4], bytes_written / 2, .little);
 }
 
 noinline fn docMaterializeValue(p: *DomParser, index: u32) void {
@@ -1174,9 +1219,34 @@ noinline fn docMaterializeValue(p: *DomParser, index: u32) void {
             matWriteF64(@bitCast(next_raw));
         },
         .string => {
-            matWriteByte(4);
             const str = readTapeString(p, index);
-            matWriteStringUtf16(str);
+            if (str.len == 0) {
+                // tag(1) + u32(4) = 5 bytes total
+                matEnsure(5);
+                if (mat_error) return;
+                const buf = mat_buffer.?;
+                buf[mat_len] = 4;
+                std.mem.writeInt(u32, buf[mat_len + 1 ..][0..4], 0, .little);
+                mat_len += 5;
+            } else {
+                // tag(1) + u32(4) + pad(1) + data(src.len * 2) — single alloc check
+                const max_data: u32 = @intCast(str.len * 2);
+                matEnsure(6 + max_data);
+                if (mat_error) return;
+                const buf = mat_buffer.?;
+                buf[mat_len] = 4;
+                mat_len += 1;
+                const count_pos = mat_len;
+                std.mem.writeInt(u32, buf[mat_len..][0..4], 0, .little);
+                mat_len += 4;
+                if (mat_len & 1 != 0) {
+                    buf[mat_len] = 0;
+                    mat_len += 1;
+                }
+                const bytes_written = utf8ToUtf16Le(str, buf, mat_len);
+                mat_len += bytes_written;
+                std.mem.writeInt(u32, buf[count_pos..][0..4], bytes_written / 2, .little);
+            }
         },
         .array_opening => {
             matWriteByte(5);
@@ -1204,9 +1274,29 @@ noinline fn docMaterializeValue(p: *DomParser, index: u32) void {
             while (i < count) : (i += 1) {
                 const w = p.tape.get(curr);
                 if (w.tag == .object_closing) break;
-                // Write key as UTF-16LE
+                // Write key as UTF-16LE (inlined for single matEnsure)
                 const key_str = readTapeString(p, curr);
-                matWriteStringUtf16(key_str);
+                if (key_str.len == 0) {
+                    matEnsure(4);
+                    if (mat_error) return;
+                    std.mem.writeInt(u32, mat_buffer.?[mat_len..][0..4], 0, .little);
+                    mat_len += 4;
+                } else {
+                    const max_key_data: u32 = @intCast(key_str.len * 2);
+                    matEnsure(5 + max_key_data);
+                    if (mat_error) return;
+                    const kb = mat_buffer.?;
+                    const kcount_pos = mat_len;
+                    std.mem.writeInt(u32, kb[mat_len..][0..4], 0, .little);
+                    mat_len += 4;
+                    if (mat_len & 1 != 0) {
+                        kb[mat_len] = 0;
+                        mat_len += 1;
+                    }
+                    const kbw = utf8ToUtf16Le(key_str, kb, mat_len);
+                    mat_len += kbw;
+                    std.mem.writeInt(u32, kb[kcount_pos..][0..4], kbw / 2, .little);
+                }
                 // Write value
                 docMaterializeValue(p, curr + 1);
                 // Advance past key + value
@@ -1244,12 +1334,10 @@ export fn doc_materialize_len() u32 {
     return mat_len;
 }
 
-/// Free the materialization buffer (resets arena — instant).
+/// Mark the materialization buffer as available for reuse.
+/// Buffer and arena capacity are retained — next materialize reuses them.
 export fn doc_materialize_free() void {
-    _ = mat_arena.reset(.retain_capacity);
-    mat_buffer = null;
     mat_len = 0;
-    mat_cap = 0;
 }
 
 // --- General UTF-8 → UTF-16LE conversion export ---
@@ -1293,10 +1381,10 @@ export fn utf8_to_utf16(ptr: [*]const u8, len: u32) u32 {
         return 0;
     }
     const src = ptr[0..len];
-    const char_count = utf8Utf16Len(src);
-    const needed = char_count * 2;
-    const buf = getUtf16Buf(needed) orelse return 0;
-    utf8ToUtf16Le(src, buf, 0);
+    // Upper bound: each UTF-8 byte → at most 1 UTF-16 code unit
+    const buf = getUtf16Buf(len * 2) orelse return 0;
+    const bytes_written = utf8ToUtf16Le(src, buf, 0);
+    const char_count = bytes_written / 2;
     str_utf16_char_count = char_count;
     return char_count;
 }
@@ -1321,10 +1409,10 @@ export fn doc_read_string_utf16(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const str = readTapeString(p, index);
     if (str.len == 0) return 0;
-    const char_count = utf8Utf16Len(str);
-    const needed = char_count * 2;
-    const buf = getUtf16Buf(needed) orelse return 0;
-    utf8ToUtf16Le(str, buf, 0);
+    // Upper bound: each UTF-8 byte → at most 1 UTF-16 code unit
+    const buf = getUtf16Buf(@intCast(str.len * 2)) orelse return 0;
+    const bytes_written = utf8ToUtf16Le(str, buf, 0);
+    const char_count = bytes_written / 2;
     str_utf16_char_count = char_count;
     return char_count;
 }
