@@ -1101,23 +1101,24 @@ fn utf8ToUtf16Le(src: []const u8, dst: [*]u8, start: u32) u32 {
 
     // SIMD fast path: process 16 ASCII bytes at a time.
     // JSON keys/values are almost always ASCII — this is the common case.
+    // Uses WASM SIMD i16x8.extend_{low,high}_i8x16_u for zero-widening,
+    // then v128.store for 16-byte bulk writes.
     const V16 = @Vector(16, u8);
+    const V8u16 = @Vector(8, u16);
     const high_bit: V16 = @splat(0x80);
     while (i + 16 <= src.len) {
         const chunk: V16 = src[i..][0..16].*;
         // Check if ALL 16 bytes are ASCII (< 0x80)
         if (@reduce(.Or, chunk & high_bit) == 0) {
-            // All ASCII — zero-extend each byte to u16 LE
-            // Low half: bytes 0-7 → u16 positions 0-7
-            inline for (0..8) |j| {
-                dst[out + j * 2] = chunk[j];
-                dst[out + j * 2 + 1] = 0;
-            }
-            // High half: bytes 8-15 → u16 positions 8-15
-            inline for (0..8) |j| {
-                dst[out + 16 + j * 2] = chunk[8 + j];
-                dst[out + 16 + j * 2 + 1] = 0;
-            }
+            // Extract low/high halves via @shuffle
+            const low_half: @Vector(8, u8) = @shuffle(u8, chunk, undefined, @as(@Vector(8, i32), .{ 0, 1, 2, 3, 4, 5, 6, 7 }));
+            const high_half: @Vector(8, u8) = @shuffle(u8, chunk, undefined, @as(@Vector(8, i32), .{ 8, 9, 10, 11, 12, 13, 14, 15 }));
+            // Zero-extend to u16 (WASM: i16x8.extend_{low,high}_i8x16_u)
+            const wide_low: V8u16 = @intCast(low_half);
+            const wide_high: V8u16 = @intCast(high_half);
+            // Store as bytes (WASM: v128.store — 16 bytes per store)
+            dst[out..][0..16].* = @bitCast(wide_low);
+            dst[out + 16 ..][0..16].* = @bitCast(wide_high);
             out += 32;
             i += 16;
             continue;
