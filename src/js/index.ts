@@ -72,7 +72,7 @@ export interface VectorJSON {
    * Call .free() on the result to release resources immediately, or let
    * FinalizationRegistry handle it automatically when the Proxy is GC'd.
    */
-  parse(input: string | Uint8Array, options?: { mode?: "lazy" | "eager" }): unknown;
+  parse(input: string | Uint8Array): unknown;
   /**
    * Eagerly materialize a lazy proxy into plain JS objects.
    * WasmString values are converted to JS strings.
@@ -199,11 +199,6 @@ interface EngineExports {
   doc_batch_ptr(): number;
   doc_array_elements(docId: number, arrIndex: number): number;
   doc_object_keys(docId: number, objIndex: number): number;
-  // Eager materialization (tape → flat binary buffer, one WASM call)
-  doc_materialize(docId: number, index: number): number;
-  doc_materialize_ptr(): number;
-  doc_materialize_len(): number;
-  doc_materialize_free(): void;
   // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
   utf8_to_utf16(ptr: number, len: number): number;
   get_utf16_ptr(): number;
@@ -562,8 +557,6 @@ export async function init(options?: {
     if (ptr === 0) throw new Error("VectorJSON: Failed to allocate input buffer");
     inputBufPtr = ptr;
     inputBufLen = cap;
-    // WASM memory may have grown — invalidate cached DataView
-    memDV = null;
     return ptr;
   }
 
@@ -828,168 +821,6 @@ export async function init(options?: {
   // One WASM call produces the buffer, then JS reads it linearly — zero
   // TextDecoder, zero FFI calls needed.
 
-  // --- String key interning ---
-  // Reusing the same string reference for repeated keys (e.g. "id" in 1000 objects)
-  // lets V8 use pointer comparison for hidden class transition lookups instead of
-  // character-by-character comparison. This is critical for monomorphic IC.
-  const keyIntern = new Map<string, string>();
-  function internKey(raw: string): string {
-    let s = keyIntern.get(raw);
-    if (s === undefined) { s = raw; keyIntern.set(s, s); }
-    return s;
-  }
-
-  // --- Shape-aware constructor caching ---
-  // For arrays of same-shaped objects, we cache a constructor per shape.
-  // V8 scans constructor bodies for `this[...]=` assignments and pre-allocates
-  // in-object property slots — zero hidden class transitions per construction.
-  // The constructor takes a single array argument to avoid argument count limits.
-  const shapeCtors = new Map<string, { ctor: new (vals: unknown[]) => Record<string, unknown>; keys: string[] }>();
-  const MAX_SHAPE_CACHE = 256;
-
-  // Last-shape fast path: consecutive same-shaped objects (e.g. array of 1000
-  // API response items) skip the join() + Map.get() entirely via pointer-equal
-  // interned key comparison.
-  let lastShapeKeys: string[] = [];
-  let lastShapeCtor: (new (vals: unknown[]) => Record<string, unknown>) | null = null;
-
-  function matchLastShape(keys: string[]): boolean {
-    if (keys.length !== lastShapeKeys.length) return false;
-    for (let i = 0; i < keys.length; i++) {
-      if (keys[i] !== lastShapeKeys[i]) return false; // pointer compare (interned)
-    }
-    return true;
-  }
-
-  function getShapeCtor(keys: string[]): new (vals: unknown[]) => Record<string, unknown> {
-    // Fast path: same shape as last object (very common in arrays)
-    if (lastShapeCtor && matchLastShape(keys)) return lastShapeCtor;
-
-    const shapeKey = keys.join('\x00');
-    const cached = shapeCtors.get(shapeKey);
-    if (cached) {
-      lastShapeKeys = cached.keys;
-      lastShapeCtor = cached.ctor;
-      return cached.ctor;
-    }
-    // Evict entire cache if too large (heterogeneous data)
-    if (shapeCtors.size >= MAX_SHAPE_CACHE) shapeCtors.clear();
-    // Build constructor: this["id"]=a[0];this["name"]=a[1];...
-    const body = keys.map((k, i) => `this[${JSON.stringify(k)}]=a[${i}]`).join(';');
-    const ctor = new Function('a', body) as unknown as new (vals: unknown[]) => Record<string, unknown>;
-    const frozenKeys = keys.slice();
-    shapeCtors.set(shapeKey, { ctor, keys: frozenKeys });
-    lastShapeKeys = frozenKeys;
-    lastShapeCtor = ctor;
-    return ctor;
-  }
-
-  // Read a UTF-16LE string from the materialization buffer.
-  // Format: [u32 char_count][pad?][...utf16le code units]
-  // A 1-byte alignment pad exists when the offset after char_count is odd.
-  function readUtf16String(): string {
-    const charCount = memDV!.getUint32(matOffset, true); matOffset += 4;
-    if (charCount === 0) return '';
-    // Skip alignment padding (Zig inserts a pad byte when offset is odd)
-    if (matOffset % 2 !== 0) matOffset++;
-    if (charCount <= 64) {
-      // Small strings: read char-by-char via DataView (avoids Uint16Array view creation).
-      // JSON keys are typically 3-20 chars — this eliminates a typed array constructor
-      // call + alignment validation per string.
-      if (charCount <= 8) {
-        // Tiny strings: inline fromCharCode args (no intermediate array)
-        let s = '';
-        for (let i = 0; i < charCount; i++) {
-          s += String.fromCharCode(memDV!.getUint16(matOffset + i * 2, true));
-        }
-        matOffset += charCount * 2;
-        return s;
-      }
-      const chars = new Array<number>(charCount);
-      for (let i = 0; i < charCount; i++) {
-        chars[i] = memDV!.getUint16(matOffset + i * 2, true);
-      }
-      matOffset += charCount * 2;
-      return String.fromCharCode.apply(null, chars);
-    }
-    // Large strings: Uint16Array view is efficient for bulk conversion
-    const codes = new Uint16Array(engine.memory.buffer, matOffset, charCount);
-    matOffset += charCount * 2;
-    return utf16ToString(codes);
-  }
-
-  // Shared state for materializeFromBuffer (avoids passing through recursion)
-  let matOffset = 0;
-
-  // Cached full-memory DataView — recreated only when WASM memory grows.
-  let memDV: DataView | null = null;
-  let memDVLen = 0;
-
-  function getMemoryDataView(): DataView {
-    const buf = engine.memory.buffer;
-    if (memDV === null || buf.byteLength !== memDVLen) {
-      memDV = new DataView(buf);
-      memDVLen = buf.byteLength;
-    }
-    return memDV;
-  }
-
-  function materializeFromBuffer(): unknown {
-    const bufPtr = engine.doc_materialize_ptr();
-    const bufLen = engine.doc_materialize_len();
-    if (bufPtr === 0 || bufLen === 0) return null;
-
-    getMemoryDataView();
-    matOffset = bufPtr;
-
-    return readValue();
-  }
-
-  function readValue(): unknown {
-    const tag = memDV!.getUint8(matOffset++);
-    switch (tag) {
-      case 0: return null;  // TAG_NULL
-      case 1: return true;  // TAG_TRUE
-      case 2: return false; // TAG_FALSE
-      case 3: { // TAG_NUMBER
-        const v = memDV!.getFloat64(matOffset, true);
-        matOffset += 8;
-        return v;
-      }
-      case 4: // TAG_STRING — UTF-16LE code units, NO TextDecoder
-        return readUtf16String();
-      case 5: { // TAG_ARRAY
-        const count = memDV!.getUint32(matOffset, true); matOffset += 4;
-        const arr = new Array(count);
-        for (let i = 0; i < count; i++) arr[i] = readValue();
-        return arr;
-      }
-      case 6: { // TAG_OBJECT
-        const count = memDV!.getUint32(matOffset, true); matOffset += 4;
-        if (count === 0) return {};
-        // Fast path: check if shape matches last seen (avoids keys array + join).
-        // Interned keys use pointer equality (===), so comparison is cheap.
-        const vals = new Array<unknown>(count);
-        let shapeMiss = count !== lastShapeKeys.length;
-        let newKeys: string[] | null = shapeMiss ? new Array<string>(count) : null;
-        for (let i = 0; i < count; i++) {
-          const key = internKey(readUtf16String());
-          if (!shapeMiss && key !== lastShapeKeys[i]) {
-            // Shape diverged — allocate keys array and backfill
-            shapeMiss = true;
-            newKeys = new Array<string>(count);
-            for (let j = 0; j < i; j++) newKeys[j] = lastShapeKeys[j];
-          }
-          if (newKeys) newKeys[i] = key;
-          vals[i] = readValue();
-        }
-        // Shape-aware construction: reuse cached constructor per key set
-        const Ctor = shapeMiss ? getShapeCtor(newKeys!) : lastShapeCtor!;
-        return new Ctor(vals);
-      }
-      default: return null;
-    }
-  }
 
   // --- Shared Proxy factories ---
 
@@ -1128,12 +959,111 @@ export async function init(options?: {
         return elemIndices;
       };
 
+      // --- Cursor optimization for homogeneous object arrays ---
+      // ONE cursor object with defineProperty getters. Each getter has its
+      // fieldIdx baked in — no Proxy get-trap, no Map lookup per access.
+      // data[i] repositions the cursor; data[i].name reads via typed getter.
+      let cursorObj: Record<string, unknown> | null = null;
+      let cursorObjIndex = 0;
+      let cursorKeys: string[] | null = null;
+      let cursorInitialized = false;
+
+      const initCursor = (): boolean => {
+        if (cursorInitialized) return cursorObj !== null;
+        cursorInitialized = true;
+        if (length === 0) return false;
+        const indices = getElemIndices();
+        const firstTag = engine.doc_get_tag(docId, indices[0]);
+        if (firstTag !== TAG_OBJECT) return false;
+
+        // Build key list + detect field types from first element
+        const firstObjIdx = indices[0];
+        const kCount = engine.doc_object_keys(docId, firstObjIdx);
+        const bp = engine.doc_batch_ptr();
+        const keyIndices = new Uint32Array(kCount);
+        keyIndices.set(new Uint32Array(engine.memory.buffer, bp, kCount));
+        cursorKeys = [];
+        const fieldTypes: number[] = [];
+        for (let i = 0; i < kCount; i++) {
+          cursorKeys.push(docReadString(docId, keyIndices[i]));
+          fieldTypes.push(engine.doc_get_tag(docId, keyIndices[i] + 1));
+        }
+
+        // Create cursor with defineProperty getters — type-specialized per field.
+        // doc_obj_val_at is called per access (lazy: only read what's used).
+        cursorObjIndex = firstObjIdx;
+        cursorObj = Object.create(null);
+
+        for (let fi = 0; fi < kCount; fi++) {
+          const fieldIdx = fi;
+          const expectedType = fieldTypes[fi];
+
+          let getter: () => unknown;
+          if (expectedType === TAG_NUMBER) {
+            getter = () => {
+              void keepAlive;
+              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
+              return engine.doc_get_number(docId, vi);
+            };
+          } else if (expectedType === TAG_STRING) {
+            getter = () => {
+              void keepAlive;
+              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
+              return docStringToGC(docId, vi);
+            };
+          } else if (expectedType === TAG_TRUE || expectedType === TAG_FALSE) {
+            getter = () => {
+              void keepAlive;
+              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
+              return engine.doc_get_tag(docId, vi) === TAG_TRUE;
+            };
+          } else {
+            getter = () => {
+              void keepAlive;
+              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
+              const t = engine.doc_get_tag(docId, vi);
+              switch (t) {
+                case TAG_NULL: return null;
+                case TAG_TRUE: return true;
+                case TAG_FALSE: return false;
+                case TAG_NUMBER: return engine.doc_get_number(docId, vi);
+                case TAG_STRING: return docStringToGC(docId, vi);
+                default: return wrapDoc(docId, vi, keepAlive, generation);
+              }
+            };
+          }
+
+          Object.defineProperty(cursorObj, cursorKeys[fi], {
+            get: getter, enumerable: true, configurable: true,
+          });
+        }
+
+        Object.defineProperty(cursorObj, 'free', {
+          get: () => freeFn, enumerable: false, configurable: true,
+        });
+        Object.defineProperty(cursorObj, 'toJSON', {
+          get: () => () => deepMaterializeDoc(docId, cursorObjIndex),
+          enumerable: false, configurable: true,
+        });
+
+        return true;
+      };
+
       const elemCache = new Map<number, unknown>();
 
       return createArrayProxy({
         length,
         getItem(idx: number): unknown {
           void keepAlive;
+          // Cursor fast path: homogeneous object array
+          if (initCursor() && cursorObj) {
+            const indices = getElemIndices();
+            if (idx < indices.length) {
+              cursorObjIndex = indices[idx];
+              return cursorObj;
+            }
+          }
+          // Fall back to per-element proxy (heterogeneous or non-object)
           let cached = elemCache.get(idx);
           if (cached !== undefined) return cached;
           const indices = getElemIndices();
@@ -1342,8 +1272,7 @@ export async function init(options?: {
 
   // --- Public API ---
   _instance = {
-    parse(input: string | Uint8Array, options?: { mode?: "lazy" | "eager" }): unknown {
-      const eager = options?.mode === "eager";
+    parse(input: string | Uint8Array): unknown {
 
       // Write input into reusable WASM buffer (no per-parse alloc/dealloc)
       let ptr: number;
@@ -1400,18 +1329,6 @@ export async function init(options?: {
               result = null;
           }
           engine.doc_free(docId);
-          return result;
-        }
-
-        // Eager mode: SIMD parse → flat buffer → POJOs (one WASM call, zero Proxy overhead)
-        if (eager) {
-          const rc = engine.doc_materialize(docId, 1);
-          engine.doc_free(docId);
-          if (rc < 0) {
-            throw new Error("VectorJSON: eager materialization failed");
-          }
-          const result = materializeFromBuffer();
-          engine.doc_materialize_free();
           return result;
         }
 
