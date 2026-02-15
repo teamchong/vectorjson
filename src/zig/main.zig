@@ -896,6 +896,218 @@ export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
     return count;
 }
 
+// --- Batch column read: read one field across all array elements in one WASM call ---
+// Struct-of-Arrays pattern: instead of N cross-module calls, one call reads the entire column.
+
+/// Static f64 output buffer for batch column reads (8 bytes × 16384 = 128KB).
+var f64_batch: [16384]f64 = undefined;
+
+/// Get pointer to the f64 batch buffer (JS reads results via Float64Array view).
+export fn doc_f64_batch_ptr() [*]f64 {
+    return &f64_batch;
+}
+
+/// Read the number value at field `field_idx` from every object element in an array.
+/// Writes f64 values into f64_batch. Returns number of rows written.
+/// Array elements must be objects. Non-number values write 0.0.
+export fn doc_read_column_f64(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    var elem_curr: u32 = arr_index + 1;
+    var row: u32 = 0;
+    while (row < 16384) {
+        const ew = p.tape.get(elem_curr);
+        if (ew.tag == .array_closing) break;
+        if (ew.tag != .object_opening) {
+            f64_batch[row] = 0.0;
+            // Skip element
+            elem_curr = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => elem_curr + 2,
+                else => elem_curr + 1,
+            };
+            row += 1;
+            continue;
+        }
+
+        // Navigate to field_idx within this object
+        var field_curr: u32 = elem_curr + 1;
+        var fi: u32 = 0;
+        while (fi < field_idx) : (fi += 1) {
+            const kw = p.tape.get(field_curr);
+            if (kw.tag == .object_closing) break;
+            // Skip key + value
+            const vw = p.tape.get(field_curr + 1);
+            field_curr = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => field_curr + 3,
+                else => field_curr + 2,
+            };
+        }
+
+        // Read the value at field_curr + 1 (key is at field_curr)
+        const val_idx = field_curr + 1;
+        const vword = p.tape.get(val_idx);
+        const next_raw: u64 = @bitCast(p.tape.get(val_idx + 1));
+        f64_batch[row] = switch (vword.tag) {
+            .unsigned => @floatFromInt(@as(u64, next_raw)),
+            .signed => @floatFromInt(@as(i64, @bitCast(next_raw))),
+            .double => @bitCast(next_raw),
+            else => 0.0,
+        };
+
+        // Advance to next array element
+        elem_curr = ew.data.ptr; // object_opening.data.ptr = past the object_closing
+        row += 1;
+    }
+    return row;
+}
+
+/// Read the tag byte at field `field_idx` from every object element in an array.
+/// Writes tag values (as u32) into batch_buffer. Returns number of rows written.
+export fn doc_read_column_tags(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    var elem_curr: u32 = arr_index + 1;
+    var row: u32 = 0;
+    while (row < 16384) {
+        const ew = p.tape.get(elem_curr);
+        if (ew.tag == .array_closing) break;
+        if (ew.tag != .object_opening) {
+            batch_buffer[row] = 0;
+            elem_curr = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => elem_curr + 2,
+                else => elem_curr + 1,
+            };
+            row += 1;
+            continue;
+        }
+
+        var field_curr: u32 = elem_curr + 1;
+        var fi: u32 = 0;
+        while (fi < field_idx) : (fi += 1) {
+            const kw = p.tape.get(field_curr);
+            if (kw.tag == .object_closing) break;
+            const vw = p.tape.get(field_curr + 1);
+            field_curr = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => field_curr + 3,
+                else => field_curr + 2,
+            };
+        }
+
+        const val_idx = field_curr + 1;
+        const vword = p.tape.get(val_idx);
+        batch_buffer[row] = @intFromEnum(vword.tag);
+
+        elem_curr = ew.data.ptr;
+        row += 1;
+    }
+    return row;
+}
+
+/// Read the boolean value at field `field_idx` from every object element.
+/// Writes u32 values (0=false, 1=true) into batch_buffer. Returns row count.
+export fn doc_read_column_bool(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    var elem_curr: u32 = arr_index + 1;
+    var row: u32 = 0;
+    while (row < 16384) {
+        const ew = p.tape.get(elem_curr);
+        if (ew.tag == .array_closing) break;
+        if (ew.tag != .object_opening) {
+            batch_buffer[row] = 0;
+            elem_curr = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => elem_curr + 2,
+                else => elem_curr + 1,
+            };
+            row += 1;
+            continue;
+        }
+
+        var field_curr: u32 = elem_curr + 1;
+        var fi: u32 = 0;
+        while (fi < field_idx) : (fi += 1) {
+            const kw = p.tape.get(field_curr);
+            if (kw.tag == .object_closing) break;
+            const vw = p.tape.get(field_curr + 1);
+            field_curr = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => field_curr + 3,
+                else => field_curr + 2,
+            };
+        }
+
+        const val_idx = field_curr + 1;
+        const vword = p.tape.get(val_idx);
+        batch_buffer[row] = if (vword.tag == .true) 1 else 0;
+
+        elem_curr = ew.data.ptr;
+        row += 1;
+    }
+    return row;
+}
+
+/// Read string pointer+length pairs at field `field_idx` from every object in array.
+/// Writes [ptr0, len0, ptr1, len1, ...] into batch_buffer (2 u32s per row).
+/// Returns number of rows (pairs = rows * 2 entries in batch_buffer).
+/// Max 8192 rows (16384 / 2).
+export fn doc_read_column_str(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    var elem_curr: u32 = arr_index + 1;
+    var row: u32 = 0;
+    while (row < 8192) {
+        const ew = p.tape.get(elem_curr);
+        if (ew.tag == .array_closing) break;
+        if (ew.tag != .object_opening) {
+            batch_buffer[row * 2] = 0;
+            batch_buffer[row * 2 + 1] = 0;
+            elem_curr = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => elem_curr + 2,
+                else => elem_curr + 1,
+            };
+            row += 1;
+            continue;
+        }
+
+        var field_curr: u32 = elem_curr + 1;
+        var fi: u32 = 0;
+        while (fi < field_idx) : (fi += 1) {
+            const kw = p.tape.get(field_curr);
+            if (kw.tag == .object_closing) break;
+            const vw = p.tape.get(field_curr + 1);
+            field_curr = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => field_curr + 3,
+                else => field_curr + 2,
+            };
+        }
+
+        // Read string at field_curr + 1
+        const val_idx = field_curr + 1;
+        const str = readTapeString(p, val_idx);
+        batch_buffer[row * 2] = @intFromPtr(str.ptr);
+        batch_buffer[row * 2 + 1] = @intCast(str.len);
+
+        elem_curr = ew.data.ptr;
+        row += 1;
+    }
+    return row;
+}
+
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
 // Walks the tape recursively, uses the existing Stringifier to produce JSON.
 // Zero cross-module calls. Zero intermediate JS strings.

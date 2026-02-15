@@ -199,6 +199,12 @@ interface EngineExports {
   doc_batch_ptr(): number;
   doc_array_elements(docId: number, arrIndex: number): number;
   doc_object_keys(docId: number, objIndex: number): number;
+  // Batch column reads (SoA: one WASM call per column)
+  doc_f64_batch_ptr(): number;
+  doc_read_column_f64(docId: number, arrIndex: number, fieldIdx: number): number;
+  doc_read_column_tags(docId: number, arrIndex: number, fieldIdx: number): number;
+  doc_read_column_bool(docId: number, arrIndex: number, fieldIdx: number): number;
+  doc_read_column_str(docId: number, arrIndex: number, fieldIdx: number): number;
   // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
   utf8_to_utf16(ptr: number, len: number): number;
   get_utf16_ptr(): number;
@@ -917,6 +923,76 @@ export async function init(options?: {
     });
   }
 
+  // --- Columnar materialization: bulk-read one field across all array elements ---
+  // Uses batch WASM exports: ONE call reads the entire column instead of 2N calls.
+  // Numbers: doc_read_column_f64 writes f64 values into a WASM-side buffer.
+  // Booleans: doc_read_column_bool writes u32 (0/1) into batch_buffer.
+  // Strings: still per-element (variable length, requires GC bridge).
+  function materializeColumn(
+    docId: number,
+    arrIndex: number,
+    fieldIdx: number,
+    expectedType: number,
+    count: number,
+    keepAlive: object,
+    generation: number,
+  ): unknown[] {
+    if (expectedType === TAG_NUMBER) {
+      // ONE WASM call reads all N f64 values
+      const n = engine.doc_read_column_f64(docId, arrIndex, fieldIdx);
+      const f64Ptr = engine.doc_f64_batch_ptr() as unknown as number;
+      const src = new Float64Array(engine.memory.buffer, f64Ptr, n);
+      const col: unknown[] = new Array(n);
+      for (let i = 0; i < n; i++) col[i] = src[i];
+      return col;
+    }
+
+    if (expectedType === TAG_TRUE || expectedType === TAG_FALSE) {
+      // ONE WASM call reads all N boolean values as u32
+      const n = engine.doc_read_column_bool(docId, arrIndex, fieldIdx);
+      const batchPtr = engine.doc_batch_ptr();
+      const src = new Uint32Array(engine.memory.buffer, batchPtr, n);
+      const col: unknown[] = new Array(n);
+      for (let i = 0; i < n; i++) col[i] = src[i] === 1;
+      return col;
+    }
+
+    if (expectedType === TAG_STRING) {
+      // Strings stay lazy: docStringToGC returns WasmString (deferred UTF-8 → JS conversion).
+      // We need element indices to navigate to each string value.
+      const elemCount = engine.doc_array_elements(docId, arrIndex);
+      const bp = engine.doc_batch_ptr();
+      const elemIndices = new Uint32Array(elemCount);
+      elemIndices.set(new Uint32Array(engine.memory.buffer, bp, elemCount));
+      const col: unknown[] = new Array(count);
+      for (let i = 0; i < count; i++) {
+        const vi = engine.doc_obj_val_at(docId, elemIndices[i], fieldIdx);
+        col[i] = docStringToGC(docId, vi);
+      }
+      return col;
+    }
+
+    // Generic fallback: mixed types, nested containers
+    const col: unknown[] = new Array(count);
+    const elemCount = engine.doc_array_elements(docId, arrIndex);
+    const bp = engine.doc_batch_ptr();
+    const elemIndices = new Uint32Array(elemCount);
+    elemIndices.set(new Uint32Array(engine.memory.buffer, bp, elemCount));
+    for (let i = 0; i < count; i++) {
+      const vi = engine.doc_obj_val_at(docId, elemIndices[i], fieldIdx);
+      const t = engine.doc_get_tag(docId, vi);
+      switch (t) {
+        case TAG_NULL: col[i] = null; break;
+        case TAG_TRUE: col[i] = true; break;
+        case TAG_FALSE: col[i] = false; break;
+        case TAG_NUMBER: col[i] = engine.doc_get_number(docId, vi); break;
+        case TAG_STRING: col[i] = docStringToGC(docId, vi); break;
+        default: col[i] = wrapDoc(docId, vi, keepAlive, generation); break;
+      }
+    }
+    return col;
+  }
+
   // --- Wrap a document tape value in a lazy Proxy ---
   // keepAlive: sentinel object registered with FinalizationRegistry.
   // As long as any Proxy created from this document is alive, keepAlive
@@ -959,90 +1035,78 @@ export async function init(options?: {
         return elemIndices;
       };
 
-      // --- Cursor optimization for homogeneous object arrays ---
-      // ONE cursor object with defineProperty getters. Each getter has its
-      // fieldIdx baked in — no Proxy get-trap, no Map lookup per access.
-      // data[i] repositions the cursor; data[i].name reads via typed getter.
-      let cursorObj: Record<string, unknown> | null = null;
-      let cursorObjIndex = 0;
-      let cursorKeys: string[] | null = null;
-      let cursorInitialized = false;
+      // --- Columnar (Struct-of-Arrays) optimization for homogeneous object arrays ---
+      // Instead of N objects with K properties each (N*K WASM calls per access),
+      // we bulk-materialize entire columns lazily. data[i].name reads columns.name[i]
+      // — a direct JS array lookup after initial column build.
+      //
+      // Row view objects are plain objects with defineProperty getters that V8 can
+      // inline-cache (no Proxy). Each getter reads from its pre-materialized column
+      // array, so after first access of a property, ALL subsequent row accesses of
+      // that property are pure JS with zero WASM overhead.
+      let columnarInitialized = false;
+      let columnarKeys: string[] | null = null;
+      let columns: Map<string, unknown[]> | null = null;
+      let fieldTypes: number[] | null = null;
+      let rowView: Record<string, unknown> | null = null;
+      let rowViewIdx = 0;
 
-      const initCursor = (): boolean => {
-        if (cursorInitialized) return cursorObj !== null;
-        cursorInitialized = true;
+      const initColumnar = (): boolean => {
+        if (columnarInitialized) return columnarKeys !== null;
+        columnarInitialized = true;
         if (length === 0) return false;
         const indices = getElemIndices();
         const firstTag = engine.doc_get_tag(docId, indices[0]);
         if (firstTag !== TAG_OBJECT) return false;
 
-        // Build key list + detect field types from first element
+        // Read key names + types from first element
         const firstObjIdx = indices[0];
         const kCount = engine.doc_object_keys(docId, firstObjIdx);
         const bp = engine.doc_batch_ptr();
         const keyIndices = new Uint32Array(kCount);
         keyIndices.set(new Uint32Array(engine.memory.buffer, bp, kCount));
-        cursorKeys = [];
-        const fieldTypes: number[] = [];
-        for (let i = 0; i < kCount; i++) {
-          cursorKeys.push(docReadString(docId, keyIndices[i]));
-          fieldTypes.push(engine.doc_get_tag(docId, keyIndices[i] + 1));
+        columnarKeys = [];
+        fieldTypes = [];
+        for (let ki = 0; ki < kCount; ki++) {
+          columnarKeys.push(docReadString(docId, keyIndices[ki]));
+          fieldTypes.push(engine.doc_get_tag(docId, keyIndices[ki] + 1));
         }
 
-        // Create cursor with defineProperty getters — type-specialized per field.
-        // doc_obj_val_at is called per access (lazy: only read what's used).
-        cursorObjIndex = firstObjIdx;
-        cursorObj = Object.create(null);
+        // Lazy column storage — each column materializes on first access
+        columns = new Map();
 
+        // Build the row view: one object with getters per key.
+        // Each getter lazily materializes its column, then reads column[rowViewIdx].
+        rowView = Object.create(null);
         for (let fi = 0; fi < kCount; fi++) {
+          const key = columnarKeys[fi];
           const fieldIdx = fi;
           const expectedType = fieldTypes[fi];
-
-          let getter: () => unknown;
-          if (expectedType === TAG_NUMBER) {
-            getter = () => {
+          Object.defineProperty(rowView, key, {
+            get(): unknown {
               void keepAlive;
-              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
-              return engine.doc_get_number(docId, vi);
-            };
-          } else if (expectedType === TAG_STRING) {
-            getter = () => {
-              void keepAlive;
-              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
-              return docStringToGC(docId, vi);
-            };
-          } else if (expectedType === TAG_TRUE || expectedType === TAG_FALSE) {
-            getter = () => {
-              void keepAlive;
-              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
-              return engine.doc_get_tag(docId, vi) === TAG_TRUE;
-            };
-          } else {
-            getter = () => {
-              void keepAlive;
-              const vi = engine.doc_obj_val_at(docId, cursorObjIndex, fieldIdx);
-              const t = engine.doc_get_tag(docId, vi);
-              switch (t) {
-                case TAG_NULL: return null;
-                case TAG_TRUE: return true;
-                case TAG_FALSE: return false;
-                case TAG_NUMBER: return engine.doc_get_number(docId, vi);
-                case TAG_STRING: return docStringToGC(docId, vi);
-                default: return wrapDoc(docId, vi, keepAlive, generation);
+              let col = columns!.get(key);
+              if (!col) {
+                // Materialize this entire column in one pass
+                col = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
+                columns!.set(key, col);
               }
-            };
-          }
-
-          Object.defineProperty(cursorObj, cursorKeys[fi], {
-            get: getter, enumerable: true, configurable: true,
+              return col[rowViewIdx];
+            },
+            enumerable: true,
+            configurable: true,
           });
         }
 
-        Object.defineProperty(cursorObj, 'free', {
-          get: () => freeFn, enumerable: false, configurable: true,
+        Object.defineProperty(rowView, 'free', {
+          value: freeFn, enumerable: false, configurable: true,
         });
-        Object.defineProperty(cursorObj, 'toJSON', {
-          get: () => () => deepMaterializeDoc(docId, cursorObjIndex),
+        Object.defineProperty(rowView, 'toJSON', {
+          value() { return deepMaterializeDoc(docId, indices[rowViewIdx]); },
+          enumerable: false, configurable: true,
+        });
+        Object.defineProperty(rowView, LAZY_PROXY, {
+          get() { return { docId, index: indices[rowViewIdx] }; },
           enumerable: false, configurable: true,
         });
 
@@ -1055,12 +1119,12 @@ export async function init(options?: {
         length,
         getItem(idx: number): unknown {
           void keepAlive;
-          // Cursor fast path: homogeneous object array
-          if (initCursor() && cursorObj) {
+          // Columnar fast path: homogeneous object array
+          if (initColumnar() && rowView) {
             const indices = getElemIndices();
             if (idx < indices.length) {
-              cursorObjIndex = indices[idx];
-              return cursorObj;
+              rowViewIdx = idx;
+              return rowView;
             }
           }
           // Fall back to per-element proxy (heterogeneous or non-object)
