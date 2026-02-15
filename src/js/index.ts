@@ -27,6 +27,15 @@ import { dirname, join } from "node:path";
 
 export type FeedStatus = "incomplete" | "complete" | "error" | "end_early";
 
+export type ParseStatus = "complete" | "complete_early" | "incomplete" | "invalid";
+
+export interface ParseResult {
+  status: ParseStatus;
+  value?: unknown;
+  remaining?: Uint8Array;
+  error?: string;
+}
+
 export type DiffType = "changed" | "added" | "removed" | "type_changed";
 
 export interface ValidationError {
@@ -106,7 +115,7 @@ export interface VectorJSON {
    * // Use materialize() first: structuredClone(vj.materialize(result))
    * ```
    */
-  parse(input: string | Uint8Array): unknown;
+  parse(input: string | Uint8Array): ParseResult;
   /**
    * Eagerly materialize a lazy proxy into plain JS objects.
    * WasmString values are converted to JS strings.
@@ -239,8 +248,13 @@ interface EngineExports {
   doc_read_column_f64(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_bool(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_str_raw(docId: number, arrIndex: number, fieldIdx: number): number;
-  doc_read_column_str_slices(docId: number, arrIndex: number, fieldIdx: number): number;
+  // Single-call columnar read: all columns in one traversal
+  doc_read_all_columns(docId: number, arrIndex: number): number;
   get_utf16_ptr(): number;
+  // Input classification & autocomplete
+  classify_input(ptr: number, len: number): number;
+  autocomplete_input(ptr: number, len: number, buf_cap: number): number;
+  get_value_end(): number;
 }
 
 interface BridgeExports {
@@ -527,6 +541,10 @@ export async function init(options?: {
       compare_diff_type: engine.compare_diff_type,
       compare_free: engine.compare_free,
       // Stringify
+      // Input classification & autocomplete
+      classify_input: engine.classify_input,
+      autocomplete_input: engine.autocomplete_input,
+      get_value_end: engine.get_value_end,
       stringify_init: engine.stringify_init,
       stringify_null: engine.stringify_null,
       stringify_bool: engine.stringify_bool,
@@ -722,13 +740,10 @@ export async function init(options?: {
   // Track generation per docId to prevent stale FinalizationRegistry callbacks
   // from freeing a reused slot. Each parse increments the generation.
   const docGenerations = new Map<number, number>();
-  // Original input string per doc — enables zero-copy string slicing
-  const docInputStrings = new Map<number, { str: string; isAscii: boolean }>();
 
   function freeDocIfCurrent(docId: number, generation: number): void {
     if (docGenerations.get(docId) !== generation) return; // stale callback
     engine.doc_free(docId);
-    docInputStrings.delete(docId);
   }
 
   // --- FinalizationRegistry for auto-cleanup of document slots ---
@@ -775,6 +790,8 @@ export async function init(options?: {
     materialize(): unknown;
     lazyHandle: unknown;
     free?: () => void;
+    /** Fast columnar iterator: returns keys + column arrays for direct property writes */
+    iterateColumnar?: () => { keys: string[]; cols: unknown[][] } | null;
   }
 
   interface ObjectProxyConfig {
@@ -845,9 +862,29 @@ export async function init(options?: {
         if (prop === LAZY_PROXY) return config.lazyHandle;
         if (prop === "length") return config.length;
         if (prop === Symbol.iterator) {
-          // Fast iterator — calls getItem directly, bypassing Proxy get trap.
-          // for...of uses this path: 1 Proxy call (Symbol.iterator) instead of N.
-          // Reuses result object to avoid allocation per .next() call.
+          // Columnar fast path: build a real Array of plain objects from columns.
+          // V8 gives all objects the same hidden class → destructuring is ~5ns.
+          // A real Array iterator is fully optimized by the engine.
+          if (config.iterateColumnar) {
+            const info = config.iterateColumnar();
+            if (info) {
+              const { keys, cols } = info;
+              const len = config.length;
+              const kLen = keys.length;
+              const arr = new Array(len);
+              for (let i = 0; i < len; i++) {
+                const obj: Record<string, unknown> = {};
+                for (let k = 0; k < kLen; k++) obj[keys[k]] = cols[k][i];
+                arr[i] = obj;
+              }
+              // All column data is now in JS plain objects — eagerly free the
+              // doc slot so tight `for..of vj.parse(...)` loops don't exhaust
+              // the 256-slot pool waiting for FinalizationRegistry.
+              if (config.free) config.free();
+              return arr[Symbol.iterator].bind(arr);
+            }
+          }
+          // Generic fallback: calls getItem per element
           const len = config.length;
           const getItem = config.getItem.bind(config);
           return function () {
@@ -958,7 +995,7 @@ export async function init(options?: {
       const f64Ptr = engine.doc_f64_batch_ptr() as unknown as number;
       const src = new Float64Array(engine.memory.buffer, f64Ptr, n);
       const col: unknown[] = new Array(n);
-      for (let i = 0; i < n; i++) col[i] = src[i];
+      for (let i = 0; i < n; i++) col[i] = Number.isNaN(src[i]) ? null : src[i];
       return col;
     }
 
@@ -1033,6 +1070,8 @@ export async function init(options?: {
     index: number,
     keepAlive: object,
     generation: number,
+    inputStr?: string | null,
+    inputByteLen?: number,
   ): unknown {
     const tag = engine.doc_get_tag(docId, index);
 
@@ -1048,7 +1087,6 @@ export async function init(options?: {
       if (docGenerations.get(docId) !== generation) return;
       docGenerations.delete(docId);
       engine.doc_free(docId);
-      docInputStrings.delete(docId);
       docRegistry.unregister(keepAlive);
     };
 
@@ -1088,6 +1126,9 @@ export async function init(options?: {
         const indices = getElemIndices();
         const firstTag = engine.doc_get_tag(docId, indices[0]);
         if (firstTag !== TAG_OBJECT) return false;
+        // Validate all rows share the same schema (key names match first object).
+        // doc_read_all_columns returns 0 if any row has mismatched keys.
+        if (engine.doc_read_all_columns(docId, index) === 0) return false;
 
         // Read key names + types from first element
         const firstObjIdx = indices[0];
@@ -1114,62 +1155,8 @@ export async function init(options?: {
           const fieldIdx = fi;
           const expectedType = fieldTypes[fi];
 
-          if (expectedType === TAG_STRING) {
-            // String column: zero-copy input slicing with per-string escape handling.
-            // Unescaped strings: slice directly from original JS input string (zero-copy).
-            // Escaped strings: JSON.parse(input.slice(offset-1, offset+rawLen+1)) — V8-native unescape.
-            // Fallback (non-ASCII input): WASM string_buffer + TextDecoder.
-            let strSlices: { offsets: Uint32Array; rawLens: Uint32Array; escapeBits: Uint32Array; inputStr: string } | null = null;
-            let strFallback: unknown[] | null = null;
-            Object.defineProperty(rowView, key, {
-              get(): unknown {
-                if (strSlices === null && strFallback === null) {
-                  const inputInfo = docInputStrings.get(docId);
-                  if (inputInfo && inputInfo.isAscii) {
-                    const result = engine.doc_read_column_str_slices(docId, index, fieldIdx);
-                    if (result === 1) {
-                      const bp = engine.doc_batch_ptr() as unknown as number;
-                      const rc = new Uint32Array(engine.memory.buffer, bp, 1)[0];
-                      if (rc > 0) {
-                        const pairs = new Uint32Array(rc * 2);
-                        pairs.set(new Uint32Array(engine.memory.buffer, bp + 4, rc * 2));
-                        const offsets = new Uint32Array(rc);
-                        const rawLens = new Uint32Array(rc);
-                        const escapeBits = new Uint32Array(rc);
-                        for (let i = 0; i < rc; i++) {
-                          offsets[i] = pairs[i * 2];
-                          const rawWithBit = pairs[i * 2 + 1];
-                          rawLens[i] = rawWithBit & 0x7FFFFFFF;
-                          escapeBits[i] = rawWithBit >>> 31;
-                        }
-                        strSlices = { offsets, rawLens, escapeBits, inputStr: inputInfo.str };
-                      }
-                    }
-                  }
-                  if (strSlices === null) {
-                    // Fallback: pre-slice via TextDecoder
-                    strFallback = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
-                  }
-                  columns!.set(key, []); // placeholder for columns map
-                }
-                if (strSlices !== null) {
-                  const o = strSlices.offsets[rowViewIdx];
-                  const rl = strSlices.rawLens[rowViewIdx];
-                  if (rl === 0) return '';
-                  if (strSlices.escapeBits[rowViewIdx]) {
-                    // Escaped string: slice including quotes from original input, let JSON.parse unescape
-                    return JSON.parse(strSlices.inputStr.slice(o - 1, o + rl + 1));
-                  }
-                  // Unescaped string: direct slice (V8 SlicedString, zero character copy)
-                  return strSlices.inputStr.slice(o, o + rl);
-                }
-                return strFallback![rowViewIdx];
-              },
-              enumerable: true,
-              configurable: true,
-            });
-          } else {
-            // Number/boolean column: cache array ref in closure
+          // All column types: single fast path via materializeColumn
+          {
             let cachedCol: unknown[] | null = null;
             Object.defineProperty(rowView, key, {
               get(): unknown {
@@ -1223,6 +1210,140 @@ export async function init(options?: {
           }
           elemCache.set(idx, cached);
           return cached;
+        },
+        iterateColumnar(): { keys: string[]; cols: unknown[][] } | null {
+          void keepAlive;
+          // ONE WASM call: doc_read_all_columns reads schema + all column data
+          const ok = engine.doc_read_all_columns(docId, index);
+          if (ok === 0) return null;
+
+          const batchPtr = engine.doc_batch_ptr() as unknown as number;
+          const hdr = new Uint32Array(engine.memory.buffer, batchPtr, 3);
+          const N = hdr[0]; // element count
+          const K = hdr[1]; // field count
+          if (N === 0 || K === 0) return null;
+
+          // Read types, key offsets, and total key bytes from batch_buffer header
+          const typesAndOffsets = new Uint32Array(engine.memory.buffer, batchPtr + 8, K * 2 + 1);
+          const types = new Uint32Array(K);
+          const keyOffsets = new Uint32Array(K + 1);
+          for (let i = 0; i < K; i++) {
+            types[i] = typesAndOffsets[i];
+            keyOffsets[i] = typesAndOffsets[K + i];
+          }
+          keyOffsets[K] = typesAndOffsets[K * 2]; // total key bytes sentinel
+
+          // Read key names from utf16_buf (raw UTF-8 bytes → TextDecoder)
+          const totalKeyBytes = keyOffsets[K];
+          const keys: string[] = new Array(K);
+          if (totalKeyBytes > 0) {
+            const utf16Ptr = engine.get_utf16_ptr();
+            const keyBuf = new Uint8Array(engine.memory.buffer, utf16Ptr, totalKeyBytes);
+            const bigKeyStr = utf8Decoder.decode(keyBuf);
+            // keyOffsets are byte offsets; for ASCII (common case) byte=char
+            // For non-ASCII we need proper char offset tracking
+            let charOff = 0;
+            for (let i = 0; i < K; i++) {
+              const byteStart = keyOffsets[i];
+              const byteEnd = keyOffsets[i + 1];
+              const byteLen = byteEnd - byteStart;
+              // Count chars in this key's byte range
+              let charLen = 0;
+              for (let b = byteStart; b < byteEnd; ) {
+                const byte = keyBuf[b];
+                if (byte < 0x80) { charLen++; b++; }
+                else if (byte < 0xE0) { charLen++; b += 2; }
+                else if (byte < 0xF0) { charLen++; b += 3; }
+                else { charLen += 2; b += 4; } // surrogate pair
+              }
+              keys[i] = bigKeyStr.slice(charOff, charOff + charLen);
+              charOff += charLen;
+            }
+          }
+
+          // Compute per-field data offsets (mirrors Zig layout)
+          const hdrSize = 2 + K * 2 + 1;
+          let boff = hdrSize;
+          let f64i = 0;
+          const fieldBatchOff: number[] = new Array(K);
+          const fieldF64Off: number[] = new Array(K);
+          for (let i = 0; i < K; i++) {
+            const t = types[i];
+            if (t === TAG_NUMBER) {
+              fieldF64Off[i] = f64i * N;
+              f64i++;
+            } else if (t === TAG_TRUE || t === TAG_FALSE) {
+              fieldBatchOff[i] = boff;
+              boff += N;
+            } else if (t === TAG_STRING) {
+              fieldBatchOff[i] = boff;
+              boff += N * 2;
+            }
+          }
+
+          // Build column arrays — read directly from WASM batch buffers
+          const cols: unknown[][] = new Array(K);
+          const f64Ptr = engine.doc_f64_batch_ptr() as unknown as number;
+          // ASCII fast path: if original input is a string and byte length matches
+          // char length, byte offsets = char offsets → input.slice() works directly
+          const isAscii = inputStr != null && inputByteLen != null && inputStr.length === inputByteLen;
+
+          for (let fi = 0; fi < K; fi++) {
+            const t = types[fi];
+            if (t === TAG_NUMBER) {
+              const src = new Float64Array(engine.memory.buffer, f64Ptr + fieldF64Off[fi] * 8, N);
+              const col: unknown[] = new Array(N);
+              for (let i = 0; i < N; i++) col[i] = Number.isNaN(src[i]) ? null : src[i];
+              cols[fi] = col;
+            } else if (t === TAG_TRUE || t === TAG_FALSE) {
+              const src = new Uint32Array(engine.memory.buffer, batchPtr + fieldBatchOff[fi] * 4, N);
+              const col: unknown[] = new Array(N);
+              for (let i = 0; i < N; i++) col[i] = src[i] === 1;
+              cols[fi] = col;
+            } else if (t === TAG_STRING) {
+              const col: unknown[] = new Array(N);
+              const pairBuf = new Uint32Array(engine.memory.buffer, batchPtr + fieldBatchOff[fi] * 4, N * 2);
+              if (isAscii) {
+                // Fast path: byte offset = char offset → input.slice() zero-copy
+                for (let i = 0; i < N; i++) {
+                  const inputOff = pairBuf[i * 2];
+                  const rawLenFlags = pairBuf[i * 2 + 1];
+                  const rawLen = rawLenFlags & 0x7FFFFFFF;
+                  const hasEscapes = (rawLenFlags & 0x80000000) !== 0;
+                  if (rawLen === 0) {
+                    col[i] = '';
+                  } else if (!hasEscapes) {
+                    // Clean string: slice directly from original JS input
+                    col[i] = inputStr!.slice(inputOff, inputOff + rawLen);
+                  } else {
+                    // Escaped string: use JSON.parse to handle escape sequences
+                    // inputStr[inputOff..inputOff+rawLen] contains raw JSON content
+                    // (without outer quotes), so wrap in quotes for JSON.parse
+                    col[i] = JSON.parse('"' + inputStr!.slice(inputOff, inputOff + rawLen) + '"');
+                  }
+                }
+              } else {
+                // Non-ASCII fallback: read processed strings from string buffer
+                // Use existing per-column approach
+                const strCol = materializeColumn(docId, index, fi, TAG_STRING, N, keepAlive, generation);
+                for (let i = 0; i < N; i++) col[i] = strCol[i];
+              }
+              cols[fi] = col;
+            } else if (t === TAG_NULL) {
+              cols[fi] = new Array(N).fill(null);
+            } else {
+              // Nested objects/arrays — fall back to per-element
+              const col: unknown[] = new Array(N);
+              const indices = getElemIndices();
+              for (let i = 0; i < N; i++) {
+                const vi = engine.doc_obj_val_at(docId, indices[i], fi);
+                col[i] = wrapDoc(docId, vi, keepAlive, generation, inputStr, inputByteLen);
+              }
+              cols[fi] = col;
+            }
+          }
+
+          return { keys, cols };
         },
         materialize: () => deepMaterializeDoc(docId, index),
         lazyHandle: { docId, index },
@@ -1419,26 +1540,75 @@ export async function init(options?: {
 
   // --- Public API ---
   _instance = {
-    parse(input: string | Uint8Array): unknown {
+    parse(input: string | Uint8Array): ParseResult {
+      const CLASSIFY_INCOMPLETE = 0;
+      const CLASSIFY_COMPLETE = 1;
+      const CLASSIFY_COMPLETE_EARLY = 2;
+      const CLASSIFY_INVALID = 3;
 
-      // Write input into reusable WASM buffer (no per-parse alloc/dealloc)
+      const STATUS_NAMES: Record<number, ParseStatus> = {
+        [CLASSIFY_INCOMPLETE]: "incomplete",
+        [CLASSIFY_COMPLETE]: "complete",
+        [CLASSIFY_COMPLETE_EARLY]: "complete_early",
+        [CLASSIFY_INVALID]: "invalid",
+      };
+
+      // Write input into reusable WASM buffer with extra headroom for autocomplete
       let ptr: number;
       let len: number;
       if (typeof input === "string") {
-        // Worst case: 3 bytes per UTF-16 code unit
-        const maxBytes = input.length * 3;
+        // Worst case: 3 bytes per UTF-16 code unit + 64 for autocomplete/padding
+        const maxBytes = input.length * 3 + 64;
         ptr = ensureInputBuffer(maxBytes);
         const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
         const result = encoder.encodeInto(input, target);
         len = result.written!;
       } else {
         len = input.byteLength;
-        ptr = ensureInputBuffer(len);
+        ptr = ensureInputBuffer(len + 64);
         new Uint8Array(engine.memory.buffer, ptr, len).set(input);
       }
+      // Pre-fill 64 bytes of space padding after the input. This ensures the
+      // SIMD parser's 64-byte block reads see only whitespace past the data,
+      // preventing false TrailingContent errors for complete_early slicing.
+      new Uint8Array(engine.memory.buffer, ptr + len, 64).fill(0x20);
 
-      // Primary path: parse into tape via doc slots (fast, lazy)
-      let docId = engine.doc_parse(ptr, len);
+      // Step 1: Classify input
+      const classification = engine.classify_input(ptr, len);
+      const status = STATUS_NAMES[classification] ?? "invalid";
+
+      // Invalid → return immediately with error
+      if (classification === CLASSIFY_INVALID) {
+        return { status: "invalid", error: "Invalid JSON structure" };
+      }
+
+      // Step 2: Determine parse length
+      let parseLen: number;
+      let remainingCopy: Uint8Array | null = null;
+      if (classification === CLASSIFY_COMPLETE_EARLY) {
+        parseLen = engine.get_value_end();
+        // The SIMD parser reads in 64-byte blocks past parseLen, so trailing
+        // data can be misinterpreted as structural chars. Copy remaining bytes
+        // out, then fill with whitespace padding for a clean parse.
+        const mem = new Uint8Array(engine.memory.buffer);
+        const remainLen = len - parseLen;
+        remainingCopy = new Uint8Array(remainLen);
+        remainingCopy.set(mem.subarray(ptr + parseLen, ptr + len));
+        // SIMD reads 64-byte chunks past parseLen — pad generously
+        mem.fill(0x20, ptr + parseLen, ptr + parseLen + 64);
+      } else if (classification === CLASSIFY_INCOMPLETE) {
+        parseLen = engine.autocomplete_input(ptr, len, inputBufLen);
+        // If autocomplete produced nothing (e.g. empty input), return incomplete with no value
+        if (parseLen === 0) {
+          return { status: "incomplete" };
+        }
+      } else {
+        // complete
+        parseLen = len;
+      }
+
+      // Step 3: Parse via doc_parse
+      let docId = engine.doc_parse(ptr, parseLen);
       if (docId < 0) {
         const errCode = engine.get_error_code();
         // Slot exhaustion (2) or OOM (13) — try to reclaim via GC and retry
@@ -1446,66 +1616,74 @@ export async function init(options?: {
           if (typeof globalThis.gc === "function") {
             globalThis.gc();
           }
-          docId = engine.doc_parse(ptr, len);
+          docId = engine.doc_parse(ptr, parseLen);
         }
       }
 
       if (docId >= 0) {
-        // Store original input for zero-copy string slicing.
-        // isAscii: byte length = char length means byte offsets = char offsets.
-        if (typeof input === "string") {
-          docInputStrings.set(docId, { str: input, isAscii: input.length === len });
-        }
         // Doc-slot path succeeded
         const rootTag = engine.doc_get_tag(docId, 1);
+        let value: unknown;
+
         if (rootTag <= TAG_STRING) {
           // Primitive — extract and free immediately
-          let result: unknown;
           switch (rootTag) {
             case TAG_NULL:
-              result = null;
+              value = null;
               break;
             case TAG_TRUE:
-              result = true;
+              value = true;
               break;
             case TAG_FALSE:
-              result = false;
+              value = false;
               break;
             case TAG_NUMBER:
-              result = engine.doc_get_number(docId, 1);
+              value = engine.doc_get_number(docId, 1);
               break;
             case TAG_STRING:
-              result = docStringToGC(docId, 1);
+              value = docStringToGC(docId, 1);
               break;
             default:
-              result = null;
+              value = null;
           }
           engine.doc_free(docId);
-          return result;
+        } else {
+          // Container — register with FinalizationRegistry
+          const generation = (docGenerations.get(docId) ?? 0) + 1;
+          docGenerations.set(docId, generation);
+
+          const keepAlive = { docId };
+          docRegistry.register(keepAlive, { docId, generation }, keepAlive);
+
+          // Pass original input for input.slice() fast path in columnar iteration
+          const origStr = typeof input === "string" ? input : null;
+          value = wrapDoc(docId, 1, keepAlive, generation, origStr, len);
         }
 
-        // Container — register with FinalizationRegistry
-        const generation = (docGenerations.get(docId) ?? 0) + 1;
-        docGenerations.set(docId, generation);
-
-        const keepAlive = { docId };
-        docRegistry.register(keepAlive, { docId, generation }, keepAlive);
-
-        return wrapDoc(docId, 1, keepAlive, generation);
+        // Build result
+        const result: ParseResult = { status, value };
+        if (classification === CLASSIFY_COMPLETE_EARLY && remainingCopy) {
+          result.remaining = remainingCopy; // already copied before parse
+        }
+        return result;
       }
 
-      // Fallback path: doc slots exhausted (Bun's JSC defers FinalizationRegistry
-      // callbacks, so gc() retry may not free slots). Use the GC tree path instead.
-      // This builds the full tree upfront but has no slot limit.
-      const gcRef = bridge.parseJSON(ptr, len);
+      // Doc-parse failed — try GC tree path as fallback
+      const gcRef = bridge.parseJSON(ptr, parseLen);
       if (gcRef === null || gcRef === undefined) {
         const errorCode = bridge.getError();
         const msg =
           ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-        throw new SyntaxError(`VectorJSON: ${msg}`);
+        // classify_input only checks structural balance, not grammar.
+        // If doc_parse fails on "complete" input, the JSON is grammatically invalid.
+        return { status: "invalid", error: `VectorJSON: ${msg}` };
       }
-      return wrapGC(gcRef);
-      // No dealloc — input buffer is persistent and reused across parses
+      const value = wrapGC(gcRef);
+      const result: ParseResult = { status, value };
+      if (classification === CLASSIFY_COMPLETE_EARLY && remainingCopy) {
+        result.remaining = remainingCopy;
+      }
+      return result;
     },
 
     materialize(value: unknown): unknown {
@@ -1792,7 +1970,7 @@ export async function init(options?: {
  * Convenience: parse JSON using a pre-initialized instance.
  * Initializes on first call.
  */
-export async function parse(input: string | Uint8Array): Promise<unknown> {
+export async function parse(input: string | Uint8Array): Promise<ParseResult> {
   const vj = await init();
   return vj.parse(input);
 }

@@ -37,27 +37,27 @@ console.log("\n🧪 VectorJSON Basic Tests\n");
 const vj = await init();
 
 await test("parse simple object", () => {
-  const result = vj.parse('{"hello": "world"}');
+  const result = vj.parse('{"hello": "world"}').value;
   assertEqual(result, { hello: "world" });
 });
 
 await test("parse nested object", () => {
-  const result = vj.parse('{"a": {"b": 1, "c": true}}');
+  const result = vj.parse('{"a": {"b": 1, "c": true}}').value;
   assertEqual(result, { a: { b: 1, c: true } });
 });
 
 await test("parse array", () => {
-  const result = vj.parse("[1, 2, 3]");
+  const result = vj.parse("[1, 2, 3]").value;
   assertEqual(result, [1, 2, 3]);
 });
 
 await test("parse mixed types", () => {
-  const result = vj.parse('[null, true, false, 42, "hello", {"key": "val"}]');
+  const result = vj.parse('[null, true, false, 42, "hello", {"key": "val"}]').value;
   assertEqual(result, [null, true, false, 42, "hello", { key: "val" }]);
 });
 
 await test("parse number types", () => {
-  const result = vj.parse('{"int": 42, "neg": -7, "float": 3.14}');
+  const result = vj.parse('{"int": 42, "neg": -7, "float": 3.14}').value;
   const obj = /** @type {any} */ (result);
   assertEqual(obj.int, 42);
   assertEqual(obj.neg, -7);
@@ -65,44 +65,39 @@ await test("parse number types", () => {
 });
 
 await test("parse empty containers", () => {
-  assertEqual(vj.parse("{}"), {});
-  assertEqual(vj.parse("[]"), []);
+  assertEqual(vj.parse("{}").value, {});
+  assertEqual(vj.parse("[]").value, []);
 });
 
 await test("parse string with escapes", () => {
-  const result = vj.parse('{"msg": "hello\\nworld"}');
+  const result = vj.parse('{"msg": "hello\\nworld"}').value;
   const obj = /** @type {any} */ (result);
   assertEqual(obj.msg, "hello\nworld");
 });
 
 await test("parse deeply nested", () => {
-  const result = vj.parse('{"a": {"b": {"c": {"d": 42}}}}');
+  const result = vj.parse('{"a": {"b": {"c": {"d": 42}}}}').value;
   assertEqual(result, { a: { b: { c: { d: 42 } } } });
 });
 
 await test("parse Uint8Array input", () => {
   const bytes = new TextEncoder().encode('{"binary": true}');
-  const result = vj.parse(bytes);
+  const result = vj.parse(bytes).value;
   assertEqual(result, { binary: true });
 });
 
-await test("parse error throws SyntaxError", async () => {
-  let threw = false;
-  try {
-    vj.parse("{invalid json}");
-  } catch (err) {
-    threw = true;
-    assert(err instanceof SyntaxError, `Expected SyntaxError, got ${err.constructor.name}`);
-  }
-  assert(threw, "Expected parse to throw");
+await test("parse error returns invalid status", async () => {
+  const result = vj.parse("{invalid json}");
+  assert(result.status === "invalid", `Expected status "invalid", got "${result.status}"`);
+  assert(result.error !== undefined, "Expected error message");
 });
 
 await test("parse scalar values", () => {
-  assertEqual(vj.parse("42"), 42);
-  assertEqual(vj.parse("true"), true);
-  assertEqual(vj.parse("false"), false);
-  assertEqual(vj.parse("null"), null);
-  assertEqual(vj.parse('"hello"'), "hello");
+  assertEqual(vj.parse("42").value, 42);
+  assertEqual(vj.parse("true").value, true);
+  assertEqual(vj.parse("false").value, false);
+  assertEqual(vj.parse("null").value, null);
+  assertEqual(vj.parse('"hello"').value, "hello");
 });
 
 await test("round-trip: JSON.stringify(vectorjson.parse(x)) === x", () => {
@@ -116,7 +111,7 @@ await test("round-trip: JSON.stringify(vectorjson.parse(x)) === x", () => {
     'null',
   ];
   for (const input of inputs) {
-    const result = vj.parse(input);
+    const result = vj.parse(input).value;
     const output = JSON.stringify(result);
     assertEqual(output, input, `Round-trip failed for: ${input}`);
   }

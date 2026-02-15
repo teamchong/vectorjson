@@ -109,6 +109,17 @@ pub fn build(b: *std.Build) void {
         "doc_batch_ptr",
         "doc_array_elements",
         "doc_object_keys",
+        // Batch column reads
+        "doc_f64_batch_ptr",
+        "doc_read_column_f64",
+        "doc_read_column_bool",
+        "doc_read_column_str_raw",
+        "doc_read_string_raw",
+        "doc_read_all_columns",
+        // Input classification & autocomplete
+        "classify_input",
+        "autocomplete_input",
+        "get_value_end",
         // Doc stringify (tape → JSON bytes, one call)
         "doc_stringify",
         // Eager materialization (tape → flat binary buffer, one call)

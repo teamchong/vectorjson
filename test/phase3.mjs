@@ -203,7 +203,7 @@ async function run() {
   ];
 
   for (const json of roundTripCases) {
-    const parsed = vj.parse(json);
+    const parsed = vj.parse(json).value;
     const reserialized = vj.stringify(parsed);
     assertEqual(reserialized, json, `roundtrip: ${json}`);
   }

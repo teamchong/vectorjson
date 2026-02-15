@@ -183,8 +183,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 + 2);
 
             self.tape.string_buffer.allocator = allocator;
-            // Extra capacity for u32 input-offset prefix per string (4 bytes each).
-            try self.tape.string_buffer.ensureTotalCapacity(new_capacity * 2 + 64);
+            try self.tape.string_buffer.ensureTotalCapacity(new_capacity);
         }
 
         fn ensureTotalCapacityForReader(self: *Self, allocator: Allocator, new_capacity: usize) Error!void {
@@ -198,7 +197,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             }
 
             self.tape.string_buffer.allocator = allocator;
-            try self.tape.string_buffer.ensureTotalCapacity(new_capacity * 2 + 64);
+            try self.tape.string_buffer.ensureTotalCapacity(new_capacity);
         }
 
         /// Parse a JSON document from slice. Allocated resources are owned by the parser.
@@ -214,6 +213,8 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             // Update string_buffer length: strings_ptr tracks how far we wrote,
             // but the list length isn't updated by advanceString in non-streaming mode.
             self.tape.string_buffer.strings.list.items.len = @intFromPtr(self.tape.strings_ptr) - @intFromPtr(self.tape.string_buffer.strings.list.items.ptr);
+            // string_meta length is tracked by string_meta_count (appended via appendAssumeCapacity)
+            self.tape.string_meta.list.items.len = self.tape.string_meta_count;
             return .{
                 .tape = &self.tape,
                 .index = 1,
@@ -431,10 +432,8 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 const w = self.tape.get(self.index);
                 return switch (w.tag) {
                     .string => brk: {
-                        const low_bits = std.mem.readInt(u16, self.tape.string_buffer.strings.items().ptr[w.data.ptr..][0..@sizeOf(u16)], native_endian);
-                        const high_bits: u64 = w.data.len;
-                        const len = high_bits << 16 | low_bits;
-                        const ptr = self.tape.string_buffer.strings.items().ptr[w.data.ptr + @sizeOf(u16) ..];
+                        const len = std.mem.readInt(u32, self.tape.string_buffer.strings.items().ptr[w.data.ptr..][0..@sizeOf(u32)], native_endian);
+                        const ptr = self.tape.string_buffer.strings.items().ptr[w.data.ptr + @sizeOf(u32) ..];
                         break :brk ptr[0..len];
                     },
                     else => error.IncorrectType,
@@ -908,6 +907,14 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
             string_buffer: types.StringBuffer(max_capacity_bound),
 
+            /// Per-string metadata: packed (input_byte_offset: u32, raw_len | has_escapes<<31: u32).
+            /// Indexed by string ordinal (0th string parsed, 1st, etc.).
+            /// Populated during visitString. Used by bulk column reads to enable
+            /// zero-copy JS input.slice() for clean (non-escaped) strings.
+            string_meta: types.BoundedArrayList(u64, max_capacity_bound) = .empty,
+            string_meta_count: u32 = 0,
+            input_base_addr: usize = 0,
+
             words_ptr: if (want_stream) void else [*]u64 = undefined,
             strings_ptr: if (want_stream) void else [*]u8 = undefined,
 
@@ -923,6 +930,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 self.stack.deinit(allocator);
                 self.tokens.deinit(allocator);
                 self.string_buffer.deinit();
+                self.string_meta.deinit(allocator);
             }
 
             pub inline fn buildFromSlice(self: *Tape, allocator: Allocator, document: Aligned.slice) Error!void {
@@ -935,8 +943,14 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                     // root words
                 + 2);
 
+                // String metadata: at most tokens_count/2 strings (every other token could be a string)
+                try self.string_meta.ensureTotalCapacity(allocator, (tokens_count >> 1) + 1);
+
                 self.words.list.clearRetainingCapacity();
                 self.stack.clearRetainingCapacity();
+                self.string_meta.list.clearRetainingCapacity();
+                self.string_meta_count = 0;
+                self.input_base_addr = @intFromPtr(document.ptr);
 
                 self.words_ptr = self.words.items().ptr;
                 self.strings_ptr = self.string_buffer.strings.items().ptr;
@@ -1236,36 +1250,33 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 }
                 const string_parser = @import("parsers/string.zig");
                 const curr_str = self.currentString();
-                // Layout: [u32 packed_input_offset][u32 raw_input_len][u16 len_low][string_bytes]
-                const header_size = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u16); // 10
-                const next_str = curr_str + header_size;
+                const next_str = curr_str + @sizeOf(u32);
                 const result = try string_parser.writeString(ptr, next_str);
                 const next_len = result.dst_end - next_str;
 
-                // Compute input byte offset from the structural token index.
-                // We use the token index (not pointer arithmetic) because ptr may
-                // point into a padding buffer rather than the original document.
-                // After next() consumed this token, the previous entry is at token[-1].
-                const prev_token: [*]const u32 = @ptrFromInt(@intFromPtr(self.tokens.token) - @sizeOf(u32));
-                const quote_byte_offset: u32 = prev_token[0]; // byte offset of '"' in original document
-                const input_offset: u32 = quote_byte_offset + 1; // skip opening quote
+                // Store per-string metadata: (input_byte_offset, raw_len | has_escapes<<31)
+                // Ordinal = string_meta_count before increment — stored in tape word for O(1) lookup
+                const ordinal = self.string_meta_count;
+                // Use the token byte index (always relative to original document) instead of
+                // @intFromPtr(ptr) which may point into the padding buffer for tokens near the
+                // end of input (zimdjson copies tail bytes for SIMD safety).
+                // tokens.token was incremented by next(), so [-1] is the just-consumed token.
+                const input_offset: u32 = (self.tokens.token - 1)[0] + 1; // +1 to skip opening quote
                 const raw_len: u32 = @intCast(result.src_end - (ptr + 1));
-                const has_escapes: bool = next_len != raw_len;
-                const packed_offset: u32 = input_offset | (if (has_escapes) @as(u32, 1) << 31 else 0);
-
-                // Write packed input offset + raw input length before the length prefix
-                std.mem.writeInt(u32, curr_str[0..@sizeOf(u32)], packed_offset, native_endian);
-                std.mem.writeInt(u32, curr_str[@sizeOf(u32)..][0..@sizeOf(u32)], raw_len, native_endian);
+                const has_escapes: u32 = if (next_len != raw_len) @as(u32, 1) << 31 else 0;
+                self.string_meta.appendAssumeCapacity(@as(u64, input_offset) | (@as(u64, raw_len | has_escapes) << 32));
+                self.string_meta_count += 1;
 
                 self.appendWordAssumeCapacity(.{
                     .tag = .string,
                     .data = .{
                         .ptr = @intCast(curr_str - self.string_buffer.strings.items().ptr),
-                        .len = @intCast(next_len >> 16),
+                        .len = @intCast(ordinal),
                     },
                 });
-                std.mem.writeInt(u16, curr_str[@sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], @truncate(next_len), native_endian);
-                self.advanceString(next_len + header_size);
+                // Full string length in u32 header (self-contained, no split encoding)
+                std.mem.writeInt(u32, curr_str[0..@sizeOf(u32)], @intCast(next_len), native_endian);
+                self.advanceString(next_len + @sizeOf(u32));
             }
 
             inline fn visitNumber(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {

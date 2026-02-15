@@ -15,6 +15,18 @@ const gpa = page_alloc;
 
 // --- Parser state ---
 const DomParser = zimdjson.dom.FullParser(.default);
+// Tag byte constants from the tape word format (matches dom.zig Tag enum)
+const TAG_NULL: u8 = 'n';
+const TAG_TRUE: u8 = 't';
+const TAG_FALSE: u8 = 'f';
+const TAG_STRING: u8 = 's';
+const TAG_UNSIGNED: u8 = 'u';
+const TAG_SIGNED: u8 = 'i';
+const TAG_DOUBLE: u8 = 'd';
+const TAG_OBJ_OPEN: u8 = '{';
+const TAG_OBJ_CLOSE: u8 = '}';
+const TAG_ARR_OPEN: u8 = '[';
+const TAG_ARR_CLOSE: u8 = ']';
 
 var parser: DomParser = DomParser.init;
 var last_error_code: i32 = 0;
@@ -158,13 +170,11 @@ export fn get_next_token() i32 {
             break :blk .number_double;
         },
         .string => blk: {
-            // Read string from the string buffer (skip u32 packed_offset + u32 raw_input_len prefix)
+            // Read string from the string buffer (u32 header contains full length)
             const native_endian = @import("builtin").cpu.arch.endian();
             const str_ptr_offset = word.data.ptr;
             const strings = parser.tape.string_buffer.strings.items();
-            const low_bits = std.mem.readInt(u16, strings.ptr[str_ptr_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
-            const high_bits: u64 = word.data.len;
-            const str_len: u32 = @intCast(high_bits << 16 | low_bits);
+            const str_len = std.mem.readInt(u32, strings.ptr[str_ptr_offset..][0..@sizeOf(u32)], native_endian);
             current_string_ptr = strings.ptr[str_ptr_offset + STR_HEADER_SIZE ..];
             current_string_len = str_len;
             tape_index += 1;
@@ -642,50 +652,25 @@ fn getDocParser(doc_id: i32) ?*DomParser {
 
 /// Read a string value from a parser's tape at the given index.
 /// Returns the raw byte slice pointing into the parser's string buffer.
-/// String buffer layout per string: [u32 packed_input_offset][u32 raw_input_len][u16 len_low][string_bytes]
-const STR_HEADER_SIZE: u32 = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u16); // 10
+/// String buffer layout per string: [u32 length][string_bytes]
+/// Tape word data.len stores the string ordinal (index into string_meta).
+const STR_HEADER_SIZE: u32 = @sizeOf(u32); // 4
 
 fn readTapeString(p: *DomParser, index: u32) []const u8 {
     const native_endian = @import("builtin").cpu.arch.endian();
     const word = p.tape.get(index);
     const str_offset = word.data.ptr;
     const strings = p.tape.string_buffer.strings.items();
-    // Skip u32 packed_input_offset + u32 raw_input_len, then read u16 len_low
-    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
-    const high_bits: u64 = word.data.len;
-    const str_len: u32 = @intCast(high_bits << 16 | low_bits);
+    const str_len = std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
     return strings.ptr[str_offset + STR_HEADER_SIZE ..][0..str_len];
-}
-
-/// Read the packed input offset for a string tape entry.
-/// Returns: bits 0-30 = byte offset of string content start in original input,
-///          bit 31 = has_escapes flag.
-fn readTapeStringPackedOffset(p: *DomParser, index: u32) u32 {
-    const native_endian = @import("builtin").cpu.arch.endian();
-    const word = p.tape.get(index);
-    const str_offset = word.data.ptr;
-    const strings = p.tape.string_buffer.strings.items();
-    return std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
-}
-
-/// Read the raw input length for a string tape entry (bytes consumed from original input, excluding quotes).
-fn readTapeStringRawInputLen(p: *DomParser, index: u32) u32 {
-    const native_endian = @import("builtin").cpu.arch.endian();
-    const word = p.tape.get(index);
-    const str_offset = word.data.ptr;
-    const strings = p.tape.string_buffer.strings.items();
-    return std.mem.readInt(u32, strings.ptr[str_offset + @sizeOf(u32) ..][0..@sizeOf(u32)], native_endian);
 }
 
 /// Get the unescaped string length from a tape entry.
 fn readTapeStringLen(p: *DomParser, index: u32) u32 {
     const native_endian = @import("builtin").cpu.arch.endian();
-    const word = p.tape.get(index);
-    const str_offset = word.data.ptr;
+    const str_offset = p.tape.get(index).data.ptr;
     const strings = p.tape.string_buffer.strings.items();
-    const low_bits = std.mem.readInt(u16, strings.ptr[str_offset + @sizeOf(u32) + @sizeOf(u32) ..][0..@sizeOf(u16)], native_endian);
-    const high_bits: u64 = word.data.len;
-    return @intCast(high_bits << 16 | low_bits);
+    return std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
 }
 
 /// Parse JSON bytes and store the result in a document slot.
@@ -996,13 +981,17 @@ export fn doc_read_column_f64(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
         // Read the value at field_curr + 1 (key is at field_curr)
         const val_idx = field_curr + 1;
         const vword = p.tape.get(val_idx);
-        const next_raw: u64 = @bitCast(p.tape.get(val_idx + 1));
-        f64_batch[row] = switch (vword.tag) {
-            .unsigned => @floatFromInt(@as(u64, next_raw)),
-            .signed => @floatFromInt(@as(i64, @bitCast(next_raw))),
-            .double => @bitCast(next_raw),
-            else => 0.0,
-        };
+        if (vword.tag == .null) {
+            f64_batch[row] = std.math.nan(f64);
+        } else {
+            const next_raw: u64 = @bitCast(p.tape.get(val_idx + 1));
+            f64_batch[row] = switch (vword.tag) {
+                .unsigned => @floatFromInt(@as(u64, next_raw)),
+                .signed => @floatFromInt(@as(i64, @bitCast(next_raw))),
+                .double => @bitCast(next_raw),
+                else => std.math.nan(f64),
+            };
+        }
 
         // Advance to next array element
         elem_curr = ew.data.ptr; // object_opening.data.ptr = past the object_closing
@@ -1325,69 +1314,232 @@ export fn doc_read_column_str_raw(doc_id: i32, arr_index: u32, field_idx: u32) u
     return out;
 }
 
-/// Read a string column as input-slice offsets — ZERO string copying.
-/// For each string in the column, outputs (input_byte_offset, raw_input_len | escape_bit) pairs.
-/// The raw_input_len is the number of bytes in the original input (excluding quotes).
-/// Bit 31 of the second u32 = has_escapes flag for that specific string.
-/// Always returns 1 on success. Returns 0 only on error (bad doc_id/tag).
+/// Read ALL columns from a homogeneous array of objects in ONE WASM call.
+/// Replaces ~20 separate WASM calls with a single tape traversal.
 ///
-/// batch_buffer layout:
-///   [elem_count, offset_0, rawLen_0|escapeBit, offset_1, rawLen_1|escapeBit, ...]
-export fn doc_read_column_str_slices(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+/// Output layout in batch_buffer:
+///   [0] = N (element count)
+///   [1] = K (field count)
+///   [2..2+K]     = JS types per field (0=null,1=true,2=false,3=number,4=string,5=obj,6=arr)
+///   [2+K..2+2K]  = key name byte offsets into utf16_buf
+///   [2+2K]        = total key name bytes
+///   Then per field in order:
+///     number → nothing in batch (data in f64_batch[cumIdx*N ..])
+///     bool   → N u32 (0 or 1)
+///     string → N*2 u32 pairs: (input_byte_offset, raw_len | has_escapes<<31) per row
+///
+/// f64_batch: number columns contiguously, N f64 per number field.
+/// utf16_buf: key name bytes only.
+///
+/// Returns 1 on success, 0 on error.
+export fn doc_read_all_columns(doc_id: i32, arr_index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
-    const word = p.tape.get(arr_index);
-    if (word.tag != .array_opening) return 0;
+    const arr_word = p.tape.get(arr_index);
+    if (arr_word.tag != .array_opening) return 0;
 
-    batch_buffer[0] = 0;
-    var row: u32 = 0;
-
-    var elem_curr: u32 = arr_index + 1;
-    while (row < 8191) { // 1 + 2*8191 = 16383, fits in batch_buffer
-        const ew = p.tape.get(elem_curr);
-        if (ew.tag == .array_closing) break;
-
-        if (ew.tag != .object_opening) {
-            // Non-object element: output zero-length placeholder
-            batch_buffer[1 + row * 2] = 0;
-            batch_buffer[1 + row * 2 + 1] = 0;
-            elem_curr = switch (ew.tag) {
+    // Count elements
+    var elem_count: u32 = 0;
+    {
+        var ec: u32 = arr_index + 1;
+        while (true) {
+            const ew = p.tape.get(ec);
+            if (ew.tag == .array_closing) break;
+            elem_count += 1;
+            ec = switch (ew.tag) {
                 .array_opening, .object_opening => ew.data.ptr,
-                .unsigned, .signed, .double => elem_curr + 2,
-                else => elem_curr + 1,
+                .unsigned, .signed, .double => ec + 2,
+                else => ec + 1,
             };
-            row += 1;
-            continue;
         }
+    }
+    if (elem_count == 0) return 0;
+    if (p.tape.get(arr_index + 1).tag != .object_opening) return 0;
 
-        // Navigate to field_idx within this object
-        var field_curr: u32 = elem_curr + 1;
-        var fi: u32 = 0;
-        while (fi < field_idx) : (fi += 1) {
-            const kw = p.tape.get(field_curr);
+    // Discover schema from first object — store key tape indices for verification
+    var field_count: u32 = 0;
+    var field_tags: [64]u8 = undefined;
+    var field_key_idx: [64]u32 = undefined; // tape index of each key (for schema comparison)
+    {
+        var fc: u32 = arr_index + 2;
+        while (field_count < 64) {
+            const kw = p.tape.get(fc);
             if (kw.tag == .object_closing) break;
-            const vw = p.tape.get(field_curr + 1);
-            field_curr = switch (vw.tag) {
+            field_key_idx[field_count] = fc;
+            const vw = p.tape.get(fc + 1);
+            field_tags[field_count] = @intFromEnum(vw.tag);
+            field_count += 1;
+            fc = switch (vw.tag) {
                 .array_opening, .object_opening => vw.data.ptr,
-                .unsigned, .signed, .double => field_curr + 3,
-                else => field_curr + 2,
+                .unsigned, .signed, .double => fc + 3,
+                else => fc + 2,
             };
         }
+    }
+    if (field_count == 0) return 0;
 
-        // Read the packed input offset and raw input length from the value at field_curr + 1
-        const val_idx = field_curr + 1;
-        const packed_off = readTapeStringPackedOffset(p, val_idx);
-        const raw_input_len = readTapeStringRawInputLen(p, val_idx);
-        const input_offset = packed_off & 0x7FFFFFFF;
-        const escape_bit: u32 = packed_off & 0x80000000; // preserve bit 31
-
-        batch_buffer[1 + row * 2] = input_offset;
-        batch_buffer[1 + row * 2 + 1] = raw_input_len | escape_bit;
-
-        elem_curr = ew.data.ptr;
-        row += 1;
+    // Write header
+    batch_buffer[0] = elem_count;
+    batch_buffer[1] = field_count;
+    for (0..field_count) |fi| {
+        const t = field_tags[fi];
+        batch_buffer[2 + fi] = if (t == TAG_NULL) 0
+            else if (t == TAG_TRUE) 1
+            else if (t == TAG_FALSE) 2
+            else if (t == TAG_UNSIGNED or t == TAG_SIGNED or t == TAG_DOUBLE) 3
+            else if (t == TAG_STRING) 4
+            else if (t == TAG_OBJ_OPEN) 5
+            else if (t == TAG_ARR_OPEN) 6
+            else 0;
     }
 
-    batch_buffer[0] = row;
+    // Write key names to utf16 buf
+    var key_bytes: u32 = 0;
+    {
+        var fc: u32 = arr_index + 2;
+        var fi: u32 = 0;
+        while (fi < field_count) {
+            batch_buffer[2 + field_count + fi] = key_bytes;
+            key_bytes += @intCast(readTapeString(p, fc).len);
+            fi += 1;
+            const vw = p.tape.get(fc + 1);
+            fc = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => fc + 3,
+                else => fc + 2,
+            };
+        }
+    }
+    batch_buffer[2 + field_count * 2] = key_bytes;
+
+    const utf16_buf = getUtf16Buf(key_bytes) orelse return 0;
+    {
+        var fc: u32 = arr_index + 2;
+        var fi: u32 = 0;
+        var off: u32 = 0;
+        while (fi < field_count) {
+            const s = readTapeString(p, fc);
+            if (s.len > 0) {
+                @memcpy(utf16_buf[off .. off + @as(u32, @intCast(s.len))], s);
+                off += @intCast(s.len);
+            }
+            fi += 1;
+            const vw = p.tape.get(fc + 1);
+            fc = switch (vw.tag) {
+                .array_opening, .object_opening => vw.data.ptr,
+                .unsigned, .signed, .double => fc + 3,
+                else => fc + 2,
+            };
+        }
+    }
+
+    // Compute per-field output positions
+    const hdr: u32 = 2 + field_count * 2 + 1;
+    var boff: u32 = hdr;
+    var f64i: u32 = 0;
+    var field_batch: [64]u32 = undefined;
+    var field_f64: [64]u32 = undefined;
+    for (0..field_count) |fi| {
+        const t = field_tags[fi];
+        if (t == TAG_UNSIGNED or t == TAG_SIGNED or t == TAG_DOUBLE) {
+            field_f64[fi] = f64i * elem_count;
+            f64i += 1;
+        } else if (t == TAG_TRUE or t == TAG_FALSE) {
+            field_batch[fi] = boff;
+            boff += elem_count;
+        } else if (t == TAG_STRING) {
+            field_batch[fi] = boff;
+            boff += elem_count * 2; // N pairs of (input_offset, raw_len|flags)
+        }
+    }
+    // Bounds check: fall back to per-element proxy if batch_buffer too small
+    if (boff > batch_buffer.len) return 0;
+
+    // String metadata from parse — ordinals stored directly in tape words
+    const meta = p.tape.string_meta.items();
+
+    // Walk array once — write all columns
+    var ec: u32 = arr_index + 1;
+    var row: u32 = 0;
+    while (row < elem_count) {
+        const ew = p.tape.get(ec);
+        if (ew.tag == .array_closing) break;
+
+        if (ew.tag == .object_opening) {
+            var fc: u32 = ec + 1;
+            for (0..field_count) |fi| {
+                const kw = p.tape.get(fc);
+                if (kw.tag == .object_closing) {
+                    // Missing fields — write defaults for remaining
+                    for (fi..field_count) |fi2| {
+                        const t2 = field_tags[fi2];
+                        if (t2 == TAG_UNSIGNED or t2 == TAG_SIGNED or t2 == TAG_DOUBLE) {
+                            f64_batch[field_f64[fi2] + row] = 0.0;
+                        } else if (t2 == TAG_TRUE or t2 == TAG_FALSE) {
+                            batch_buffer[field_batch[fi2] + row] = 0;
+                        } else if (t2 == TAG_STRING) {
+                            batch_buffer[field_batch[fi2] + row * 2] = 0;
+                            batch_buffer[field_batch[fi2] + row * 2 + 1] = 0;
+                        }
+                    }
+                    break;
+                }
+
+                // Verify key matches schema (bail out on heterogeneous objects)
+                const expected_key = readTapeString(p, field_key_idx[fi]);
+                const actual_key = readTapeString(p, fc);
+                if (!std.mem.eql(u8, expected_key, actual_key)) return 0;
+
+                // Key is at fc, value at fc+1
+                const val_idx = fc + 1;
+                const vw = p.tape.get(val_idx);
+                const t = field_tags[fi];
+
+                if (t == TAG_UNSIGNED or t == TAG_SIGNED or t == TAG_DOUBLE) {
+                    if (vw.tag == .null) {
+                        // Null in a number column → NaN sentinel (JS converts to null)
+                        f64_batch[field_f64[fi] + row] = std.math.nan(f64);
+                    } else {
+                        const next_raw: u64 = @bitCast(p.tape.get(val_idx + 1));
+                        f64_batch[field_f64[fi] + row] = switch (vw.tag) {
+                            .unsigned => @floatFromInt(@as(u64, next_raw)),
+                            .signed => @floatFromInt(@as(i64, @bitCast(next_raw))),
+                            .double => @bitCast(next_raw),
+                            else => std.math.nan(f64),
+                        };
+                    }
+                } else if (t == TAG_TRUE or t == TAG_FALSE) {
+                    batch_buffer[field_batch[fi] + row] = if (vw.tag == .true) 1 else 0;
+                } else if (t == TAG_STRING) {
+                    // O(1) lookup: tape word data.len = string ordinal → string_meta[ordinal]
+                    const ordinal: u32 = vw.data.len;
+                    if (ordinal < meta.len) {
+                        const meta_val = meta[ordinal];
+                        const input_offset: u32 = @truncate(meta_val);
+                        const raw_len_flags: u32 = @truncate(meta_val >> 32);
+                        batch_buffer[field_batch[fi] + row * 2] = input_offset;
+                        batch_buffer[field_batch[fi] + row * 2 + 1] = raw_len_flags;
+                    } else {
+                        batch_buffer[field_batch[fi] + row * 2] = 0;
+                        batch_buffer[field_batch[fi] + row * 2 + 1] = 0;
+                    }
+                }
+
+                fc = switch (vw.tag) {
+                    .array_opening, .object_opening => vw.data.ptr,
+                    .unsigned, .signed, .double => fc + 3,
+                    else => fc + 2,
+                };
+            }
+        }
+
+        row += 1;
+        ec = switch (ew.tag) {
+            .array_opening, .object_opening => ew.data.ptr,
+            .unsigned, .signed, .double => ec + 2,
+            else => ec + 1,
+        };
+    }
+
     return 1;
 }
 
@@ -1911,6 +2063,396 @@ export fn doc_read_string_utf16(doc_id: i32, index: u32) u32 {
     const char_count = bytes_written / 2;
     str_utf16_char_count = char_count;
     return char_count;
+}
+
+/// Debug: dump string_meta into batch_buffer.
+/// Layout: [meta_count, then for each: lo32, hi32]
+/// Returns meta_count.
+export fn doc_debug_string_meta(doc_id: i32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const meta = p.tape.string_meta.items();
+    const count: u32 = @intCast(meta.len);
+    batch_buffer[0] = count;
+    var i: u32 = 0;
+    while (i < count and (1 + i * 2 + 1) < batch_buffer.len) : (i += 1) {
+        batch_buffer[1 + i * 2] = @truncate(meta[i]);
+        batch_buffer[1 + i * 2 + 1] = @truncate(meta[i] >> 32);
+    }
+    // Also dump input_base_addr, string_meta_count, and meta buffer address
+    const off = 1 + count * 2;
+    batch_buffer[off] = @intCast(p.tape.input_base_addr);
+    batch_buffer[off + 1] = p.tape.string_meta_count;
+    batch_buffer[off + 2] = @intCast(@intFromPtr(p.tape.string_meta.list.items.ptr));
+    batch_buffer[off + 3] = @intCast(p.tape.string_meta.list.items.len);
+    batch_buffer[off + 4] = @intCast(p.tape.string_meta.list.capacity);
+    // Buffer addresses and sizes for overlap detection
+    batch_buffer[off + 5] = @intCast(@intFromPtr(p.tape.words.list.items.ptr));
+    batch_buffer[off + 6] = @intCast(p.tape.words.list.items.len * @sizeOf(u64));
+    batch_buffer[off + 7] = @intCast(p.tape.words.list.capacity * @sizeOf(u64));
+    batch_buffer[off + 8] = @intCast(@intFromPtr(p.tape.string_buffer.strings.list.items.ptr));
+    batch_buffer[off + 9] = @intCast(p.tape.string_buffer.strings.list.items.len);
+    batch_buffer[off + 10] = @intCast(p.tape.string_buffer.strings.list.capacity);
+    // strings_ptr after parsing (shows how far string buffer was advanced)
+    batch_buffer[off + 11] = @intCast(@intFromPtr(p.tape.strings_ptr));
+    // words_ptr after parsing (shows how far words was advanced)
+    batch_buffer[off + 12] = @intCast(@intFromPtr(p.tape.words_ptr));
+    return count;
+}
+
+/// Debug: dump tape words for string tags.
+/// Layout: [count, then for each string: tape_index, data_ptr, data_len]
+/// Returns string count.
+export fn doc_debug_tape_strings(doc_id: i32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    // Walk tape and find all string tags
+    const root_raw: u64 = @bitCast(p.tape.get(0));
+    const tape_end: u32 = @truncate(root_raw >> 8);
+    var ti: u32 = 1;
+    var count: u32 = 0;
+    while (ti < tape_end) {
+        const w = p.tape.get(ti);
+        if (w.tag == .string) {
+            if (1 + count * 3 + 2 < batch_buffer.len) {
+                batch_buffer[1 + count * 3] = ti;
+                batch_buffer[1 + count * 3 + 1] = w.data.ptr;
+                batch_buffer[1 + count * 3 + 2] = w.data.len;
+            }
+            count += 1;
+        }
+        ti += switch (w.tag) {
+            .unsigned, .signed, .double => @as(u32, 2),
+            else => @as(u32, 1),
+        };
+    }
+    batch_buffer[0] = count;
+    return count;
+}
+
+// ============================================================
+// Input Classification & Autocomplete — for status-based parse API
+// ============================================================
+//
+// classify_input: lightweight structural scan that determines whether
+// the JSON input is complete, incomplete, complete_early, or invalid.
+// Reuses the same bracket-depth + string-state approach as stream.zig.
+//
+// autocomplete_input: appends closing suffix to incomplete JSON so
+// doc_parse can handle it. Writes directly into WASM buffer after input.
+
+/// Stored value_end offset for complete_early case.
+var classify_value_end: u32 = 0;
+
+/// Classify JSON input without parsing.
+/// Returns: 0=incomplete, 1=complete, 2=complete_early, 3=invalid
+export fn classify_input(ptr: [*]const u8, len: u32) u32 {
+    classify_value_end = 0;
+
+    if (len == 0) return 0; // empty = incomplete
+
+    var depth_val: i32 = 0;
+    var in_string: bool = false;
+    var escape_next: bool = false;
+    var root_started: bool = false;
+    var root_completed: bool = false;
+    var root_is_string: bool = false;
+    var pending_scalar: bool = false;
+    var value_end: u32 = 0;
+
+    var i: u32 = 0;
+    while (i < len) {
+        const c = ptr[i];
+
+        if (escape_next) {
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if (in_string) {
+            if (c == '\\') {
+                escape_next = true;
+            } else if (c == '"') {
+                in_string = false;
+                if (depth_val == 0 and root_is_string and !root_completed) {
+                    root_completed = true;
+                    value_end = i + 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        switch (c) {
+            '"' => {
+                // A quote at depth 0 after a pending scalar terminates the scalar
+                if (depth_val == 0 and pending_scalar and !root_completed) {
+                    root_completed = true;
+                    value_end = i;
+                }
+                if (depth_val == 0 and !root_started) {
+                    root_started = true;
+                    root_is_string = true;
+                }
+                in_string = true;
+            },
+            '{', '[' => {
+                // Opening bracket at depth 0 after a pending scalar terminates it
+                if (depth_val == 0 and pending_scalar and !root_completed) {
+                    root_completed = true;
+                    value_end = i;
+                }
+                if (depth_val == 0 and !root_started) {
+                    root_started = true;
+                }
+                depth_val += 1;
+            },
+            '}', ']' => {
+                // Closing bracket at depth 0 after a pending scalar terminates it
+                if (depth_val == 0 and pending_scalar and !root_completed) {
+                    root_completed = true;
+                    value_end = i;
+                }
+                depth_val -= 1;
+                if (depth_val < 0) return 3; // invalid: unmatched closing bracket
+                if (depth_val == 0 and !root_completed) {
+                    root_completed = true;
+                    value_end = i + 1;
+                }
+            },
+            't', 'f', 'n', '-', '0'...'9' => {
+                if (depth_val == 0 and !root_started) {
+                    root_started = true;
+                    pending_scalar = true;
+                }
+            },
+            ' ', '\t', '\n', '\r' => {
+                if (depth_val == 0 and pending_scalar and !root_completed) {
+                    root_completed = true;
+                    value_end = i;
+                }
+            },
+            ',' => {
+                // Comma (or any structural char) at depth 0 after a pending scalar
+                // terminates the scalar. E.g. "false,true" → "false" ends at comma.
+                if (depth_val == 0 and pending_scalar and !root_completed) {
+                    root_completed = true;
+                    value_end = i;
+                }
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    // Handle pending scalar at EOF (e.g. "42" with no trailing whitespace)
+    if (!root_completed and depth_val == 0 and !in_string and pending_scalar) {
+        root_completed = true;
+        value_end = len;
+    }
+
+    if (!root_started) return 0; // nothing started = incomplete
+
+    if (!root_completed) {
+        // Still mid-string or depth > 0 → incomplete
+        return 0;
+    }
+
+    // Root value is complete. Check for trailing content.
+    var j = value_end;
+    while (j < len) : (j += 1) {
+        const c = ptr[j];
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+            // Non-whitespace after complete value → complete_early
+            classify_value_end = value_end;
+            return 2;
+        }
+    }
+
+    return 1; // complete (only whitespace after)
+}
+
+/// Get the stored value_end offset (for complete_early classification).
+export fn get_value_end() u32 {
+    return classify_value_end;
+}
+
+/// Autocomplete incomplete JSON input by appending closing tokens.
+/// Writes suffix directly after input[len] in the WASM buffer.
+/// Returns new length (len + suffix_len). Caller must ensure buf_cap >= len + 64.
+export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
+    if (len == 0) return 0;
+
+    const max_suffix = if (buf_cap > len) buf_cap - len else @as(u32, 0);
+    if (max_suffix == 0) return len;
+
+    // Scan input to determine what needs closing
+    var container_stack: [256]u8 = undefined; // '{' or '['
+    var stack_depth: u32 = 0;
+    var in_string: bool = false;
+    var escape_next: bool = false;
+    var after_colon: bool = false; // true when we just saw ':' and no value yet
+    var after_comma_in_obj: bool = false; // true when last significant token was ',' inside object
+    var after_comma_in_arr: bool = false; // true when last significant token was ',' inside array
+    var in_key_position: bool = false; // true when next string should be an object key
+
+    var i: u32 = 0;
+    while (i < len) {
+        const c = ptr[i];
+
+        if (escape_next) {
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if (in_string) {
+            if (c == '\\') {
+                escape_next = true;
+            } else if (c == '"') {
+                in_string = false;
+                // After a string in object key position, we expect ':'
+                // After a string as value, we're done with after_colon
+                if (after_colon) {
+                    after_colon = false;
+                }
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        switch (c) {
+            '"' => {
+                in_string = true;
+                after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+            },
+            '{' => {
+                if (stack_depth < container_stack.len) {
+                    container_stack[stack_depth] = '{';
+                    stack_depth += 1;
+                }
+                after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+                in_key_position = true; // first thing in object is a key
+            },
+            '[' => {
+                if (stack_depth < container_stack.len) {
+                    container_stack[stack_depth] = '[';
+                    stack_depth += 1;
+                }
+                after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+                in_key_position = false;
+            },
+            '}' => {
+                if (stack_depth > 0) stack_depth -= 1;
+                after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+                in_key_position = false;
+            },
+            ']' => {
+                if (stack_depth > 0) stack_depth -= 1;
+                after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+                in_key_position = false;
+            },
+            ':' => {
+                after_colon = true;
+                after_comma_in_obj = false;
+                in_key_position = false;
+            },
+            ',' => {
+                after_colon = false;
+                if (stack_depth > 0 and container_stack[stack_depth - 1] == '{') {
+                    after_comma_in_obj = true;
+                    after_comma_in_arr = false;
+                    in_key_position = true; // after comma in object, next is key
+                } else {
+                    after_comma_in_arr = true;
+                    after_comma_in_obj = false;
+                    in_key_position = false;
+                }
+            },
+            ' ', '\t', '\n', '\r' => {
+                // whitespace doesn't change state
+            },
+            else => {
+                // value character (number, true, false, null)
+                if (after_colon) after_colon = false;
+                after_comma_in_obj = false;
+                after_comma_in_arr = false;
+                in_key_position = false;
+            },
+        }
+        i += 1;
+    }
+
+    // Now append closing suffix
+    var write_pos: u32 = len;
+
+    // Mid-string → close the string
+    if (in_string or escape_next) {
+        if (escape_next) {
+            // Escape sequence started but not completed (e.g. "hello\")
+            // Append a safe escape char to complete the sequence, then close string
+            if (write_pos < buf_cap) {
+                ptr[write_pos] = 'n'; // \n is always valid
+                write_pos += 1;
+            }
+        }
+        if (write_pos < buf_cap) {
+            ptr[write_pos] = '"';
+            write_pos += 1;
+        }
+        // If we were in a string that's the value after ':', colon is now satisfied
+        // If the string was a key, we need ':' then a value
+        // Since we're approximating, the string close handles most cases
+    } else if (after_colon) {
+        // After ':' with no value → append null
+        const null_str = "null";
+        for (null_str) |ch| {
+            if (write_pos < buf_cap) {
+                ptr[write_pos] = ch;
+                write_pos += 1;
+            }
+        }
+    } else if (after_comma_in_obj) {
+        // After ',' in object → need key:value pair
+        const kv = "\"\":null";
+        for (kv) |ch| {
+            if (write_pos < buf_cap) {
+                ptr[write_pos] = ch;
+                write_pos += 1;
+            }
+        }
+    } else if (after_comma_in_arr) {
+        // After ',' in array → need a value
+        const null_str = "null";
+        for (null_str) |ch| {
+            if (write_pos < buf_cap) {
+                ptr[write_pos] = ch;
+                write_pos += 1;
+            }
+        }
+    }
+
+    // Close all open containers in reverse order
+    while (stack_depth > 0) {
+        stack_depth -= 1;
+        if (write_pos < buf_cap) {
+            ptr[write_pos] = if (container_stack[stack_depth] == '{') '}' else ']';
+            write_pos += 1;
+        }
+    }
+
+    return write_pos;
 }
 
 fn mapError(err: anytype) i32 {

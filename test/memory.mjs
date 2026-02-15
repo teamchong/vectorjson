@@ -70,7 +70,7 @@ console.log("--- Test 1: Parse/drop cycle — rss returns to baseline ---");
   // Parse objects and free immediately — tests that memory is truly reclaimed.
   // Doc-slot path has limited slots; .free() releases them immediately.
   for (let i = 0; i < 1000; i++) {
-    const r = vj.parse(`{"id":${i},"data":"${"x".repeat(100)}"}`);
+    const r = vj.parse(`{"id":${i},"data":"${"x".repeat(100)}"}`).value;
     r.free();
   }
 
@@ -117,7 +117,7 @@ console.log(
   // Root strings from doc-slot path are also WasmString (copied to GC memory)
   const strings = [];
   for (let i = 0; i < 1000; i++) {
-    const ws = vj.parse(`"${"a".repeat(200)}${i}"`);
+    const ws = vj.parse(`"${"a".repeat(200)}${i}"`).value;
     // Access byteLength (no JS string created)
     if (ws instanceof WasmString) {
       const _len = ws.byteLength; // just read byteLength, no JS string
@@ -249,7 +249,7 @@ console.log("\n--- Test 5: Large parse drop — rss returns to baseline ---");
 
   // Parse it 10 times, dropping each time (GC between to free doc slots)
   for (let i = 0; i < 10; i++) {
-    const _result = vj.parse(largeJson);
+    const _result = vj.parse(largeJson).value;
     void _result;
     forceGC(); // let FinalizationRegistry free doc slot
   }
@@ -270,7 +270,7 @@ console.log("\n--- Test 5: Large parse drop — rss returns to baseline ---");
 // ============================================================
 console.log("\n--- Test 6: WasmString.equals() — WASM-side comparison ---");
 {
-  const obj = vj.parse('{"a":"hello","b":"hello","c":"world"}');
+  const obj = vj.parse('{"a":"hello","b":"hello","c":"world"}').value;
   const a = obj.a;
   const b = obj.b;
   const c = obj.c;
@@ -297,7 +297,7 @@ console.log("\n--- Test 7: FinalizationRegistry + .free() — doc slot lifecycle
   let parseCount = 0;
   try {
     for (let i = 0; i < 300; i++) {
-      const r = vj.parse(`{"idx":${i},"value":"${"x".repeat(50)}"}`);
+      const r = vj.parse(`{"idx":${i},"value":"${"x".repeat(50)}"}`).value;
       // Explicitly free to release doc slot immediately
       r.free();
       parseCount++;
@@ -334,7 +334,7 @@ console.log("\n--- Test 7: FinalizationRegistry + .free() — doc slot lifecycle
 console.log("\n--- Test 8: gcStringify (GC tree → JSON, one WASM call) ---");
 {
   const input = '{"name":"Alice","items":[1,true,null,"str"],"nested":{"x":42}}';
-  const parsed = vj.parse(input);
+  const parsed = vj.parse(input).value;
 
   // stringify should use gcStringify for GC-backed proxy
   const result = vj.stringify(parsed);
@@ -353,7 +353,7 @@ console.log("\n--- Test 8: gcStringify (GC tree → JSON, one WASM call) ---");
 // ============================================================
 console.log("\n--- Test 9: WasmString auto-coercion ---");
 {
-  const parsed = vj.parse('{"greeting":"hello"}');
+  const parsed = vj.parse('{"greeting":"hello"}').value;
   const ws = parsed.greeting;
 
   assert(ws instanceof WasmString, "greeting is WasmString");
@@ -383,7 +383,7 @@ console.log("\n--- Test 10: Parse/materialize cycle — memory stable ---");
   for (let i = 0; i < 500; i++) {
     const parsed = vj.parse(
       `{"data":{"id":${i},"values":[1,2,3],"name":"test${i}"}}`,
-    );
+    ).value;
     const _materialized = vj.materialize(parsed);
     void _materialized;
     parsed.free(); // release doc slot immediately
@@ -406,7 +406,7 @@ console.log("\n--- Test 10: Parse/materialize cycle — memory stable ---");
 console.log("\n--- Test 11: Double-free safety — .free() called twice ---");
 {
   // Calling .free() twice on the same proxy should be a no-op the second time
-  const obj = vj.parse('{"key":"value","num":42}');
+  const obj = vj.parse('{"key":"value","num":42}').value;
   const val = obj.key; // access a value first
   assert(val instanceof WasmString, "key value is WasmString before free");
 
@@ -423,7 +423,7 @@ console.log("\n--- Test 11: Double-free safety — .free() called twice ---");
   assert(doubleFreeOk, ".free() called twice does not throw");
 
   // Parse new object into possibly-reused slot — must work fine
-  const obj2 = vj.parse('{"reuse":"works"}');
+  const obj2 = vj.parse('{"reuse":"works"}').value;
   const reuse = obj2.reuse;
   assert(reuse instanceof WasmString, "reused slot works after double-free");
   assert(reuse.toString() === "works", "reused slot value is correct");
@@ -440,7 +440,7 @@ console.log("\n--- Test 12: .free() then GC — FinalizationRegistry stays safe 
   let success = true;
   try {
     for (let round = 0; round < 50; round++) {
-      const r = vj.parse(`{"round":${round},"data":"${"z".repeat(100)}"}`);
+      const r = vj.parse(`{"round":${round},"data":"${"z".repeat(100)}"}`).value;
       // Access some data
       void r.round;
       void r.data;
@@ -453,7 +453,7 @@ console.log("\n--- Test 12: .free() then GC — FinalizationRegistry stays safe 
 
     // Parse more objects into potentially reused slots
     for (let i = 0; i < 50; i++) {
-      const r = vj.parse(`{"after_gc":${i}}`);
+      const r = vj.parse(`{"after_gc":${i}}`).value;
       assert(r.after_gc === i, `post-GC parse ${i} correct`);
       r.free();
     }
