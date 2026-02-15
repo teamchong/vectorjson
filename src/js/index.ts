@@ -71,6 +71,28 @@ export interface VectorJSON {
    * Objects and arrays return Proxy objects — values materialize only when accessed.
    * Call .free() on the result to release resources immediately, or let
    * FinalizationRegistry handle it automatically when the Proxy is GC'd.
+   *
+   * **Cursor pattern**: When iterating arrays of objects, VectorJSON returns a
+   * shared cursor object that repositions on each access. This enables columnar
+   * reads (one WASM call per field instead of per row) but means array elements
+   * are **not safe to store by reference**:
+   *
+   * ```js
+   * // ✅ Sequential access — works perfectly
+   * for (const item of data) { use(item.id, item.name); }
+   *
+   * // ✅ JSON.stringify — processes elements sequentially
+   * JSON.stringify(result);
+   *
+   * // ✅ Destructure immediately — captures values
+   * const items = data.map(item => ({ ...item }));
+   *
+   * // ✅ Materialize — converts to plain JS objects
+   * const plain = vj.materialize(result);
+   *
+   * // ❌ Storing references — all point to the same cursor
+   * const a = data[0]; const b = data[1]; // a === b
+   * ```
    */
   parse(input: string | Uint8Array): unknown;
   /**
@@ -872,7 +894,6 @@ export async function init(options?: {
           };
         }
         if (prop === Symbol.toPrimitive) return undefined;
-        if (prop === "toJSON") return () => config.materialize();
         if (typeof prop === "string") {
           const idx = Number(prop);
           if (Number.isInteger(idx) && idx >= 0 && idx < config.length) {
@@ -926,7 +947,6 @@ export async function init(options?: {
         if (prop === LAZY_PROXY) return config.lazyHandle;
         if (prop === Symbol.toPrimitive) return undefined;
         if (prop === Symbol.toStringTag) return "Object";
-        if (prop === "toJSON") return () => config.materialize();
         if (typeof prop === "string") {
           return config.getProp(prop);
         }
@@ -1095,6 +1115,8 @@ export async function init(options?: {
       let columnarKeys: string[] | null = null;
       let columns: Map<string, unknown[]> | null = null;
       let fieldTypes: number[] | null = null;
+      // Single cursor: ONE reusable row view object. data[i] repositions it.
+      // Fast (~5ns per access) but references are NOT safe to store.
       let rowView: Record<string, unknown> | null = null;
       let rowViewIdx = 0;
 
@@ -1122,7 +1144,7 @@ export async function init(options?: {
         // Lazy column storage — each column materializes on first access
         columns = new Map();
 
-        // Build the row view: one object with getters per key.
+        // Build the cursor: one object with getters per key.
         // Each getter lazily materializes its column, then reads column[rowViewIdx].
         rowView = Object.create(null);
         for (let fi = 0; fi < kCount; fi++) {
@@ -1134,7 +1156,6 @@ export async function init(options?: {
               void keepAlive;
               let col = columns!.get(key);
               if (!col) {
-                // Materialize this entire column in one pass
                 col = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
                 columns!.set(key, col);
               }
@@ -1147,10 +1168,6 @@ export async function init(options?: {
 
         Object.defineProperty(rowView, 'free', {
           value: freeFn, enumerable: false, configurable: true,
-        });
-        Object.defineProperty(rowView, 'toJSON', {
-          value() { return deepMaterializeDoc(docId, indices[rowViewIdx]); },
-          enumerable: false, configurable: true,
         });
         Object.defineProperty(rowView, LAZY_PROXY, {
           get() { return { docId, index: indices[rowViewIdx] }; },
