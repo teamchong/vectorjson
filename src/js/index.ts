@@ -828,6 +828,62 @@ export async function init(options?: {
   // One WASM call produces the buffer, then JS reads it linearly — zero
   // TextDecoder, zero FFI calls needed.
 
+  // --- String key interning ---
+  // Reusing the same string reference for repeated keys (e.g. "id" in 1000 objects)
+  // lets V8 use pointer comparison for hidden class transition lookups instead of
+  // character-by-character comparison. This is critical for monomorphic IC.
+  const keyIntern = new Map<string, string>();
+  function internKey(raw: string): string {
+    let s = keyIntern.get(raw);
+    if (s === undefined) { s = raw; keyIntern.set(s, s); }
+    return s;
+  }
+
+  // --- Shape-aware constructor caching ---
+  // For arrays of same-shaped objects, we cache a constructor per shape.
+  // V8 scans constructor bodies for `this[...]=` assignments and pre-allocates
+  // in-object property slots — zero hidden class transitions per construction.
+  // The constructor takes a single array argument to avoid argument count limits.
+  const shapeCtors = new Map<string, { ctor: new (vals: unknown[]) => Record<string, unknown>; keys: string[] }>();
+  const MAX_SHAPE_CACHE = 256;
+
+  // Last-shape fast path: consecutive same-shaped objects (e.g. array of 1000
+  // API response items) skip the join() + Map.get() entirely via pointer-equal
+  // interned key comparison.
+  let lastShapeKeys: string[] = [];
+  let lastShapeCtor: (new (vals: unknown[]) => Record<string, unknown>) | null = null;
+
+  function matchLastShape(keys: string[]): boolean {
+    if (keys.length !== lastShapeKeys.length) return false;
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] !== lastShapeKeys[i]) return false; // pointer compare (interned)
+    }
+    return true;
+  }
+
+  function getShapeCtor(keys: string[]): new (vals: unknown[]) => Record<string, unknown> {
+    // Fast path: same shape as last object (very common in arrays)
+    if (lastShapeCtor && matchLastShape(keys)) return lastShapeCtor;
+
+    const shapeKey = keys.join('\x00');
+    const cached = shapeCtors.get(shapeKey);
+    if (cached) {
+      lastShapeKeys = cached.keys;
+      lastShapeCtor = cached.ctor;
+      return cached.ctor;
+    }
+    // Evict entire cache if too large (heterogeneous data)
+    if (shapeCtors.size >= MAX_SHAPE_CACHE) shapeCtors.clear();
+    // Build constructor: this["id"]=a[0];this["name"]=a[1];...
+    const body = keys.map((k, i) => `this[${JSON.stringify(k)}]=a[${i}]`).join(';');
+    const ctor = new Function('a', body) as unknown as new (vals: unknown[]) => Record<string, unknown>;
+    const frozenKeys = keys.slice();
+    shapeCtors.set(shapeKey, { ctor, keys: frozenKeys });
+    lastShapeKeys = frozenKeys;
+    lastShapeCtor = ctor;
+    return ctor;
+  }
+
   // Read a UTF-16LE string from the materialization buffer.
   // Format: [u32 char_count][pad?][...utf16le code units]
   // A 1-byte alignment pad exists when the offset after char_count is odd.
@@ -910,12 +966,26 @@ export async function init(options?: {
       }
       case 6: { // TAG_OBJECT
         const count = memDV!.getUint32(matOffset, true); matOffset += 4;
-        const obj: Record<string, unknown> = {};
+        if (count === 0) return {};
+        // Fast path: check if shape matches last seen (avoids keys array + join).
+        // Interned keys use pointer equality (===), so comparison is cheap.
+        const vals = new Array<unknown>(count);
+        let shapeMiss = count !== lastShapeKeys.length;
+        let newKeys: string[] | null = shapeMiss ? new Array<string>(count) : null;
         for (let i = 0; i < count; i++) {
-          const key = readUtf16String();
-          obj[key] = readValue();
+          const key = internKey(readUtf16String());
+          if (!shapeMiss && key !== lastShapeKeys[i]) {
+            // Shape diverged — allocate keys array and backfill
+            shapeMiss = true;
+            newKeys = new Array<string>(count);
+            for (let j = 0; j < i; j++) newKeys[j] = lastShapeKeys[j];
+          }
+          if (newKeys) newKeys[i] = key;
+          vals[i] = readValue();
         }
-        return obj;
+        // Shape-aware construction: reuse cached constructor per key set
+        const Ctor = shapeMiss ? getShapeCtor(newKeys!) : lastShapeCtor!;
+        return new Ctor(vals);
       }
       default: return null;
     }
