@@ -1108,18 +1108,21 @@ export fn doc_read_column_str(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
     return row;
 }
 
-/// Batch string column → UTF-16LE: reads ALL strings at field_idx across an array,
-/// SIMD-converts each to UTF-16, and packs them into the UTF-16 buffer as:
-///   [u32 char_count_0][utf16 data_0][u32 char_count_1][utf16 data_1]...
-/// Returns total byte length written. JS reads via get_utf16_ptr().
-/// ONE WASM call replaces N individual doc_read_string_utf16 calls.
+/// Batch string column → contiguous UTF-16LE with offset table.
+/// SIMD-converts ALL strings in ONE call. Output split into two buffers:
+///   - batch_buffer: [row_count, charOffset_0, charOffset_1, ..., charOffset_N]
+///     where charOffset_i is the char start position for string i in the UTF-16 buffer.
+///     The length of string i = charOffset_{i+1} - charOffset_i.
+///   - UTF-16 buffer (via get_utf16_ptr): contiguous UTF-16LE code units, no gaps.
+/// JS creates ONE big JS string from the entire buffer, then .slice() each substring.
+/// Returns total char count (for JS to read the UTF-16 buffer).
 export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const word = p.tape.get(arr_index);
     if (word.tag != .array_opening) return 0;
 
-    // First pass: calculate total buffer needed (sum of string lengths × 2 + 4 per string)
-    var total_bytes: u32 = 0;
+    // First pass: count elements and total UTF-8 bytes (for buffer sizing)
+    var total_utf8_bytes: u32 = 0;
     var elem_count: u32 = 0;
     {
         var ec: u32 = arr_index + 1;
@@ -1140,9 +1143,7 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
                     };
                 }
                 const str = readTapeString(p, fc + 1);
-                total_bytes += 4 + @as(u32, @intCast(str.len)) * 2; // u32 prefix + worst case UTF-16
-            } else {
-                total_bytes += 4; // empty string (just count prefix)
+                total_utf8_bytes += @intCast(str.len);
             }
             elem_count += 1;
             ec = switch (ew.tag) {
@@ -1153,14 +1154,26 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
         }
     }
 
-    const buf = getUtf16Buf(total_bytes) orelse return 0;
-    var out: u32 = 0;
+    if (elem_count == 0) return 0;
 
-    // Second pass: convert strings
+    // Allocate UTF-16 buffer (worst case: each UTF-8 byte → 1 UTF-16 code unit)
+    const buf = getUtf16Buf(total_utf8_bytes * 2) orelse return 0;
+
+    // batch_buffer layout: [elem_count, offset_0, offset_1, ..., offset_N]
+    // offset_N is the total char count (sentinel for computing last string's length)
+    batch_buffer[0] = elem_count;
+    var out: u32 = 0; // byte offset into buf
+    var row: u32 = 0;
+
+    // Second pass: SIMD-convert each string, write offsets
     var ec2: u32 = arr_index + 1;
     while (true) {
         const ew = p.tape.get(ec2);
         if (ew.tag == .array_closing) break;
+
+        // Record char offset for this row
+        batch_buffer[1 + row] = out / 2; // char offset (not byte offset)
+
         if (ew.tag == .object_opening) {
             var fc: u32 = ec2 + 1;
             var fi: u32 = 0;
@@ -1175,33 +1188,14 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
                 };
             }
             const str = readTapeString(p, fc + 1);
-            if (str.len == 0) {
-                // Write 0 char count
-                buf[out] = 0;
-                buf[out + 1] = 0;
-                buf[out + 2] = 0;
-                buf[out + 3] = 0;
-                out += 4;
-            } else {
-                // Reserve space for char count (will fill after conversion)
-                const count_offset = out;
-                out += 4;
+            if (str.len > 0) {
                 const bytes_written = utf8ToUtf16Le(str, buf, out);
-                const char_count = bytes_written / 2;
-                // Write char count as little-endian u32
-                buf[count_offset] = @truncate(char_count);
-                buf[count_offset + 1] = @truncate(char_count >> 8);
-                buf[count_offset + 2] = @truncate(char_count >> 16);
-                buf[count_offset + 3] = @truncate(char_count >> 24);
                 out += bytes_written;
             }
-        } else {
-            buf[out] = 0;
-            buf[out + 1] = 0;
-            buf[out + 2] = 0;
-            buf[out + 3] = 0;
-            out += 4;
         }
+        // else: non-object element → empty string (offset stays same as next)
+
+        row += 1;
         ec2 = switch (ew.tag) {
             .array_opening, .object_opening => ew.data.ptr,
             .unsigned, .signed, .double => ec2 + 2,
@@ -1209,9 +1203,10 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
         };
     }
 
-    // Store row count in batch_buffer[0] for JS to read
-    batch_buffer[0] = elem_count;
-    return out; // total bytes written
+    // Sentinel: total char count (so JS can compute last string's length)
+    batch_buffer[1 + row] = out / 2;
+
+    return out / 2; // total char count
 }
 
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
