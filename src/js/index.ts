@@ -219,6 +219,7 @@ interface EngineExports {
   doc_get_number(docId: number, index: number): number;
   doc_get_string_ptr(docId: number, index: number): number;
   doc_get_string_len(docId: number, index: number): number;
+  doc_read_string_raw(docId: number, index: number): number;
   doc_get_count(docId: number, index: number): number;
   doc_find_field(
     docId: number,
@@ -236,17 +237,9 @@ interface EngineExports {
   // Batch column reads (SoA: one WASM call per column)
   doc_f64_batch_ptr(): number;
   doc_read_column_f64(docId: number, arrIndex: number, fieldIdx: number): number;
-  doc_read_column_tags(docId: number, arrIndex: number, fieldIdx: number): number;
   doc_read_column_bool(docId: number, arrIndex: number, fieldIdx: number): number;
-  doc_read_column_str(docId: number, arrIndex: number, fieldIdx: number): number;
-  doc_read_column_str_utf16(docId: number, arrIndex: number, fieldIdx: number): number;
-  // UTF-8 → UTF-16LE conversion (replaces TextDecoder)
-  utf8_to_utf16(ptr: number, len: number): number;
+  doc_read_column_str_raw(docId: number, arrIndex: number, fieldIdx: number): number;
   get_utf16_ptr(): number;
-  // Single-call doc string → UTF-16LE (replaces 4-call ping-pong)
-  doc_read_string_utf16(docId: number, index: number): number;
-  // Fixed address of the UTF-16 buffer pointer (call once at init, then DataView read)
-  get_utf16_ptr_addr(): number;
 }
 
 interface BridgeExports {
@@ -314,40 +307,14 @@ interface BridgeExports {
   compareDiffPathLen(index: number): number;
   compareDiffType(index: number): number;
   compareFree(): void;
-  // Batch column string slicing (loop inside WASM)
-  batchSliceStrings(utf16Ptr: number, totalChars: number, offsetsPtr: number, count: number): unknown;
-  externArrayGet(ref: unknown, idx: number): unknown;
-  externArrayLen(ref: unknown): number;
 }
-
-// --- UTF-16 string helpers (module-level) ---
 
 /**
  * Bulk UTF-16LE → JS string using TextDecoder.
  * 1.8x faster than chunked fromCharCode for large buffers (>4K chars).
  * Used for column string materialization where we convert one big buffer.
  */
-const utf16Decoder = new TextDecoder('utf-16le');
-function utf16BulkToString(codes: Uint16Array): string {
-  return utf16Decoder.decode(new Uint8Array(codes.buffer, codes.byteOffset, codes.byteLength));
-}
-
-/**
- * Convert a Uint16Array of UTF-16 code units to a JS string.
- * Uses chunked fromCharCode.apply to avoid argument-count limits
- * in some JS engines (~65536 max args).
- */
-function utf16ToString(codes: Uint16Array): string {
-  if (codes.length <= 8192) {
-    return String.fromCharCode.apply(null, codes as unknown as number[]);
-  }
-  let result = '';
-  for (let i = 0; i < codes.length; i += 8192) {
-    const chunk = codes.subarray(i, Math.min(i + 8192, codes.length));
-    result += String.fromCharCode.apply(null, chunk as unknown as number[]);
-  }
-  return result;
-}
+const utf8Decoder = new TextDecoder('utf-8');
 
 // --- WasmString: string data stays in WasmGC memory ---
 
@@ -401,7 +368,7 @@ export class WasmString {
     }
   }
 
-  /** Materialize a JS string. Cached after first call. Uses Zig UTF-8→UTF-16 conversion. */
+  /** Materialize a JS string. Cached after first call. Uses TextDecoder('utf-8') on raw bytes. */
   toString(): string {
     if (this._cached !== null) return this._cached;
     if (this._len === 0) {
@@ -412,18 +379,9 @@ export class WasmString {
     if (ptr === 0) throw new Error("VectorJSON: Failed to allocate for string");
     try {
       this._bridge.gcCopyString(this._ref, ptr);
-      // Zig converts UTF-8 → UTF-16LE in a shared buffer, then JS reads via fromCharCode.
-      // Buffer pointer is at a fixed address — read directly, no extra WASM call.
-      const charCount = this._engine.utf8_to_utf16(ptr, this._len);
-      if (charCount === 0) {
-        this._cached = "";
-        return "";
-      }
-      const u16ptr = new DataView(this._engine.memory.buffer).getUint32(
-        this._engine.get_utf16_ptr_addr(), true,
+      this._cached = utf8Decoder.decode(
+        new Uint8Array(this._engine.memory.buffer, ptr, this._len),
       );
-      const codes = new Uint16Array(this._engine.memory.buffer, u16ptr, charCount);
-      this._cached = utf16ToString(codes);
       return this._cached;
     } finally {
       this._bridge.dealloc(ptr, this._len);
@@ -504,32 +462,10 @@ export async function init(options?: {
   const engineInstance = await WebAssembly.instantiate(engineModule, {});
   const engine = engineInstance.exports as unknown as EngineExports;
 
-  // --- Read strings from engine memory via Zig UTF-8→UTF-16 conversion ---
-  // No TextDecoder — Zig converts UTF-8 to UTF-16LE, JS reads via fromCharCode.
-  // The UTF-16 buffer pointer lives at a fixed address in WASM memory.
-  // JS reads it directly via DataView — zero WASM calls to locate the buffer.
-  const utf16PtrAddr = engine.get_utf16_ptr_addr(); // one-time init
-
-  /** Read UTF-16 result from the shared Zig buffer (zero WASM calls — direct memory read). */
-  function readUtf16Result(charCount: number): string {
-    const ptr = new DataView(engine.memory.buffer).getUint32(utf16PtrAddr, true);
-    const codes = new Uint16Array(engine.memory.buffer, ptr, charCount);
-    return utf16ToString(codes);
-  }
-
-  /** Convert arbitrary UTF-8 bytes in linear memory to a JS string (1 WASM call). */
+  /** Convert UTF-8 bytes in WASM linear memory to a JS string. Zero WASM calls. */
   function readString(ptr: number, len: number): string {
     if (len === 0) return "";
-    const charCount = engine.utf8_to_utf16(ptr, len);
-    if (charCount === 0) return "";
-    return readUtf16Result(charCount);
-  }
-
-  /** Read a doc tape string as JS string (1 WASM call — no ping-pong). */
-  function docReadStringUtf16(docId: number, index: number): string {
-    const charCount = engine.doc_read_string_utf16(docId, index);
-    if (charCount === 0) return "";
-    return readUtf16Result(charCount);
+    return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
   }
 
   // --- Instantiate WAT bridge, linking to engine ---
@@ -537,9 +473,10 @@ export async function init(options?: {
   const bridgeInstance = await WebAssembly.instantiate(bridgeModule, {
     jsstr: {
       // Create a JS string from UTF-16LE code units in WASM memory
+      // (Required by bridge.wat import — not called at runtime)
       makeString(ptr: number, charCount: number): string {
-        const codes = new Uint16Array(engine.memory.buffer, ptr, charCount);
-        return utf16BulkToString(codes);
+        const u8 = new Uint8Array(engine.memory.buffer, ptr, charCount * 2);
+        return new TextDecoder('utf-16le').decode(u8);
       },
       // Slice a substring (V8 creates a SlicedString — zero char copying)
       sliceString(str: string, start: number, end: number): string {
@@ -798,9 +735,14 @@ export async function init(options?: {
   );
 
   // --- Read a doc string at a tape index into a JS string ---
-  // Single WASM call: doc_read_string_utf16 reads tape + converts to UTF-16LE.
+  // ONE WASM call: doc_read_string_raw writes ptr+len to batch_buffer.
+  // JS reads raw UTF-8 bytes via TextDecoder('utf-8').
   function docReadString(docId: number, index: number): string {
-    return docReadStringUtf16(docId, index);
+    const len = engine.doc_read_string_raw(docId, index);
+    if (len === 0) return "";
+    const batchPtr = engine.doc_batch_ptr();
+    const ptr = new Uint32Array(engine.memory.buffer, batchPtr as unknown as number, 2)[0];
+    return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
   }
 
   // --- Read a doc string → WasmGC $JsonString externref → WasmString ---
@@ -899,10 +841,18 @@ export async function init(options?: {
         if (prop === LAZY_PROXY) return config.lazyHandle;
         if (prop === "length") return config.length;
         if (prop === Symbol.iterator) {
-          return function* () {
-            for (let i = 0; i < config.length; i++) {
-              yield config.getItem(i);
-            }
+          // Fast iterator — calls getItem directly, bypassing Proxy get trap.
+          // for...of uses this path: 1 Proxy call (Symbol.iterator) instead of N.
+          const len = config.length;
+          const getItem = config.getItem.bind(config);
+          return function () {
+            let i = 0;
+            return {
+              next(): { done: boolean; value: unknown } {
+                if (i >= len) return { done: true, value: undefined };
+                return { done: false, value: getItem(i++) };
+              },
+            };
           };
         }
         if (prop === Symbol.toPrimitive) return undefined;
@@ -1016,30 +966,25 @@ export async function init(options?: {
     }
 
     if (expectedType === TAG_STRING) {
-      // ONE WASM call: SIMD-converts ALL strings into contiguous UTF-16 buffer.
-      // batch_buffer: [rowCount, charOffset_0, charOffset_1, ..., charOffset_N]
-      // UTF-16 buffer: contiguous code units for all strings, no gaps.
-      //
-      // JS creates ONE big string, then .slice() each substring.
-      // Sliced strings reference the parent's backing store — zero char copying.
-      const totalChars = engine.doc_read_column_str_utf16(docId, arrIndex, fieldIdx);
+      // ONE WASM call: copies raw UTF-8 bytes contiguously (no SIMD UTF-16 conversion).
+      // JS uses TextDecoder('utf-8') for the bulk decode, then .slice() per substring.
+      // Offsets in batch_buffer are UTF-16 code unit offsets (for correct String.slice).
+      const totalBytes = engine.doc_read_column_str_raw(docId, arrIndex, fieldIdx);
       const batchPtr = engine.doc_batch_ptr();
       const rowCount = new Uint32Array(engine.memory.buffer, batchPtr, 1)[0];
       if (rowCount === 0) return [];
 
-      // Read offset table (rowCount + 1 entries: starts + sentinel)
       const offsets = new Uint32Array(rowCount + 1);
       offsets.set(new Uint32Array(engine.memory.buffer, batchPtr + 4, rowCount + 1));
 
-      if (totalChars === 0) {
+      if (totalBytes === 0) {
         return new Array(rowCount).fill('');
       }
 
-      // Create ONE big string from contiguous UTF-16 buffer via TextDecoder
-      // (1.8x faster than chunked fromCharCode for bulk conversion)
+      // TextDecoder('utf-8') is C++ in V8 — extremely fast for bulk decode
       const bufPtr = engine.get_utf16_ptr();
-      const codes = new Uint16Array(engine.memory.buffer, bufPtr, totalChars);
-      const bigStr = utf16BulkToString(codes);
+      const rawBytes = new Uint8Array(engine.memory.buffer, bufPtr, totalBytes);
+      const bigStr = utf8Decoder.decode(rawBytes);
 
       // Slice each substring — V8 creates SlicedString objects (zero char copy)
       const col: unknown[] = new Array(rowCount);
@@ -1159,15 +1104,16 @@ export async function init(options?: {
           const key = columnarKeys[fi];
           const fieldIdx = fi;
           const expectedType = fieldTypes[fi];
+          // Cache column ref in closure — eliminates Map.get on every access
+          let cachedCol: unknown[] | null = null;
           Object.defineProperty(rowView, key, {
             get(): unknown {
               void keepAlive;
-              let col = columns!.get(key);
-              if (!col) {
-                col = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
-                columns!.set(key, col);
+              if (cachedCol === null) {
+                cachedCol = materializeColumn(docId, index, fieldIdx, expectedType, length, keepAlive, generation);
+                columns!.set(key, cachedCol);
               }
-              return col[rowViewIdx];
+              return cachedCol[rowViewIdx];
             },
             enumerable: true,
             configurable: true,

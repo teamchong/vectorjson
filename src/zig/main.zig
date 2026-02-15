@@ -736,6 +736,17 @@ export fn doc_get_string_len(doc_id: i32, index: u32) u32 {
     return @intCast(str.len);
 }
 
+/// Read a doc string as raw UTF-8 — ONE WASM call.
+/// Writes ptr to batch_buffer[0], len to batch_buffer[1].
+/// Returns len (0 = empty string). JS reads raw bytes via ptr.
+export fn doc_read_string_raw(doc_id: i32, index: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const str = readTapeString(p, index);
+    batch_buffer[0] = @intFromPtr(str.ptr);
+    batch_buffer[1] = @intCast(str.len);
+    return @intCast(str.len);
+}
+
 /// Get the child count of a container (object or array) at the given tape index.
 export fn doc_get_count(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
@@ -1207,6 +1218,113 @@ export fn doc_read_column_str_utf16(doc_id: i32, arr_index: u32, field_idx: u32)
     batch_buffer[1 + row] = out / 2;
 
     return out / 2; // total char count
+}
+
+/// Batch-read a string column as raw UTF-8 bytes — skip SIMD UTF-16 conversion.
+/// Layout same as doc_read_column_str_utf16:
+///   - batch_buffer: [elem_count, charOff_0, charOff_1, ..., charOff_N]
+///     charOff = UTF-16 code unit offset (for JS String.slice)
+///   - utf16_buffer: raw UTF-8 bytes (read via get_utf16_ptr)
+/// Returns total byte count. JS uses TextDecoder('utf-8') on the raw buffer.
+export fn doc_read_column_str_raw(doc_id: i32, arr_index: u32, field_idx: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const word = p.tape.get(arr_index);
+    if (word.tag != .array_opening) return 0;
+
+    // First pass: count elements and total UTF-8 bytes
+    var total_bytes: u32 = 0;
+    var elem_count: u32 = 0;
+    {
+        var ec: u32 = arr_index + 1;
+        while (true) {
+            const ew = p.tape.get(ec);
+            if (ew.tag == .array_closing) break;
+            if (ew.tag == .object_opening) {
+                var fc: u32 = ec + 1;
+                var fi: u32 = 0;
+                while (fi < field_idx) : (fi += 1) {
+                    const kw = p.tape.get(fc);
+                    if (kw.tag == .object_closing) break;
+                    const vw = p.tape.get(fc + 1);
+                    fc = switch (vw.tag) {
+                        .array_opening, .object_opening => vw.data.ptr,
+                        .unsigned, .signed, .double => fc + 3,
+                        else => fc + 2,
+                    };
+                }
+                const str = readTapeString(p, fc + 1);
+                total_bytes += @intCast(str.len);
+            }
+            elem_count += 1;
+            ec = switch (ew.tag) {
+                .array_opening, .object_opening => ew.data.ptr,
+                .unsigned, .signed, .double => ec + 2,
+                else => ec + 1,
+            };
+        }
+    }
+
+    if (elem_count == 0) return 0;
+
+    // Allocate buffer for raw UTF-8 bytes (exact size, no 2x for UTF-16)
+    const buf = getUtf16Buf(total_bytes) orelse return 0;
+
+    // batch_buffer layout: [elem_count, charOff_0, charOff_1, ..., charOff_N]
+    // charOff = cumulative UTF-16 code unit count (for JS String.slice)
+    batch_buffer[0] = elem_count;
+    var out: u32 = 0; // byte offset into buf
+    var char_offset: u32 = 0; // cumulative UTF-16 code units
+    var row: u32 = 0;
+
+    // Second pass: memcpy each string, compute UTF-16 code unit offsets
+    var ec2: u32 = arr_index + 1;
+    while (true) {
+        const ew = p.tape.get(ec2);
+        if (ew.tag == .array_closing) break;
+
+        batch_buffer[1 + row] = char_offset;
+
+        if (ew.tag == .object_opening) {
+            var fc: u32 = ec2 + 1;
+            var fi: u32 = 0;
+            while (fi < field_idx) : (fi += 1) {
+                const kw = p.tape.get(fc);
+                if (kw.tag == .object_closing) break;
+                const vw = p.tape.get(fc + 1);
+                fc = switch (vw.tag) {
+                    .array_opening, .object_opening => vw.data.ptr,
+                    .unsigned, .signed, .double => fc + 3,
+                    else => fc + 2,
+                };
+            }
+            const str = readTapeString(p, fc + 1);
+            if (str.len > 0) {
+                // memcpy: just copy raw bytes, no conversion
+                @memcpy(buf[out .. out + @as(u32, @intCast(str.len))], str);
+                out += @intCast(str.len);
+
+                // Count UTF-16 code units for JS String.slice offsets
+                for (str) |b| {
+                    // Non-continuation bytes = new codepoint
+                    if (b & 0xC0 != 0x80) char_offset += 1;
+                    // 4-byte sequences (non-BMP) produce 2 UTF-16 code units
+                    if (b & 0xF8 == 0xF0) char_offset += 1;
+                }
+            }
+        }
+
+        row += 1;
+        ec2 = switch (ew.tag) {
+            .array_opening, .object_opening => ew.data.ptr,
+            .unsigned, .signed, .double => ec2 + 2,
+            else => ec2 + 1,
+        };
+    }
+
+    // Sentinel
+    batch_buffer[1 + row] = char_offset;
+
+    return out; // total byte count
 }
 
 // --- Doc stringify: tape → JSON bytes in one WASM call ---
