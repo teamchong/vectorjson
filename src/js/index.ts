@@ -958,16 +958,24 @@ export async function init(options?: {
     }
 
     if (expectedType === TAG_STRING) {
-      // Strings stay lazy: docStringToGC returns WasmString (deferred UTF-8 → JS conversion).
-      // We need element indices to navigate to each string value.
-      const elemCount = engine.doc_array_elements(docId, arrIndex);
-      const bp = engine.doc_batch_ptr();
-      const elemIndices = new Uint32Array(elemCount);
-      elemIndices.set(new Uint32Array(engine.memory.buffer, bp, elemCount));
-      const col: unknown[] = new Array(count);
-      for (let i = 0; i < count; i++) {
-        const vi = engine.doc_obj_val_at(docId, elemIndices[i], fieldIdx);
-        col[i] = docStringToGC(docId, vi);
+      // Batch read: ONE WASM call gets all (ptr, len) pairs.
+      // Then N createGCString calls create WasmString wrappers.
+      // Total: 1 + N WASM calls instead of 3N (docStringToGC does 3 per string).
+      const n = engine.doc_read_column_str(docId, arrIndex, fieldIdx);
+      const batchPtr = engine.doc_batch_ptr();
+      const pairs = new Uint32Array(n * 2);
+      pairs.set(new Uint32Array(engine.memory.buffer, batchPtr, n * 2));
+      const col: unknown[] = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const strPtr = pairs[i * 2];
+        const strLen = pairs[i * 2 + 1];
+        if (strLen === 0) {
+          const ref = bridge.createGCString(1, 0);
+          col[i] = new WasmString(ref, 0, bridge, engine);
+        } else {
+          const ref = bridge.createGCString(strPtr, strLen);
+          col[i] = new WasmString(ref, strLen, bridge, engine);
+        }
       }
       return col;
     }
