@@ -1552,6 +1552,7 @@ export fn doc_read_all_columns(doc_id: i32, arr_index: u32) u32 {
 /// Result accessible via stringify_result_ptr/len. Caller must call stringify_free.
 export fn doc_stringify(doc_id: i32, index: u32) i32 {
     const p = getDocParser(doc_id) orelse return -1;
+    stringifier.deinit();
     stringifier.init(gpa);
     docStringifyValue(p, index);
     if (stringifier.has_error) return -1;

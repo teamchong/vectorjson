@@ -116,11 +116,11 @@ async function run() {
     });
     printResult("JSON.parse → JSON.stringify", jpResult);
 
-    // JSON.stringify(vj.parse(str).value)
+    // vj.stringify(vj.parse(str).value) — one WASM call for stringify
     const vjResult = bench(() => {
-      JSON.stringify(vj.parse(json).value);
+      vj.stringify(vj.parse(json).value);
     });
-    printResult("vj.parse → JSON.stringify", vjResult);
+    printResult("vj.parse → vj.stringify", vjResult);
 
     const ratio = vjResult.opsPerSec / jpResult.opsPerSec;
     console.log(

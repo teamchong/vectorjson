@@ -251,6 +251,8 @@ interface EngineExports {
   // Single-call columnar read: all columns in one traversal
   doc_read_all_columns(docId: number, arrIndex: number): number;
   get_utf16_ptr(): number;
+  // Doc-slot stringify (one WASM call, walks tape directly)
+  doc_stringify(docId: number, index: number): number;
   // Input classification & autocomplete
   classify_input(ptr: number, len: number): number;
   autocomplete_input(ptr: number, len: number, buf_cap: number): number;
@@ -1542,22 +1544,13 @@ export async function init(options?: {
   _instance = {
     parse(input: string | Uint8Array): ParseResult {
       const CLASSIFY_INCOMPLETE = 0;
-      const CLASSIFY_COMPLETE = 1;
       const CLASSIFY_COMPLETE_EARLY = 2;
       const CLASSIFY_INVALID = 3;
-
-      const STATUS_NAMES: Record<number, ParseStatus> = {
-        [CLASSIFY_INCOMPLETE]: "incomplete",
-        [CLASSIFY_COMPLETE]: "complete",
-        [CLASSIFY_COMPLETE_EARLY]: "complete_early",
-        [CLASSIFY_INVALID]: "invalid",
-      };
 
       // Write input into reusable WASM buffer with extra headroom for autocomplete
       let ptr: number;
       let len: number;
       if (typeof input === "string") {
-        // Worst case: 3 bytes per UTF-16 code unit + 64 for autocomplete/padding
         const maxBytes = input.length * 3 + 64;
         ptr = ensureInputBuffer(maxBytes);
         const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
@@ -1568,122 +1561,112 @@ export async function init(options?: {
         ptr = ensureInputBuffer(len + 64);
         new Uint8Array(engine.memory.buffer, ptr, len).set(input);
       }
-      // Pre-fill 64 bytes of space padding after the input. This ensures the
-      // SIMD parser's 64-byte block reads see only whitespace past the data,
-      // preventing false TrailingContent errors for complete_early slicing.
+      // Pad after input for SIMD safety
       new Uint8Array(engine.memory.buffer, ptr + len, 64).fill(0x20);
 
-      // Step 1: Classify input
-      const classification = engine.classify_input(ptr, len);
-      const status = STATUS_NAMES[classification] ?? "invalid";
+      // Helper: extract value from a successful doc_parse
+      const buildValue = (docId: number): unknown => {
+        const rootTag = engine.doc_get_tag(docId, 1);
+        if (rootTag <= TAG_STRING) {
+          let value: unknown;
+          switch (rootTag) {
+            case TAG_NULL: value = null; break;
+            case TAG_TRUE: value = true; break;
+            case TAG_FALSE: value = false; break;
+            case TAG_NUMBER: value = engine.doc_get_number(docId, 1); break;
+            case TAG_STRING: value = docStringToGC(docId, 1); break;
+            default: value = null;
+          }
+          engine.doc_free(docId);
+          return value;
+        }
+        const generation = (docGenerations.get(docId) ?? 0) + 1;
+        docGenerations.set(docId, generation);
+        const keepAlive = { docId };
+        docRegistry.register(keepAlive, { docId, generation }, keepAlive);
+        const origStr = typeof input === "string" ? input : null;
+        return wrapDoc(docId, 1, keepAlive, generation, origStr, len);
+      };
 
-      // Invalid → return immediately with error
+      // Helper: retry doc_parse with GC on slot exhaustion
+      const tryDocParse = (p: number, l: number): number => {
+        let docId = engine.doc_parse(p, l);
+        if (docId < 0) {
+          const errCode = engine.get_error_code();
+          if (errCode === 2 || errCode === 13) {
+            if (typeof globalThis.gc === "function") globalThis.gc();
+            docId = engine.doc_parse(p, l);
+          }
+        }
+        return docId;
+      };
+
+      // ── Happy path: try doc_parse directly (no classify overhead) ──
+      let docId = tryDocParse(ptr, len);
+      if (docId >= 0) {
+        return { status: "complete", value: buildValue(docId) };
+      }
+
+      // ── doc_parse failed — classify to determine why ──
+      const classification = engine.classify_input(ptr, len);
+
       if (classification === CLASSIFY_INVALID) {
         return { status: "invalid", error: "Invalid JSON structure" };
       }
 
-      // Step 2: Determine parse length
-      let parseLen: number;
-      let remainingCopy: Uint8Array | null = null;
       if (classification === CLASSIFY_COMPLETE_EARLY) {
-        parseLen = engine.get_value_end();
-        // The SIMD parser reads in 64-byte blocks past parseLen, so trailing
-        // data can be misinterpreted as structural chars. Copy remaining bytes
-        // out, then fill with whitespace padding for a clean parse.
+        const parseLen = engine.get_value_end();
         const mem = new Uint8Array(engine.memory.buffer);
         const remainLen = len - parseLen;
-        remainingCopy = new Uint8Array(remainLen);
+        const remainingCopy = new Uint8Array(remainLen);
         remainingCopy.set(mem.subarray(ptr + parseLen, ptr + len));
-        // SIMD reads 64-byte chunks past parseLen — pad generously
         mem.fill(0x20, ptr + parseLen, ptr + parseLen + 64);
-      } else if (classification === CLASSIFY_INCOMPLETE) {
-        parseLen = engine.autocomplete_input(ptr, len, inputBufLen);
-        // If autocomplete produced nothing (e.g. empty input), return incomplete with no value
+
+        docId = tryDocParse(ptr, parseLen);
+        if (docId >= 0) {
+          return { status: "complete_early", value: buildValue(docId), remaining: remainingCopy };
+        }
+        // Bridge fallback
+        const gcRef = bridge.parseJSON(ptr, parseLen);
+        if (gcRef === null || gcRef === undefined) {
+          const errorCode = bridge.getError();
+          const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+          return { status: "invalid", error: `VectorJSON: ${msg}` };
+        }
+        return { status: "complete_early", value: wrapGC(gcRef), remaining: remainingCopy };
+      }
+
+      if (classification === CLASSIFY_INCOMPLETE) {
+        const parseLen = engine.autocomplete_input(ptr, len, inputBufLen);
         if (parseLen === 0) {
-          return { status: "incomplete" };
+          // Nothing to autocomplete. Empty input → incomplete; anything else
+          // (e.g. unrecognized tokens like NaN) → invalid.
+          if (len === 0) return { status: "incomplete" };
+          return { status: "invalid", error: "Invalid JSON structure" };
         }
-      } else {
-        // complete
-        parseLen = len;
+        docId = tryDocParse(ptr, parseLen);
+        if (docId >= 0) {
+          return { status: "incomplete", value: buildValue(docId) };
+        }
+        // Autocompleted input was structurally closed but grammatically invalid
+        // (e.g. "\u00" → autocomplete closes string but \u00" is bad escape)
+        const gcRef = bridge.parseJSON(ptr, parseLen);
+        if (gcRef === null || gcRef === undefined) {
+          const errorCode = bridge.getError();
+          const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+          return { status: "invalid", error: `VectorJSON: ${msg}` };
+        }
+        return { status: "incomplete", value: wrapGC(gcRef) };
       }
 
-      // Step 3: Parse via doc_parse
-      let docId = engine.doc_parse(ptr, parseLen);
-      if (docId < 0) {
-        const errCode = engine.get_error_code();
-        // Slot exhaustion (2) or OOM (13) — try to reclaim via GC and retry
-        if (errCode === 2 || errCode === 13) {
-          if (typeof globalThis.gc === "function") {
-            globalThis.gc();
-          }
-          docId = engine.doc_parse(ptr, parseLen);
-        }
-      }
-
-      if (docId >= 0) {
-        // Doc-slot path succeeded
-        const rootTag = engine.doc_get_tag(docId, 1);
-        let value: unknown;
-
-        if (rootTag <= TAG_STRING) {
-          // Primitive — extract and free immediately
-          switch (rootTag) {
-            case TAG_NULL:
-              value = null;
-              break;
-            case TAG_TRUE:
-              value = true;
-              break;
-            case TAG_FALSE:
-              value = false;
-              break;
-            case TAG_NUMBER:
-              value = engine.doc_get_number(docId, 1);
-              break;
-            case TAG_STRING:
-              value = docStringToGC(docId, 1);
-              break;
-            default:
-              value = null;
-          }
-          engine.doc_free(docId);
-        } else {
-          // Container — register with FinalizationRegistry
-          const generation = (docGenerations.get(docId) ?? 0) + 1;
-          docGenerations.set(docId, generation);
-
-          const keepAlive = { docId };
-          docRegistry.register(keepAlive, { docId, generation }, keepAlive);
-
-          // Pass original input for input.slice() fast path in columnar iteration
-          const origStr = typeof input === "string" ? input : null;
-          value = wrapDoc(docId, 1, keepAlive, generation, origStr, len);
-        }
-
-        // Build result
-        const result: ParseResult = { status, value };
-        if (classification === CLASSIFY_COMPLETE_EARLY && remainingCopy) {
-          result.remaining = remainingCopy; // already copied before parse
-        }
-        return result;
-      }
-
-      // Doc-parse failed — try GC tree path as fallback
-      const gcRef = bridge.parseJSON(ptr, parseLen);
+      // classify returned "complete" but doc_parse failed → grammatically invalid
+      const gcRef = bridge.parseJSON(ptr, len);
       if (gcRef === null || gcRef === undefined) {
         const errorCode = bridge.getError();
-        const msg =
-          ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-        // classify_input only checks structural balance, not grammar.
-        // If doc_parse fails on "complete" input, the JSON is grammatically invalid.
+        const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
         return { status: "invalid", error: `VectorJSON: ${msg}` };
       }
-      const value = wrapGC(gcRef);
-      const result: ParseResult = { status, value };
-      if (classification === CLASSIFY_COMPLETE_EARLY && remainingCopy) {
-        result.remaining = remainingCopy;
-      }
-      return result;
+      return { status: "complete", value: wrapGC(gcRef) };
     },
 
     materialize(value: unknown): unknown {
@@ -1709,11 +1692,29 @@ export async function init(options?: {
     },
 
     stringify(value: unknown): string {
-      // Fast path: GC-backed proxy → gcStringify (one WASM call, zero JS)
       if (isLazyProxy(value)) {
         const handle = (value as Record<symbol, unknown>)[LAZY_PROXY] as {
+          docId?: number;
+          index?: number;
           gcRef?: unknown;
         };
+
+        // Doc-backed proxy → doc_stringify (one WASM call, walks tape directly)
+        if (typeof handle.docId === "number" && typeof handle.index === "number") {
+          const rc = engine.doc_stringify(handle.docId, handle.index);
+          if (rc === 0) {
+            const rPtr = engine.stringify_result_ptr();
+            const rLen = engine.stringify_result_len();
+            try {
+              return readString(rPtr, rLen);
+            } finally {
+              engine.stringify_free();
+            }
+          }
+          // Fall through to slow path if doc_stringify failed
+        }
+
+        // GC-backed proxy → gcStringify (one WASM call, zero JS)
         if ("gcRef" in handle) {
           bridge.gcStringify(handle.gcRef);
           try {
@@ -1736,7 +1737,7 @@ export async function init(options?: {
         return JSON.stringify(value);
       }
 
-      // Doc-backed proxy or mixed → WASM token-by-token stringify
+      // Doc-backed proxy fallback → WASM token-by-token stringify
       bridge.stringifyInit();
       try {
         writeValue(value);
