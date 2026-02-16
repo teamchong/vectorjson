@@ -251,6 +251,9 @@ interface EngineExports {
 
 const utf8Decoder = new TextDecoder('utf-8');
 
+// Pre-computed byte→char table — avoids String.fromCharCode() calls in hot loops
+const B2C: string[] = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i));
+
 let _instance: VectorJSON | null = null;
 
 /**
@@ -1111,7 +1114,7 @@ export async function init(options?: {
               continue;
             }
             // Still inside the scalar, keep scanning
-            ldScalarAccum += String.fromCharCode(c);
+            ldScalarAccum += B2C[c];
             continue;
           }
 
@@ -1129,17 +1132,16 @@ export async function init(options?: {
                 case 0x2F: decoded = '/'; break;     // /
                 case 0x62: decoded = '\b'; break;    // b
                 case 0x66: decoded = '\f'; break;    // f
-                default: decoded = String.fromCharCode(c); break;
+                default: decoded = B2C[c]; break;
               }
               ptDeltaAccum += decoded;
-              // Live doc: accumulate decoded escape char and update in parent
+              // Live doc: accumulate decoded escape char (batched — flushed at string close or chunk end)
               if (ldInStringValue) {
                 ldStringAccum += decoded;
-                ldUpdateString(ldStringAccum);
               }
               if (ptAccumulatingKey) ptKeyAccum += decoded;
             } else if (ptAccumulatingKey) {
-              ptKeyAccum += String.fromCharCode(c);
+              ptKeyAccum += B2C[c];
             }
             continue;
           }
@@ -1183,16 +1185,13 @@ export async function init(options?: {
             }
             // Regular string character
             if (ptInStringValue && ptSkipDepth < 0) {
-              const ch = String.fromCharCode(c);
+              const ch = B2C[c];
               ptDeltaAccum += ch;
-              // Live doc: accumulate string char and update in parent
-              if (ldInStringValue) {
-                ldStringAccum += ch;
-                ldUpdateString(ldStringAccum);
-              }
+              // Live doc: accumulate string char (batched — flushed at string close or chunk end)
+              if (ldInStringValue) ldStringAccum += ch;
               if (ptAccumulatingKey) ptKeyAccum += ch;
             } else if (ptAccumulatingKey) {
-              ptKeyAccum += String.fromCharCode(c);
+              ptKeyAccum += B2C[c];
             }
             continue;
           }
@@ -1344,6 +1343,11 @@ export async function init(options?: {
               break;
             }
           }
+        }
+
+        // Flush accumulated string to live doc parent (batched update)
+        if (ldInStringValue && ldStringAccum) {
+          ldUpdateString(ldStringAccum);
         }
 
         // Flush accumulated deltas at end of each feed for in-progress strings
@@ -1621,7 +1625,7 @@ export async function init(options?: {
               scanInScalar = false;
               i--; continue;
             }
-            ldScalarAccum += String.fromCharCode(c);
+            ldScalarAccum += B2C[c];
             continue;
           }
 
@@ -1638,12 +1642,11 @@ export async function init(options?: {
                 case 0x2F: decoded = '/'; break;
                 case 0x62: decoded = '\b'; break;
                 case 0x66: decoded = '\f'; break;
-                default: decoded = String.fromCharCode(c); break;
+                default: decoded = B2C[c]; break;
               }
               ldStringAccum += decoded;
-              spUpdateString(ldStringAccum);
             }
-            if (scanAccumulatingKey) scanKeyAccum += String.fromCharCode(c);
+            if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             continue;
           }
 
@@ -1658,16 +1661,15 @@ export async function init(options?: {
                 continue;
               }
               if (ldInStringValue) {
-                // Final update (value already in parent from spSetValue('') at open)
+                // Final update at string close (value already in parent from spSetValue('') at open)
                 spUpdateString(ldStringAccum);
                 ldStringAccum = '';
                 ldInStringValue = false;
               }
               continue;
             }
-            const ch = String.fromCharCode(c);
-            if (ldInStringValue) { ldStringAccum += ch; spUpdateString(ldStringAccum); }
-            if (scanAccumulatingKey) scanKeyAccum += ch;
+            if (ldInStringValue) ldStringAccum += B2C[c];
+            if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             continue;
           }
 
@@ -1762,6 +1764,11 @@ export async function init(options?: {
               break;
             }
           }
+        }
+
+        // End-of-chunk: flush accumulated string to parent (batched update)
+        if (ldInStringValue && ldStringAccum) {
+          spUpdateString(ldStringAccum);
         }
 
         // End-of-chunk: if we're still accumulating a scalar and stream says complete,

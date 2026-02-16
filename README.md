@@ -87,18 +87,18 @@ Apple-to-apple: both sides produce a materialized partial object on every chunk.
 
 | Payload | Product | Original | + VectorJSON | Speedup |
 |---------|---------|----------|-------------|---------|
-| 1 KB | Vercel AI SDK | 2.4 ms | 130 µs | **19×** |
-| | Anthropic SDK | 1.6 ms | 130 µs | **12×** |
-| | TanStack AI | 1.9 ms | 130 µs | **14×** |
-| | OpenClaw | 1.9 ms | 130 µs | **15×** |
-| 10 KB | Vercel AI SDK | 53 ms | 507 µs | **104×** |
-| | Anthropic SDK | 99 ms | 507 µs | **194×** |
-| | TanStack AI | 98 ms | 507 µs | **192×** |
-| | OpenClaw | 108 ms | 507 µs | **212×** |
-| 100 KB | Vercel AI SDK | 4.2 s | 4.6 ms | **923×** |
-| | Anthropic SDK | 9.2 s | 4.6 ms | **2000×** |
-| | TanStack AI | 7.6 s | 4.6 ms | **1651×** |
-| | OpenClaw | 8.5 s | 4.6 ms | **1845×** |
+| 1 KB | Vercel AI SDK | 4.2 ms | 162 µs | **26×** |
+| | Anthropic SDK | 1.6 ms | 162 µs | **10×** |
+| | TanStack AI | 1.8 ms | 162 µs | **11×** |
+| | OpenClaw | 2.0 ms | 162 µs | **12×** |
+| 10 KB | Vercel AI SDK | 49 ms | 470 µs | **104×** |
+| | Anthropic SDK | 93 ms | 470 µs | **198×** |
+| | TanStack AI | 96 ms | 470 µs | **204×** |
+| | OpenClaw | 113 ms | 470 µs | **240×** |
+| 100 KB | Vercel AI SDK | 4.1 s | 4.6 ms | **892×** |
+| | Anthropic SDK | 9.3 s | 4.6 ms | **2016×** |
+| | TanStack AI | 7.5 s | 4.6 ms | **1644×** |
+| | OpenClaw | 8.1 s | 4.6 ms | **1757×** |
 
 Stock parsers re-parse the full buffer on every chunk — O(n²). VectorJSON maintains a **live JS object** that grows incrementally on each `feed()`, so `getValue()` is O(1). Total work: O(n).
 
