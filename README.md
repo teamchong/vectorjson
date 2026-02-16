@@ -2,9 +2,18 @@
 
 SIMD-accelerated streaming JSON parser for JavaScript. Replaces the O(n²) partial-JSON parsers in Vercel AI SDK, Anthropic SDK, and TanStack AI with an O(n) WASM streaming parser.
 
-## The Problem
+## Why
 
-Every AI SDK that handles streaming JSON (tool calls, structured outputs) does this:
+Three problems with how AI SDKs parse streaming JSON today:
+
+**1. Intermediate strings grow faster than GC can collect them.**
+LLMs are getting faster and generating longer responses. Every chunk creates a new accumulated string and a new parsed object. The old copies pile up faster than the garbage collector can free them — and `using` / `Symbol.dispose` can't help because the allocations happen *inside* the parser, not in your code.
+
+**2. The agent bottleneck is data, not CPU — but you can't act on partial data.**
+When an LLM generates 100 tasks in a JSON array, you could start executing task 1 as soon as it arrives. But current parsers either fail on incomplete JSON or force you to materialize the entire tree. VectorJSON parses incomplete JSON into lazy proxies — access only what you need, and `isComplete()` tells you which elements are real vs autocompleted.
+
+**3. O(n²) parsing at streaming frequency.**
+Every AI SDK re-parses the full buffer on every chunk:
 
 ```js
 // What Vercel AI SDK, Anthropic SDK, and TanStack AI actually do
@@ -14,19 +23,27 @@ for await (const chunk of stream) {
 }
 ```
 
-Each chunk re-parses the full accumulated string. For a 100KB response in 12-char chunks, that's ~8,500 full parses. This is **O(n²)** and causes quadratic CPU time, heap churn, and GC pressure.
+For a 100KB response in 12-char chunks, that's ~8,500 full parses — O(n²) CPU time.
+
+**VectorJSON solves all three:**
 
 ```js
-// VectorJSON — O(n) total
 const parser = vj.createParser();
 for await (const chunk of stream) {
-  if (parser.feed(chunk) === "complete") break;
+  if (parser.feed(chunk) === "complete") break; // O(chunk_size) per call
 }
-const result = parser.getValue();
+const result = parser.getValue(); // lazy Proxy — zero-copy access
 parser.destroy();
 ```
 
-Each `feed()` processes only new bytes. Total work: O(n).
+```js
+// Act on partial data as it streams
+const result = vj.parse(incompleteJson);       // works on truncated JSON
+const tasks = result.value.tasks;               // lazy — no full materialization
+for (const task of tasks) {
+  if (result.isComplete(task)) execute(task);   // skip autocompleted elements
+}
+```
 
 ## Benchmarks
 
