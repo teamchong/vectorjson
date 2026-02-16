@@ -277,15 +277,12 @@ export async function init(options?: {
   // from freeing a reused slot. Each parse increments the generation.
   const docGenerations = new Map<number, number>();
 
-  function freeDocIfCurrent(docId: number, generation: number): void {
-    if (docGenerations.get(docId) !== generation) return; // stale callback
-    engine.doc_free(docId);
-  }
-
   // --- FinalizationRegistry for auto-cleanup of document slots ---
   const docRegistry = new FinalizationRegistry(
     ({ docId, generation }: { docId: number; generation: number }) => {
-      freeDocIfCurrent(docId, generation);
+      if (docGenerations.get(docId) !== generation) return; // stale callback
+      docGenerations.delete(docId);
+      engine.doc_free(docId);
     },
   );
 
@@ -399,19 +396,14 @@ export async function init(options?: {
       if (prop === LAZY_PROXY) return { docId: target._d, index: target._i };
       if (prop === 'length') return target._l;
       if (prop === Symbol.iterator) {
-        const indices = batchElemIndices(target);
-        const len = target._l;
-        const docId = target._d;
-        const ka = target._k;
-        const gen = target._g;
-        const fr = target._f;
-        const po = target._p;
+        const t = target; // single capture instead of 7 locals
         return function () {
           let i = 0;
           return {
             next() {
-              if (i >= len) return { done: true as const, value: undefined };
-              return { done: false as const, value: resolveValue(docId, indices[i++], ka, gen, fr, po) };
+              if (i >= t._l) return { done: true as const, value: undefined };
+              // Use indexed get to populate cache (avoids double-resolving)
+              return { done: false as const, value: docArrHandler.get!(t, String(i++), t) };
             },
           };
         };
@@ -419,7 +411,6 @@ export async function init(options?: {
       if (prop === Symbol.toPrimitive) return undefined;
       if (prop === Symbol.toStringTag) return "Array";
       if (typeof prop === 'string') {
-        void target._k;
         const idx = Number(prop);
         if (Number.isInteger(idx) && idx >= 0 && idx < target._l) {
           if (!target._c) target._c = new Array(target._l);
@@ -515,31 +506,6 @@ export async function init(options?: {
     },
   };
 
-  // --- Wrap a document root in a lazy cursor Proxy ---
-  // Called only for containers (object/array) — buildDocRoot handles primitives.
-  function wrapDoc(
-    docId: number,
-    index: number,
-    keepAlive: object,
-    generation: number,
-    proxyObjects = false,
-  ): unknown {
-    const tag = engine.doc_get_tag(docId, index);
-
-    // Create freeFn once for the root — shared by all child cursors via target._f
-    const freeFn = () => {
-      void keepAlive; // prevent GC of sentinel
-      if (docGenerations.get(docId) !== generation) return;
-      docGenerations.delete(docId);
-      engine.doc_free(docId);
-      docRegistry.unregister(keepAlive);
-    };
-
-    // Root value always gets a Proxy so .free() is accessible.
-    // Child objects may deep-materialize (via proxyObjects=false in resolveValue).
-    return resolveValue(docId, index, keepAlive, generation, freeFn, tag === TAG_OBJECT ? true : proxyObjects);
-  }
-
   // --- Check if a value is a lazy proxy ---
   function isLazyProxy(value: unknown): boolean {
     if (value === null || value === undefined) return false;
@@ -564,12 +530,20 @@ export async function init(options?: {
       engine.doc_free(docId);
       return value;
     }
-    // Containers: register for GC and wrap in Proxy
+    // Containers: register for GC and wrap in Proxy with manual .free()
     const generation = (docGenerations.get(docId) ?? 0) + 1;
     docGenerations.set(docId, generation);
     const keepAlive = { docId };
     docRegistry.register(keepAlive, { docId, generation }, keepAlive);
-    return wrapDoc(docId, 1, keepAlive, generation, proxyObjects);
+    const freeFn = () => {
+      void keepAlive; // prevent GC of sentinel
+      if (docGenerations.get(docId) !== generation) return;
+      docGenerations.delete(docId);
+      engine.doc_free(docId);
+      docRegistry.unregister(keepAlive);
+    };
+    // Root always gets Proxy so .free() is accessible; force objects to Proxy for isComplete()
+    return resolveValue(docId, 1, keepAlive, generation, freeFn, rootTag === TAG_OBJECT ? true : proxyObjects);
   }
 
   // --- Public API ---
