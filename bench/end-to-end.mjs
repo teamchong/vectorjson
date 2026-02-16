@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../dist/index.js";
-import { parse as partialParse } from "./vercel-sdk/node_modules/partial-json/dist/index.js";
+import { parse as partialParse } from "./ai-parsers/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
