@@ -44,7 +44,7 @@ export type DeepPartial<T> =
 export interface StreamingParser<T = unknown> {
   /** Feed a chunk of bytes to the parser. Only NEW bytes are scanned (O(chunk_size)). */
   feed(chunk: Uint8Array | string): FeedStatus;
-  /** Get the parsed value. Returns `undefined` while JSON is incomplete; throws on parse errors. */
+  /** Get the parsed value. Returns autocompleted partial value while incomplete, final value when complete; throws on parse errors. */
   getValue(): T | undefined;
   /** Get remaining bytes after end_early status (for NDJSON). */
   getRemaining(): Uint8Array | null;
@@ -242,6 +242,7 @@ interface EngineExports {
   stream_get_remaining_ptr(id: number): number;
   stream_get_remaining_len(id: number): number;
   stream_get_buffer_len(id: number): number;
+  stream_get_buffer_cap(id: number): number;
   stream_reset_for_next(id: number): number;
   classify_input(ptr: number, len: number): number;
   autocomplete_input(ptr: number, len: number, buf_cap: number): number;
@@ -976,6 +977,57 @@ export async function init(options?: {
       let ptInScalar = false;                        // tracking a scalar that may span chunks
       let ptScalarStart = -1;                        // byte offset where current scalar started
 
+      // --- Live document builder ---
+      // Incrementally builds a JS object/array as bytes are scanned.
+      // getValue() returns this growing object. O(n) total materialization.
+      let ldRoot: unknown = undefined;               // the growing root value
+      let ldStack: (Record<string, unknown> | unknown[])[] = [];  // container stack
+      let ldCurrentKey: string | null = null;        // pending key for object assignment
+      let ldActiveKey: string | null = null;         // key used for current string being updated
+      let ldStringAccum = '';                        // accumulating string value
+      let ldInStringValue = false;                   // currently inside a string value
+      let ldScalarAccum = '';                        // accumulating scalar chars
+
+      function ldSetValue(value: unknown) {
+        if (ldStack.length === 0) {
+          ldRoot = value;
+          return;
+        }
+        const parent = ldStack[ldStack.length - 1];
+        if (Array.isArray(parent)) {
+          parent.push(value);
+        } else if (ldCurrentKey !== null) {
+          parent[ldCurrentKey] = value;
+          ldActiveKey = ldCurrentKey;  // remember key for in-place updates
+          ldCurrentKey = null;
+        }
+      }
+
+      // Update a string/scalar value in-place (for partial strings being built)
+      function ldUpdateString(str: string) {
+        if (ldStack.length === 0) {
+          ldRoot = str;
+          return;
+        }
+        const parent = ldStack[ldStack.length - 1];
+        if (Array.isArray(parent)) {
+          if (parent.length > 0) parent[parent.length - 1] = str;
+          else parent.push(str);
+        } else if (ldActiveKey !== null) {
+          parent[ldActiveKey] = str;
+        }
+      }
+
+      function ldReset() {
+        ldRoot = undefined;
+        ldStack.length = 0;
+        ldCurrentKey = null;
+        ldActiveKey = null;
+        ldStringAccum = '';
+        ldInStringValue = false;
+        ldScalarAccum = '';
+      }
+
       function ptReset() {
         ptDepth = 0; ptInString = false; ptEscapeNext = false;
         ptContextStack.length = 0; ptKeyStack.length = 0;
@@ -985,6 +1037,7 @@ export async function init(options?: {
         ptStringValueStart = -1; ptInStringValue = false;
         ptDeltaAccum = ''; ptDeltaByteStart = 0;
         ptInScalar = false; ptScalarStart = -1;
+        ldReset();
       }
 
       /** Unified path matcher: exact = segments.length must equal depth, prefix = <= depth.
@@ -1048,6 +1101,9 @@ export async function init(options?: {
               // Scalar ended — fire value complete for the whole span
               const scalarLen = i - ptScalarStart;
               fireValueComplete(buf.slice(ptScalarStart, i), ptScalarStart, scalarLen);
+              // Live doc: finalize scalar
+              try { ldSetValue(JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
+              ldScalarAccum = '';
               ptInScalar = false;
               ptScalarStart = -1;
               // Re-process this delimiter char (it may be comma/close bracket)
@@ -1055,6 +1111,7 @@ export async function init(options?: {
               continue;
             }
             // Still inside the scalar, keep scanning
+            ldScalarAccum += String.fromCharCode(c);
             continue;
           }
 
@@ -1075,6 +1132,11 @@ export async function init(options?: {
                 default: decoded = String.fromCharCode(c); break;
               }
               ptDeltaAccum += decoded;
+              // Live doc: accumulate decoded escape char and update in parent
+              if (ldInStringValue) {
+                ldStringAccum += decoded;
+                ldUpdateString(ldStringAccum);
+              }
               if (ptAccumulatingKey) ptKeyAccum += decoded;
             } else if (ptAccumulatingKey) {
               ptKeyAccum += String.fromCharCode(c);
@@ -1093,6 +1155,8 @@ export async function init(options?: {
                 ptAccumulatingKey = false;
                 // Store key at parent depth (ptDepth-1) since we're inside the container
                 if (ptDepth > 0) ptKeyStack[ptDepth - 1] = ptKeyAccum;
+                // Live doc: store key for next value assignment
+                ldCurrentKey = ptKeyAccum;
                 ptKeyAccum = '';
                 continue;
               }
@@ -1108,6 +1172,10 @@ export async function init(options?: {
                 const start = ptStringValueStart;
                 const len = i + 1 - start;
                 fireValueComplete(buf.slice(start, i + 1), start, len);
+                // Live doc: final update (value already in parent from ldSetValue('') at open)
+                ldUpdateString(ldStringAccum);
+                ldStringAccum = '';
+                ldInStringValue = false;
               }
               ptInStringValue = false;
               ptStringValueStart = -1;
@@ -1117,6 +1185,11 @@ export async function init(options?: {
             if (ptInStringValue && ptSkipDepth < 0) {
               const ch = String.fromCharCode(c);
               ptDeltaAccum += ch;
+              // Live doc: accumulate string char and update in parent
+              if (ldInStringValue) {
+                ldStringAccum += ch;
+                ldUpdateString(ldStringAccum);
+              }
               if (ptAccumulatingKey) ptKeyAccum += ch;
             } else if (ptAccumulatingKey) {
               ptKeyAccum += String.fromCharCode(c);
@@ -1138,6 +1211,10 @@ export async function init(options?: {
               if (ptSkipDepth < 0 && isPathSkipped()) {
                 ptSkipDepth = ptDepth - 1;
               }
+              // Live doc: create object and push to stack
+              const obj: Record<string, unknown> = {};
+              ldSetValue(obj);
+              ldStack.push(obj);
               break;
             }
             case 0x5B: { // [
@@ -1151,6 +1228,10 @@ export async function init(options?: {
               if (ptSkipDepth < 0 && isPathSkipped()) {
                 ptSkipDepth = ptDepth - 1;
               }
+              // Live doc: create array and push to stack
+              const arr: unknown[] = [];
+              ldSetValue(arr);
+              ldStack.push(arr);
               break;
             }
             case 0x7D: // }
@@ -1172,6 +1253,8 @@ export async function init(options?: {
                 ptExpectingKey = parentCtx === 'o';
                 ptAfterColon = false;
               }
+              // Live doc: pop container from stack
+              ldStack.pop();
               break;
             }
             case 0x22: { // opening quote
@@ -1180,13 +1263,18 @@ export async function init(options?: {
                 // Start accumulating key
                 ptAccumulatingKey = true;
                 ptKeyAccum = '';
-              } else if (ptAfterColon || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
+              } else if (ptAfterColon || ptDepth === 0 || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
                 // String value — only track if not in a skipped path
                 if (ptSkipDepth < 0 && !isPathSkipped()) {
                   ptInStringValue = true;
                   ptStringValueStart = i;
                   ptDeltaAccum = '';
                   ptDeltaByteStart = i + 1; // byte after opening quote
+                  // Live doc: start string value accumulation
+                  ldStringAccum = '';
+                  ldInStringValue = true;
+                  // Push an empty string as placeholder so updates work
+                  ldSetValue('');
                 }
                 ptAfterColon = false;
               }
@@ -1195,6 +1283,14 @@ export async function init(options?: {
             case 0x3A: { // colon
               ptExpectingKey = false;
               ptAfterColon = true;
+              // Live doc: set null placeholder for pending key
+              if (ldCurrentKey !== null && ldStack.length > 0) {
+                const parent = ldStack[ldStack.length - 1];
+                if (!Array.isArray(parent)) {
+                  (parent as Record<string, unknown>)[ldCurrentKey] = null;
+                  ldActiveKey = ldCurrentKey;
+                }
+              }
               break;
             }
             case 0x2C: { // comma
@@ -1217,7 +1313,7 @@ export async function init(options?: {
             }
             default: {
               // Scalar values (numbers, true, false, null)
-              if (ptAfterColon || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
+              if (ptAfterColon || ptDepth === 0 || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
                 if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
                   // Find end of scalar
                   if (ptSkipDepth < 0 && !isPathSkipped()) {
@@ -1228,13 +1324,17 @@ export async function init(options?: {
                       j++;
                     }
                     if (j < to) {
-                      // Complete scalar
+                      // Complete scalar within this chunk
                       fireValueComplete(buf.slice(i, j), i, j - i);
+                      // Live doc: parse and set scalar value
+                      const scalarStr = utf8Decoder.decode(buf.slice(i, j));
+                      try { ldSetValue(JSON.parse(scalarStr)); } catch { ldSetValue(null); }
                       i = j - 1; // -1 because loop will increment
                     } else {
                       // Scalar extends past this chunk — track it
                       ptInScalar = true;
                       ptScalarStart = i;
+                      ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
                       i = to; // skip to end, will resume on next feed
                     }
                   }
@@ -1324,11 +1424,24 @@ export async function init(options?: {
           const status = engine.stream_feed(streamId, ptr, len);
           const newLen = engine.stream_get_buffer_len(streamId);
 
-          // Scan new bytes with PathTracker
-          if (newLen > prevLen && (pathSubs.length > 0 || deltaSubs.length > 0)) {
+          // Scan new bytes with PathTracker (always runs — needed for live document builder)
+          if (newLen > prevLen) {
             const bufPtr = engine.stream_get_buffer_ptr(streamId);
-            const wasmBuf = new Uint8Array(engine.memory.buffer, bufPtr, newLen);
-            ptScan(wasmBuf, prevLen, newLen);
+            // For end_early/complete: only scan up to the value boundary
+            const scanEnd = (status === 1 || status === 3)
+              ? Math.min(newLen, engine.stream_get_value_len(streamId))
+              : newLen;
+            if (scanEnd > prevLen) {
+              const wasmBuf = new Uint8Array(engine.memory.buffer, bufPtr, scanEnd);
+              ptScan(wasmBuf, prevLen, scanEnd);
+            }
+            // Finalize pending scalar on complete/end_early
+            if ((status === 1 || status === 3) && ptInScalar && ldScalarAccum) {
+              try { ldSetValue(JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
+              ldScalarAccum = '';
+              ptInScalar = false;
+              ptScalarStart = -1;
+            }
           }
 
           const feedStatus = FEED_STATUS[status] || "error";
@@ -1384,9 +1497,32 @@ export async function init(options?: {
         getValue(): unknown | undefined {
           if (destroyed) throw new Error("EventParser already destroyed");
           const status = engine.stream_get_status(streamId);
-          if (status === 0) return undefined;
           if (status === 2) throw new SyntaxError("VectorJSON: Parse error in stream");
 
+          if (status === 0) {
+            // incomplete — return the incrementally-built live document
+            let value: unknown = ldRoot;
+
+            // Handle pending values not yet committed to ldRoot
+            if (ptInScalar && ldScalarAccum) {
+              const partial = ldScalarAccum;
+              const completed = partial.startsWith('t') ? 'true'
+                : partial.startsWith('f') ? 'false'
+                : partial.startsWith('n') ? 'null'
+                : partial;
+              try {
+                const parsed = JSON.parse(completed);
+                if (ldStack.length === 0) value = parsed;
+              } catch { /* leave as-is */ }
+            } else if (ldInStringValue && ldStack.length === 0) {
+              value = ldStringAccum;
+            }
+
+            if (value === undefined) return undefined;
+            return value;
+          }
+
+          // complete or end_early — do a final WASM parse for correctness
           const bufPtr = engine.stream_get_buffer_ptr(streamId);
           const valueLen = engine.stream_get_value_len(streamId);
           new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
@@ -1437,6 +1573,214 @@ export async function init(options?: {
       let cachedValue: unknown = UNCACHED;
       let cachedRemaining: Uint8Array | null | undefined; // undefined = not yet cached
 
+      // --- Live document builder state (same approach as EventParser) ---
+      let ldRoot: unknown = undefined;
+      let ldStack: (Record<string, unknown> | unknown[])[] = [];
+      let ldCurrentKey: string | null = null;
+      let ldActiveKey: string | null = null;
+      let ldStringAccum = '';
+      let ldInStringValue = false;
+      let ldScalarAccum = '';
+
+      // Byte scanner state
+      let scanInString = false;
+      let scanEscapeNext = false;
+      let scanDepth = 0;
+      let scanContext: ('o' | 'a')[] = [];
+      let scanExpectingKey = false;
+      let scanAfterColon = false;
+      let scanKeyAccum = '';
+      let scanAccumulatingKey = false;
+      let scanInScalar = false;
+
+      function spSetValue(value: unknown) {
+        if (ldStack.length === 0) { ldRoot = value; return; }
+        const parent = ldStack[ldStack.length - 1];
+        if (Array.isArray(parent)) { parent.push(value); }
+        else if (ldCurrentKey !== null) { parent[ldCurrentKey] = value; ldActiveKey = ldCurrentKey; ldCurrentKey = null; }
+      }
+
+      function spUpdateString(str: string) {
+        if (ldStack.length === 0) { ldRoot = str; return; }
+        const parent = ldStack[ldStack.length - 1];
+        if (Array.isArray(parent)) {
+          if (parent.length > 0) parent[parent.length - 1] = str;
+          else parent.push(str);
+        } else if (ldActiveKey !== null) { parent[ldActiveKey] = str; }
+      }
+
+      /** Scan new bytes to incrementally build the live JS document */
+      function spScan(buf: Uint8Array, from: number, to: number) {
+        for (let i = from; i < to; i++) {
+          const c = buf[i];
+
+          if (scanInScalar) {
+            if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
+              try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+              ldScalarAccum = '';
+              scanInScalar = false;
+              i--; continue;
+            }
+            ldScalarAccum += String.fromCharCode(c);
+            continue;
+          }
+
+          if (scanEscapeNext) {
+            scanEscapeNext = false;
+            if (ldInStringValue) {
+              let decoded: string;
+              switch (c) {
+                case 0x6E: decoded = '\n'; break;
+                case 0x72: decoded = '\r'; break;
+                case 0x74: decoded = '\t'; break;
+                case 0x22: decoded = '"'; break;
+                case 0x5C: decoded = '\\'; break;
+                case 0x2F: decoded = '/'; break;
+                case 0x62: decoded = '\b'; break;
+                case 0x66: decoded = '\f'; break;
+                default: decoded = String.fromCharCode(c); break;
+              }
+              ldStringAccum += decoded;
+              spUpdateString(ldStringAccum);
+            }
+            if (scanAccumulatingKey) scanKeyAccum += String.fromCharCode(c);
+            continue;
+          }
+
+          if (scanInString) {
+            if (c === 0x5C) { scanEscapeNext = true; continue; }
+            if (c === 0x22) {
+              scanInString = false;
+              if (scanAccumulatingKey) {
+                scanAccumulatingKey = false;
+                ldCurrentKey = scanKeyAccum;
+                scanKeyAccum = '';
+                continue;
+              }
+              if (ldInStringValue) {
+                // Final update (value already in parent from spSetValue('') at open)
+                spUpdateString(ldStringAccum);
+                ldStringAccum = '';
+                ldInStringValue = false;
+              }
+              continue;
+            }
+            const ch = String.fromCharCode(c);
+            if (ldInStringValue) { ldStringAccum += ch; spUpdateString(ldStringAccum); }
+            if (scanAccumulatingKey) scanKeyAccum += ch;
+            continue;
+          }
+
+          switch (c) {
+            case 0x7B: {
+              scanContext[scanDepth] = 'o';
+              scanDepth++;
+              scanExpectingKey = true;
+              scanAfterColon = false;
+              const obj: Record<string, unknown> = {};
+              spSetValue(obj);
+              ldStack.push(obj);
+              break;
+            }
+            case 0x5B: {
+              scanContext[scanDepth] = 'a';
+              scanDepth++;
+              scanExpectingKey = false;
+              scanAfterColon = false;
+              const arr: unknown[] = [];
+              spSetValue(arr);
+              ldStack.push(arr);
+              break;
+            }
+            case 0x7D: case 0x5D: {
+              scanDepth--;
+              ldStack.pop();
+              if (scanDepth > 0) {
+                scanExpectingKey = scanContext[scanDepth - 1] === 'o';
+                scanAfterColon = false;
+              }
+              break;
+            }
+            case 0x22: {
+              scanInString = true;
+              const isValue = scanAfterColon || scanDepth === 0 || (scanDepth > 0 && scanContext[scanDepth - 1] === 'a');
+              if (scanExpectingKey) {
+                scanAccumulatingKey = true;
+                scanKeyAccum = '';
+              } else if (isValue) {
+                ldStringAccum = '';
+                ldInStringValue = true;
+                spSetValue('');
+                scanAfterColon = false;
+              }
+              break;
+            }
+            case 0x3A: {
+              scanExpectingKey = false;
+              scanAfterColon = true;
+              // Set null placeholder for the pending key — will be overwritten
+              // when the real value arrives. This ensures getValue() during
+              // incomplete streaming shows {"key": null} instead of {}.
+              if (ldCurrentKey !== null && ldStack.length > 0) {
+                const parent = ldStack[ldStack.length - 1];
+                if (!Array.isArray(parent)) {
+                  (parent as Record<string, unknown>)[ldCurrentKey] = null;
+                  ldActiveKey = ldCurrentKey;
+                }
+              }
+              break;
+            }
+            case 0x2C: {
+              if (scanDepth > 0 && scanContext[scanDepth - 1] === 'o') {
+                scanExpectingKey = true;
+              }
+              scanAfterColon = false;
+              break;
+            }
+            default: {
+              const isValuePos = scanAfterColon || scanDepth === 0 || (scanDepth > 0 && scanContext[scanDepth - 1] === 'a');
+              if (isValuePos) {
+                if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
+                  let j = i + 1;
+                  while (j < to) {
+                    const sc = buf[j];
+                    if (sc === 0x2C || sc === 0x7D || sc === 0x5D || sc === 0x20 || sc === 0x0A || sc === 0x0D || sc === 0x09) break;
+                    j++;
+                  }
+                  if (j < to) {
+                    const scalarStr = utf8Decoder.decode(buf.slice(i, j));
+                    try { spSetValue(JSON.parse(scalarStr)); } catch { spSetValue(null); }
+                    i = j - 1;
+                  } else {
+                    scanInScalar = true;
+                    ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
+                    i = to;
+                  }
+                  scanAfterColon = false;
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // End-of-chunk: if we're still accumulating a scalar and stream says complete,
+        // finalize it now (root-level scalars like "42" end at end-of-buffer)
+        if (scanInScalar) {
+          const status = engine.stream_get_status(streamId);
+          if (status === 1 || status === 3) { // complete or end_early
+            // Autocomplete partial keywords (e.g., "tr" → "true")
+            const s = ldScalarAccum;
+            const completed = s.startsWith('t') ? 'true'
+              : s.startsWith('f') ? 'false'
+              : s.startsWith('n') ? 'null' : s;
+            try { spSetValue(JSON.parse(completed)); } catch { spSetValue(null); }
+            ldScalarAccum = '';
+            scanInScalar = false;
+          }
+        }
+      }
+
       const ensureRemaining = () => {
         if (cachedRemaining !== undefined) return;
         const rPtr = engine.stream_get_remaining_ptr(streamId);
@@ -1449,14 +1793,30 @@ export async function init(options?: {
         }
       };
 
+      let prevLen = 0;
+
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
           if (destroyed) throw new Error("Parser already destroyed");
           const chunkLen = typeof chunk === "string" ? chunk.length : chunk.byteLength;
           if (chunkLen === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
           const { ptr, len } = writeToWasm(chunk, feedBuf, 0, 4096);
-          const status = engine.stream_feed(streamId, ptr, len);
-          return FEED_STATUS[status] || "error";
+          const rawStatus = engine.stream_feed(streamId, ptr, len);
+          // Scan new bytes for live document building
+          const newLen = engine.stream_get_buffer_len(streamId);
+          if (newLen > prevLen) {
+            const bufPtr = engine.stream_get_buffer_ptr(streamId);
+            // For end_early/complete: only scan up to the value boundary, not trailing data
+            const scanEnd = (rawStatus === 1 || rawStatus === 3)
+              ? Math.min(newLen, engine.stream_get_value_len(streamId))
+              : newLen;
+            if (scanEnd > prevLen) {
+              const wasmBuf = new Uint8Array(engine.memory.buffer, bufPtr, scanEnd);
+              spScan(wasmBuf, prevLen, scanEnd);
+            }
+            prevLen = newLen;
+          }
+          return FEED_STATUS[rawStatus] || "error";
         },
 
         getValue(): unknown | undefined {
@@ -1464,32 +1824,52 @@ export async function init(options?: {
           if (cachedValue !== UNCACHED) return cachedValue;
 
           const status = engine.stream_get_status(streamId);
-          if (status === 0) return undefined;
           if (status === 2) {
             throw new SyntaxError("VectorJSON: Parse error in stream");
           }
 
-          // complete or end_early — parse the accumulated buffer via doc_parse
-          const bufPtr = engine.stream_get_buffer_ptr(streamId);
-          const valueLen = engine.stream_get_value_len(streamId);
+          if (status === 0) {
+            // incomplete — return the incrementally-built live document
+            // The returned object IS the live object — it grows as more data arrives.
+            // Callers get a reference that automatically reflects future feed() calls.
+            let value: unknown = ldRoot;
 
-          // Save remaining bytes BEFORE SIMD padding (padding starts at bufPtr + valueLen,
-          // which is exactly where remaining bytes live in the end_early case)
+            // Handle pending partial values that haven't been committed to ldRoot yet:
+            if (scanInScalar && ldScalarAccum) {
+              // Pending scalar: try to autocomplete (e.g., "tr" → true)
+              const partial = ldScalarAccum;
+              const completed = partial.startsWith('t') ? 'true'
+                : partial.startsWith('f') ? 'false'
+                : partial.startsWith('n') ? 'null'
+                : partial;
+              try {
+                const parsed = JSON.parse(completed);
+                if (ldStack.length === 0) value = parsed;
+              } catch { /* partial number like "1." — leave as-is */ }
+            } else if (ldInStringValue && ldStack.length === 0) {
+              // Root-level string still being accumulated
+              value = ldStringAccum;
+            }
+
+            if (value === undefined) return undefined;
+            if (schema) {
+              const result = schema.safeParse(value);
+              if (!result.success) return undefined;
+              value = result.data;
+            }
+            return value;
+          }
+
+          // complete or end_early — finalize any pending scalar
+          if (scanInScalar && ldScalarAccum) {
+            try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+            ldScalarAccum = '';
+            scanInScalar = false;
+          }
           ensureRemaining();
 
-          // Pad for SIMD safety (zimdjson needs 64 bytes of padding)
-          new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
-
-          const docId = engine.doc_parse(bufPtr, valueLen);
-          if (docId < 0) {
-            const errorCode = engine.get_error_code();
-            const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-            throw new SyntaxError(`VectorJSON: ${msg}`);
-          }
-          let value = buildDocRoot(docId);
+          let value: unknown = ldRoot;
           if (schema) {
-            // Materialize for safeParse (it expects plain JS objects, not Proxy)
-            if (isLazyProxy(value)) value = deepMaterializeDoc((value as any)[LAZY_PROXY].docId, (value as any)[LAZY_PROXY].index);
             const result = schema.safeParse(value);
             if (!result.success) return (cachedValue = undefined) as undefined;
             value = result.data;

@@ -134,11 +134,21 @@ await test("stream: getValue caches result", () => {
   p.destroy();
 });
 
-await test("stream: getValue on incomplete returns undefined", () => {
+await test("stream: getValue on incomplete returns autocompleted partial value", () => {
   const p = vj.createParser();
-  p.feed('{"incomplete');
+  p.feed('{"name":"Ali');
   const val = p.getValue();
-  if (val !== undefined) throw new Error("Expected undefined for incomplete parse");
+  // Autocompleted partial: {"name":"Ali"} — string gets closed, object gets closed
+  if (val === undefined) throw new Error("Expected partial value, got undefined");
+  if (typeof val !== "object") throw new Error("Expected object, got " + typeof val);
+  p.destroy();
+});
+
+await test("stream: getValue on empty incomplete returns undefined", () => {
+  const p = vj.createParser();
+  p.feed("");
+  const val = p.getValue();
+  if (val !== undefined) throw new Error("Expected undefined for empty feed");
   p.destroy();
 });
 
@@ -257,10 +267,10 @@ await test("schema: createParser(schema) rejects all → undefined", () => {
   p.destroy();
 });
 
-await test("schema: createParser(schema) on incomplete returns undefined (not validated)", () => {
+await test("schema: createParser(schema) on incomplete returns undefined when schema fails", () => {
   const p = vj.createParser(userSchema);
   p.feed('{"name":"Ali');
-  // Stream is incomplete — getValue returns undefined before schema even runs
+  // Incomplete → autocompleted to {"name":"Ali"} → schema fails (missing age) → undefined
   const val = p.getValue();
   assertEqual(val, undefined);
   p.destroy();

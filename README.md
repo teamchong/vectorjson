@@ -25,33 +25,46 @@ for await (const chunk of stream) {
 }
 ```
 
-A 50KB tool call streamed in ~12-char chunks = **~4,000 full re-parses**. That's O(n²) CPU. At 100KB, Vercel AI SDK takes **3.7 seconds**. Anthropic SDK takes **8.8 seconds**. Your UI is frozen the entire time.
+A 50KB tool call streamed in ~12-char chunks = **~4,000 full re-parses**. That's O(n²) CPU. At 100KB, Vercel AI SDK takes **4.2 seconds**. Anthropic SDK takes **9.2 seconds**. Your UI is frozen the entire time.
 
 ## The Fix
 
-**Drop-in replacement** — swap one function call, everything else stays the same:
+**Drop-in replacement** — swap one function call, get 900-2000× faster parsing:
 
 ```js
 import { init } from "vectorjson";
 const vj = await init();
 
-// Before (O(n²) — what your SDK does today):
+// Before (JS parser — what your SDK does today):
 for await (const chunk of stream) {
   buffer += chunk;
-  result = parsePartialJson(buffer); // 3.7s at 100KB
+  result = parsePartialJson(buffer); // JS re-parse: 4.2s at 100KB
 }
 
-// After (O(n) — only new bytes processed):
+// After (VectorJSON — O(n) live document builder):
 const parser = vj.createParser();
 for await (const chunk of stream) {
-  const s = parser.feed(chunk);      // 2.3ms at 100KB
-  if (s === "complete" || s === "end_early") break;
+  parser.feed(chunk);
+  result = parser.getValue();        // O(1) — returns live object: 4.6ms at 100KB
 }
-const result = parser.getValue();
 parser.destroy();
 ```
 
-**Event-driven** — react to fields as they arrive instead of polling the whole object:
+`getValue()` returns a **live JS object** that grows incrementally on each `feed()`. No re-parsing — each byte is scanned exactly once.
+
+**Or skip intermediate access entirely** — if you only need the final value:
+
+```js
+const parser = vj.createParser();
+for await (const chunk of stream) {
+  const s = parser.feed(chunk);      // O(1) — appends bytes to WASM buffer
+  if (s === "complete") break;
+}
+const result = parser.getValue();    // one SIMD parse at the end
+parser.destroy();
+```
+
+**Event-driven** — react to fields as they arrive, O(n) total, no re-parsing:
 
 ```js
 const parser = vj.createEventParser();
@@ -68,36 +81,40 @@ parser.destroy();
 
 ## Benchmarks
 
-Each product benchmarked twice: original parser, then patched with VectorJSON. Same payload, same chunks (~12 chars, typical LLM token).
+Apple-to-apple: both sides produce a materialized partial object on every chunk. Same payload, same chunks (~12 chars, typical LLM token).
 
 `bun --expose-gc bench/ai-parsers/bench.mjs`
 
 | Payload | Product | Original | + VectorJSON | Speedup |
 |---------|---------|----------|-------------|---------|
-| 1 KB | Vercel AI SDK | 2.0 ms | 0.1 ms | 15× |
-| | TanStack AI | 1.5 ms | 0.04 ms | 35× |
-| | OpenClaw | 1.7 ms | 0.04 ms | 46× |
-| | Anthropic SDK | 1.9 ms | 0.09 ms | 20× |
-| 10 KB | Vercel AI SDK | 48 ms | 0.2 ms | 238× |
-| | TanStack AI | 93 ms | 0.2 ms | 422× |
-| | OpenClaw | 104 ms | 0.4 ms | 272× |
-| | Anthropic SDK | 92 ms | 0.2 ms | 445× |
-| 100 KB | Vercel AI SDK | 3.7 s | 2.3 ms | 1,624× |
-| | TanStack AI | 6.5 s | 2.3 ms | 2,775× |
-| | OpenClaw | 7.7 s | 2.4 ms | 3,251× |
-| | Anthropic SDK | 8.8 s | 2.8 ms | 3,145× |
+| 1 KB | Vercel AI SDK | 2.4 ms | 130 µs | **19×** |
+| | Anthropic SDK | 1.6 ms | 130 µs | **12×** |
+| | TanStack AI | 1.9 ms | 130 µs | **14×** |
+| | OpenClaw | 1.9 ms | 130 µs | **15×** |
+| 10 KB | Vercel AI SDK | 53 ms | 507 µs | **104×** |
+| | Anthropic SDK | 99 ms | 507 µs | **194×** |
+| | TanStack AI | 98 ms | 507 µs | **192×** |
+| | OpenClaw | 108 ms | 507 µs | **212×** |
+| 100 KB | Vercel AI SDK | 4.2 s | 4.6 ms | **923×** |
+| | Anthropic SDK | 9.2 s | 4.6 ms | **2000×** |
+| | TanStack AI | 7.6 s | 4.6 ms | **1651×** |
+| | OpenClaw | 8.5 s | 4.6 ms | **1845×** |
+
+Stock parsers re-parse the full buffer on every chunk — O(n²). VectorJSON maintains a **live JS object** that grows incrementally on each `feed()`, so `getValue()` is O(1). Total work: O(n).
+
+For even more control, use `createEventParser()` for field-level subscriptions or only call `getValue()` once when `feed()` returns `"complete"`.
 
 <details>
 <summary>Which products use which parser</summary>
 
 | Product | Original Parser | Patched With |
 |---------|----------------|-------------|
-| Vercel AI SDK | `fixJson` + `JSON.parse` — O(n²) | `createParser().feed()` — O(n) |
-| OpenCode | Vercel AI SDK (`streamText()`) — O(n²) | `createParser().feed()` — O(n) |
-| TanStack AI | `partial-json` npm — O(n²) | `createParser().feed()` — O(n) |
-| OpenClaw | pi-ai → `partial-json` npm — O(n²) | `createParser().feed()` — O(n) |
-| Anthropic SDK | vendored `partial-json-parser` — O(n²) | `createParser().feed()` — O(n) |
-| Claude Code | Anthropic SDK (`partialParse`) — O(n²) | `createParser().feed()` — O(n) |
+| Vercel AI SDK | `fixJson` + `JSON.parse` — O(n²) | `createParser().feed()` + `getValue()` |
+| OpenCode | Vercel AI SDK (`streamText()`) — O(n²) | `createParser().feed()` + `getValue()` |
+| TanStack AI | `partial-json` npm — O(n²) | `createParser().feed()` + `getValue()` |
+| OpenClaw | pi-ai → `partial-json` npm — O(n²) | `createParser().feed()` + `getValue()` |
+| Anthropic SDK | vendored `partial-json-parser` — O(n²) | `createParser().feed()` + `getValue()` |
+| Claude Code | Anthropic SDK (`partialParse`) — O(n²) | `createParser().feed()` + `getValue()` |
 
 </details>
 
@@ -282,7 +299,7 @@ Each `feed()` processes only new bytes — O(n) total. Pass an optional schema t
 ```ts
 interface StreamingParser<T = unknown> {
   feed(chunk: Uint8Array | string): FeedStatus;
-  getValue(): T | undefined;  // undefined while incomplete or schema rejects
+  getValue(): T | undefined;  // autocompleted partial while incomplete, final when complete
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
   destroy(): void;
@@ -290,7 +307,7 @@ interface StreamingParser<T = unknown> {
 type FeedStatus = "incomplete" | "complete" | "error" | "end_early";
 ```
 
-With a schema, `getValue()` returns `undefined` when validation fails (same as incomplete — the stream hasn't produced valid data yet):
+While incomplete, `getValue()` returns the **live document** — a mutable JS object that grows incrementally on each `feed()`. This is O(1) per call (just returns the reference). With a schema, returns `undefined` when validation fails:
 
 ```ts
 import { z } from 'zod';
@@ -381,6 +398,31 @@ interface RootEvent {
 ### `vj.materialize(value): unknown`
 
 Convert a lazy Proxy into a plain JS object tree. No-op on plain values.
+
+## Runtime Support
+
+| Runtime | Status | Notes |
+|---------|--------|-------|
+| Node.js 20+ | ✅ | WASM loaded from disk automatically |
+| Bun | ✅ | WASM loaded from disk automatically |
+| Browsers | ✅ | Pass `engineWasm` as `ArrayBuffer` or `URL` to `init()` |
+| Deno | ✅ | Pass `engineWasm` as `URL` to `init()` |
+| Cloudflare Workers | ✅ | Import WASM as module, pass as `ArrayBuffer` to `init()` |
+
+For environments without filesystem access, provide the WASM binary explicitly:
+
+```js
+import { init } from "vectorjson";
+
+// Option 1: URL (browsers, Deno)
+const vj = await init({ engineWasm: new URL('./engine.wasm', import.meta.url) });
+
+// Option 2: ArrayBuffer (Workers, custom loaders)
+const wasmBytes = await fetch('/engine.wasm').then(r => r.arrayBuffer());
+const vj = await init({ engineWasm: wasmBytes });
+```
+
+Bundle size: ~101 KB WASM + ~63 KB JS (minified). No runtime dependencies.
 
 ## Building from Source
 

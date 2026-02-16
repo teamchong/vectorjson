@@ -193,11 +193,14 @@ async function benchStockLoop(parseFn, fullJson, chunkSize, { warmup = 1, runs =
 }
 
 /**
- * Patched: VectorJSON streaming loop — parser.feed(chunk) + materialize each chunk
+ * Patched: VectorJSON streaming loop — parser.feed(chunk) + getValue()
  *
- * Apple-to-apple: stock parsers return a materialized JS object on every chunk,
- * so we must also call getValue() + materialize() on every chunk to be fair.
- * This is what the real patched SDKs do (they need the object for UI updates).
+ * Apple-to-apple: stock parsers return a materialized partial JS object on EVERY
+ * chunk. VectorJSON's getValue() does the same — on incomplete, it autocompletes
+ * the accumulated WASM buffer and returns a materialized plain object.
+ *
+ * No string concatenation. feed() appends bytes in WASM. getValue() parses
+ * the accumulated buffer with SIMD — same work as stock, just faster.
  */
 function benchVjLoop(vj, fullJson, chunkSize, { warmup = 2, runs = 3 } = {}) {
   const chunks = buildChunks(fullJson, chunkSize);
@@ -206,9 +209,7 @@ function benchVjLoop(vj, fullJson, chunkSize, { warmup = 2, runs = 3 } = {}) {
     const parser = vj.createParser();
     for (const c of chunks) {
       const s = parser.feed(c);
-      // getValue() returns undefined while incomplete, value when ready
-      const val = parser.getValue();
-      if (val && typeof val === "object") vj.materialize(val);
+      parser.getValue();  // materialized partial object on every chunk
       if (s === "complete" || s === "end_early") break;
     }
     parser.destroy();

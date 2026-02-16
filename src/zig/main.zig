@@ -101,6 +101,11 @@ export fn stream_get_buffer_len(id: i32) u32 {
     return s.buffer_len;
 }
 
+export fn stream_get_buffer_cap(id: i32) u32 {
+    const s = getStream(id) orelse return 0;
+    return s.buffer_cap;
+}
+
 export fn stream_reset_for_next(id: i32) u32 {
     const s = getStream(id) orelse return 0;
     return s.resetForNext();

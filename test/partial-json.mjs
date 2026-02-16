@@ -436,10 +436,12 @@ test("streaming: NDJSON (end_early) — getValue before getRemaining", () => {
   parser.destroy();
 });
 
-test("streaming: getValue returns undefined on incomplete", () => {
+test("streaming: getValue returns autocompleted partial on incomplete", () => {
   const parser = vj.createParser();
   parser.feed('{"a": ');
-  assertEqual(parser.getValue(), undefined);
+  const val = parser.getValue();
+  // Autocompleted: {"a": null} → { a: null }
+  assertEqual(val, { a: null });
   parser.destroy();
 });
 
