@@ -4,10 +4,24 @@
   "description": "O(n) WASM SIMD streaming JSON parser — 900-2000× faster partial JSON for AI SDKs vs Vercel/Anthropic/TanStack",
   "type": "module",
   "main": "dist/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./engine.wasm": "./dist/engine.wasm"
+  },
+  "sideEffects": false,
   "files": [
-    "dist/"
+    "dist/",
+    "LICENSE"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build:zig": "zig build -Doptimize=ReleaseSmall",
     "build:opt": "npx wasm-opt -Oz --strip-producers dist/engine.wasm -o dist/engine.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals",

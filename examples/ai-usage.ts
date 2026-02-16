@@ -88,7 +88,7 @@ async function mcpStreamableHttpExample(vj: VectorJSON) {
       "Accept": "application/json, text/event-stream",
       "Mcp-Session-Id": "abc-123",
     },
-    body: vj.stringify(request),
+    body: JSON.stringify(request),
   });
 
   const contentType = response.headers.get("Content-Type") ?? "";

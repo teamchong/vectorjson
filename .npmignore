@@ -11,11 +11,14 @@ build.zig.zon
 test/
 bench/
 
-# Dev config
+# Dev tools
+demo/
+examples/
 .github/
 .claude/
 .gitignore
 tsconfig.json
+knip.json
 bun.lock
 
 # OS files
