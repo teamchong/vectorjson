@@ -561,11 +561,13 @@ test("incomplete: array with nested empty object unclosed", () => {
   assertEqual(v[1], {});
 });
 
-test("incomplete: object with boolean value truncated → invalid", () => {
-  // "tru" is a partial scalar inside a container. classify says "incomplete" (depth>0),
-  // autocomplete closes the brace, but doc_parse rejects "tru" as invalid literal → invalid
+test("incomplete: object with boolean value truncated", () => {
+  // "tru" is a partial keyword inside a container. autocomplete completes it to "true"
+  // and closes the brace → incomplete with { flag: true }
   const r = vj.parse('{"flag":tru');
-  assertEqual(r.status, "invalid");
+  assertEqual(r.status, "incomplete");
+  const v = r.toJSON();
+  assertEqual(v.flag, true);
 });
 
 test("incomplete: only whitespace then partial token", () => {

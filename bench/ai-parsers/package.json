@@ -1,0 +1,16 @@
+{
+  "name": "vectorjson-ai-parsers-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun --expose-gc bench.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.74.0",
+    "@opencode-ai/sdk": "1.2.5",
+    "@streamparser/json": "^0.0.22",
+    "@tanstack/ai": "^0.5.0",
+    "ai": "^6.0.86",
+    "partial-json": "^0.1.7"
+  }
+}
