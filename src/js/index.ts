@@ -360,10 +360,7 @@ export async function init(options?: {
     // deep-materialize for complete parses (fast native property access).
     if (tag === TAG_OBJECT) {
       if (proxyObjects) {
-        const t: any = {};
-        t._d = docId; t._i = index; t._k = keepAlive;
-        t._g = generation; t._f = freeFn;
-        return new Proxy(t, docObjHandler);
+        return new Proxy({ _d: docId, _i: index, _k: keepAlive, _g: generation, _f: freeFn } as any, docObjHandler);
       }
       return deepMaterializeDoc(docId, index);
     }

@@ -457,7 +457,6 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     var depth_val: i32 = 0;
     var in_string: bool = false;
     var escape_next: bool = false;
-    var root_started: bool = false;
     var root_completed: bool = false;
     var root_is_string: bool = false;
     var pending_scalar: bool = false;
@@ -499,14 +498,12 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
 
         switch (c) {
             '"' => {
-                if (depth_val == 0 and !root_started) {
-                    root_started = true;
+                if (depth_val == 0 and !root_completed and !root_is_string and !pending_scalar) {
                     root_is_string = true;
                 }
                 in_string = true;
             },
             '{', '[' => {
-                if (depth_val == 0 and !root_started) root_started = true;
                 depth_val += 1;
             },
             '}', ']' => {
@@ -518,8 +515,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 }
             },
             't', 'f', 'n', '-', '0'...'9' => {
-                if (depth_val == 0 and !root_started) {
-                    root_started = true;
+                if (depth_val == 0 and !root_completed and !pending_scalar) {
                     pending_scalar = true;
                     scalar_start = i;
                 }
@@ -549,10 +545,8 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
         value_end = len;
     }
 
-    if (!root_started) return 0; // nothing started = incomplete
-
     if (!root_completed) {
-        // Still mid-string or depth > 0 → incomplete
+        // Nothing started, still mid-string, or depth > 0 → incomplete
         return 0;
     }
 
