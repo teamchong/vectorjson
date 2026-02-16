@@ -35,8 +35,8 @@ export interface PartialJsonResult {
 export interface StreamingParser {
   /** Feed a chunk of bytes to the parser. Only NEW bytes are scanned (O(chunk_size)). */
   feed(chunk: Uint8Array | string): FeedStatus;
-  /** Get the parsed value after complete or end_early status. */
-  getValue(): unknown;
+  /** Get the parsed value. Returns `undefined` while JSON is incomplete; throws on parse errors. */
+  getValue(): unknown | undefined;
   /** Get remaining bytes after end_early status (for NDJSON). */
   getRemaining(): Uint8Array | null;
   /** Get the current status without feeding data. */
@@ -94,7 +94,7 @@ export interface EventParser {
   skip(...paths: string[]): EventParser;
   off(path: string, callback?: Function): EventParser;
   feed(chunk: string | Uint8Array): FeedStatus;
-  getValue(): unknown;
+  getValue(): unknown | undefined;
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
   destroy(): void;
@@ -1328,10 +1328,10 @@ export async function init(options?: {
           return feedStatus;
         },
 
-        getValue(): unknown {
+        getValue(): unknown | undefined {
           if (destroyed) throw new Error("EventParser already destroyed");
           const status = engine.stream_get_status(streamId);
-          if (status === 0) throw new Error("VectorJSON: JSON is incomplete, feed more data");
+          if (status === 0) return undefined;
           if (status === 2) throw new SyntaxError("VectorJSON: Parse error in stream");
 
           const bufPtr = engine.stream_get_buffer_ptr(streamId);
@@ -1406,14 +1406,12 @@ export async function init(options?: {
           return FEED_STATUS[status] || "error";
         },
 
-        getValue(): unknown {
+        getValue(): unknown | undefined {
           if (destroyed) throw new Error("Parser already destroyed");
           if (cachedValue !== UNCACHED) return cachedValue;
 
           const status = engine.stream_get_status(streamId);
-          if (status === 0) {
-            throw new Error("VectorJSON: JSON is incomplete, feed more data");
-          }
+          if (status === 0) return undefined;
           if (status === 2) {
             throw new SyntaxError("VectorJSON: Parse error in stream");
           }

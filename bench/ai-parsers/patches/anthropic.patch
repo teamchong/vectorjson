@@ -1,0 +1,64 @@
+--- node_modules/@anthropic-ai/sdk/lib/MessageStream.mjs	2026-02-16 09:48:19.185470441 -0500
++++ node_modules/@anthropic-ai/sdk/lib/MessageStream.mjs	2026-02-16 09:49:43.155030877 -0500
+@@ -1,3 +1,12 @@
++import { init as vjInit } from "../../../../../../dist/index.js";
++var __vjInstance = null;
++async function getVJ() {
++  if (!__vjInstance) __vjInstance = await vjInit();
++  return __vjInstance;
++}
++var __vjParsers = new Map();
++var __vjReady = getVJ();
++
+ var _MessageStream_instances, _MessageStream_currentMessageSnapshot, _MessageStream_params, _MessageStream_connectedPromise, _MessageStream_resolveConnectedPromise, _MessageStream_rejectConnectedPromise, _MessageStream_endPromise, _MessageStream_resolveEndPromise, _MessageStream_rejectEndPromise, _MessageStream_listeners, _MessageStream_ended, _MessageStream_errored, _MessageStream_aborted, _MessageStream_catchingPromiseCreated, _MessageStream_response, _MessageStream_request_id, _MessageStream_logger, _MessageStream_getFinalMessage, _MessageStream_getFinalText, _MessageStream_handleError, _MessageStream_beginRequest, _MessageStream_addStreamEvent, _MessageStream_endRequest, _MessageStream_accumulateMessage;
+ import { __classPrivateFieldGet, __classPrivateFieldSet } from "../internal/tslib.mjs";
+ import { isAbortError } from "../internal/errors.mjs";
+@@ -486,18 +495,29 @@
+                     }
+                     case 'input_json_delta': {
+                         if (snapshotContent && tracksToolInput(snapshotContent)) {
+-                            // we need to keep track of the raw JSON string as well so that we can
+-                            // re-parse it for each delta, for now we just store it as an untyped
+-                            // non-enumerable property on the snapshot
+-                            let jsonBuf = snapshotContent[JSON_BUF_PROPERTY] || '';
+-                            jsonBuf += event.delta.partial_json;
++                            let jsonBuf = (snapshotContent[JSON_BUF_PROPERTY] || '') + event.delta.partial_json;
+                             const newContent = { ...snapshotContent };
+                             Object.defineProperty(newContent, JSON_BUF_PROPERTY, {
+                                 value: jsonBuf,
+                                 enumerable: false,
+                                 writable: true,
+                             });
+-                            if (jsonBuf) {
++                            // VectorJSON: feed only the new delta (O(delta) not O(buffer))
++                            if (jsonBuf && __vjInstance) {
++                                const blockIdx = event.index;
++                                let parser = __vjParsers.get(blockIdx);
++                                if (!parser) {
++                                    parser = __vjInstance.createParser();
++                                    __vjParsers.set(blockIdx, parser);
++                                }
++                                parser.feed(event.delta.partial_json);
++                                const val = parser.getValue();
++                                if (val !== undefined) {
++                                    newContent.input = typeof val === "object" && val ? __vjInstance.materialize(val) : val;
++                                } else {
++                                    newContent.input = partialParse(jsonBuf);
++                                }
++                            } else if (jsonBuf) {
+                                 newContent.input = partialParse(jsonBuf);
+                             }
+                             snapshot.content[event.index] = newContent;
+@@ -528,6 +548,12 @@
+                 return snapshot;
+             }
+             case 'content_block_stop':
++                // VectorJSON: clean up parser for this content block
++                if (__vjParsers.size > 0) {
++                    const blockIdx = snapshot.content.length - 1;
++                    const parser = __vjParsers.get(blockIdx);
++                    if (parser) { parser.destroy(); __vjParsers.delete(blockIdx); }
++                }
+                 return snapshot;
+         }
+     }, Symbol.asyncIterator)]() {

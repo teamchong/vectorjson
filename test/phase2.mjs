@@ -134,12 +134,11 @@ await test("stream: getValue caches result", () => {
   p.destroy();
 });
 
-await test("stream: getValue on incomplete throws", () => {
+await test("stream: getValue on incomplete returns undefined", () => {
   const p = vj.createParser();
   p.feed('{"incomplete');
-  let threw = false;
-  try { p.getValue(); } catch (e) { threw = true; }
-  if (!threw) throw new Error("Expected error");
+  const val = p.getValue();
+  if (val !== undefined) throw new Error("Expected undefined for incomplete parse");
   p.destroy();
 });
 

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "postinstall": "bash -c 'cp node_modules/ai/dist/index.mjs node_modules/ai/dist/index.stock.mjs && cp node_modules/@anthropic-ai/sdk/lib/MessageStream.mjs node_modules/@anthropic-ai/sdk/lib/MessageStream.stock.mjs && cp \"node_modules/@tanstack/ai/dist/esm/activities/chat/stream/processor.js\" \"node_modules/@tanstack/ai/dist/esm/activities/chat/stream/processor.stock.js\" && for p in patches/*.patch; do patch -p0 -N < \"$p\" || true; done'",
     "bench": "bun --expose-gc bench.mjs"
   },
   "dependencies": {

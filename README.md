@@ -256,7 +256,7 @@ Each `feed()` processes only new bytes — O(n) total.
 ```ts
 interface StreamingParser {
   feed(chunk: Uint8Array | string): FeedStatus;
-  getValue(): unknown;
+  getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
   destroy(): void;
@@ -288,7 +288,7 @@ interface EventParser {
   skip(...paths: string[]): EventParser;
   off(path: string, callback?: Function): EventParser;
   feed(chunk: string | Uint8Array): FeedStatus;
-  getValue(): unknown;
+  getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
   destroy(): void;

@@ -436,12 +436,10 @@ test("streaming: NDJSON (end_early) — getValue before getRemaining", () => {
   parser.destroy();
 });
 
-test("streaming: getValue throws on incomplete", () => {
+test("streaming: getValue returns undefined on incomplete", () => {
   const parser = vj.createParser();
   parser.feed('{"a": ');
-  let threw = false;
-  try { parser.getValue(); } catch { threw = true; }
-  assertEqual(threw, true);
+  assertEqual(parser.getValue(), undefined);
   parser.destroy();
 });
 

@@ -1,0 +1,92 @@
+--- node_modules/ai/dist/index.mjs	2026-02-16 09:48:19.184470434 -0500
++++ node_modules/ai/dist/index.mjs	2026-02-16 09:49:03.307765573 -0500
+@@ -1,3 +1,9 @@
++import { init as vjInit } from "../../../../../dist/index.js";
++var __vjInstance = null;
++async function getVJ() {
++  if (!__vjInstance) __vjInstance = await vjInit();
++  return __vjInstance;
++}
+ var __defProp = Object.defineProperty;
+ var __export = (target, all) => {
+   for (var name21 in all)
+@@ -10248,6 +10254,9 @@
+         };
+         let latestObjectJson = void 0;
+         let latestObject = void 0;
++        // VectorJSON: incremental streaming parser (O(n) total vs O(n²) parsePartialJson)
++        const __vj = await getVJ();
++        const __vjParser = __vj.createParser();
+         let isFirstChunk = true;
+         let isFirstDelta = true;
+         const transformedStream = stream.pipeThrough(new TransformStream(transformer)).pipeThrough(
+@@ -10271,31 +10280,36 @@
+               if (typeof chunk === "string") {
+                 accumulatedText += chunk;
+                 textDelta += chunk;
+-                const { value: currentObjectJson, state: parseState } = await parsePartialJson(accumulatedText);
+-                if (currentObjectJson !== void 0 && !isDeepEqualData(latestObjectJson, currentObjectJson)) {
+-                  const validationResult = await outputStrategy.validatePartialResult({
+-                    value: currentObjectJson,
+-                    textDelta,
+-                    latestObject,
+-                    isFirstDelta,
+-                    isFinalDelta: parseState === "successful-parse"
+-                  });
+-                  if (validationResult.success && !isDeepEqualData(
+-                    latestObject,
+-                    validationResult.value.partial
+-                  )) {
+-                    latestObjectJson = currentObjectJson;
+-                    latestObject = validationResult.value.partial;
+-                    controller.enqueue({
+-                      type: "object",
+-                      object: latestObject
+-                    });
+-                    controller.enqueue({
+-                      type: "text-delta",
+-                      textDelta: validationResult.value.textDelta
++                // VectorJSON: feed only the NEW chunk bytes (O(chunk_size), not O(accumulated_size))
++                const feedStatus = __vjParser.feed(chunk);
++                if (feedStatus === "complete" || feedStatus === "end_early") {
++                  const vjValue = __vjParser.getValue();
++                  const currentObjectJson = __vj.materialize(vjValue);
++                  if (currentObjectJson !== void 0 && !isDeepEqualData(latestObjectJson, currentObjectJson)) {
++                    const validationResult = await outputStrategy.validatePartialResult({
++                      value: currentObjectJson,
++                      textDelta,
++                      latestObject,
++                      isFirstDelta,
++                      isFinalDelta: true
+                     });
+-                    textDelta = "";
+-                    isFirstDelta = false;
++                    if (validationResult.success && !isDeepEqualData(
++                      latestObject,
++                      validationResult.value.partial
++                    )) {
++                      latestObjectJson = currentObjectJson;
++                      latestObject = validationResult.value.partial;
++                      controller.enqueue({
++                        type: "object",
++                        object: latestObject
++                      });
++                      controller.enqueue({
++                        type: "text-delta",
++                        textDelta: validationResult.value.textDelta
++                      });
++                      textDelta = "";
++                      isFirstDelta = false;
++                    }
+                   }
+                 }
+                 return;
+@@ -10361,6 +10375,8 @@
+             },
+             // invoke onFinish callback and resolve toolResults promise when the stream is about to close:
+             async flush(controller) {
++              // VectorJSON: clean up the streaming parser
++              __vjParser.destroy();
+               try {
+                 const finalUsage = usage != null ? usage : {
+                   promptTokens: NaN,
