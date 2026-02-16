@@ -20,6 +20,9 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install
+        run: bun install
+
       - name: Build
         run: bun run build
 
@@ -39,6 +42,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+
+      - name: Install
+        run: bun install
 
       - name: Build
         run: bun run build
