@@ -593,11 +593,7 @@ export async function init(options?: {
           },
           toJSON(): unknown {
             if (_toJSONCached) return _toJSONCache;
-            if (toJSONStr !== undefined) {
-              _toJSONCache = JSON.parse(toJSONStr);
-            } else {
-              _toJSONCache = value;
-            }
+            _toJSONCache = toJSONStr !== undefined ? JSON.parse(toJSONStr) : value;
             _toJSONCached = true;
             return _toJSONCache;
           },
