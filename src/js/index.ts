@@ -244,6 +244,21 @@ export async function init(options?: {
   let keyBufPtr = 0;
   let keyBufCap = 0;
 
+  // --- Reusable feed buffer — avoids alloc/dealloc per stream chunk ---
+  let feedBufPtr = 0;
+  let feedBufCap = 0;
+
+  function ensureFeedBuffer(needed: number): number {
+    if (needed <= feedBufCap) return feedBufPtr;
+    if (feedBufPtr !== 0) engine.dealloc(feedBufPtr, feedBufCap);
+    let cap = feedBufCap === 0 ? 4096 : feedBufCap;
+    while (cap < needed) cap *= 2;
+    feedBufPtr = engine.alloc(cap);
+    if (feedBufPtr === 0) throw new Error("VectorJSON: Failed to allocate feed buffer");
+    feedBufCap = cap;
+    return feedBufPtr;
+  }
+
   function writeKeyToMemory(str: string): { ptr: number; len: number } {
     if (str.length === 0) return { ptr: 1, len: 0 };
     const maxBytes = str.length * 3;
@@ -724,22 +739,22 @@ export async function init(options?: {
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
           if (destroyed) throw new Error("Parser already destroyed");
-          const bytes =
-            typeof chunk === "string" ? encoder.encode(chunk) : chunk;
-          const len = bytes.byteLength;
-          if (len === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-
-          // Allocate in engine memory and copy the chunk
-          const ptr = engine.alloc(len);
-          if (ptr === 0) throw new Error("VectorJSON: allocation failed");
-
-          try {
-            new Uint8Array(engine.memory.buffer, ptr, len).set(bytes);
-            const status = engine.stream_feed(streamId, ptr, len);
-            return FEED_STATUS[status] || "error";
-          } finally {
-            engine.dealloc(ptr, len);
+          let ptr: number;
+          let len: number;
+          if (typeof chunk === "string") {
+            if (chunk.length === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+            const maxBytes = chunk.length * 3;
+            ptr = ensureFeedBuffer(maxBytes);
+            const result = encoder.encodeInto(chunk, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+            len = result.written!;
+          } else {
+            len = chunk.byteLength;
+            if (len === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+            ptr = ensureFeedBuffer(len);
+            new Uint8Array(engine.memory.buffer, ptr, len).set(chunk);
           }
+          const status = engine.stream_feed(streamId, ptr, len);
+          return FEED_STATUS[status] || "error";
         },
 
         getValue(): unknown {
