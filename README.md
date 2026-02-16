@@ -104,6 +104,21 @@ Apple-to-apple: both sides produce a materialized partial object on every chunk.
 
 Stock parsers re-parse the full buffer on every chunk — O(n²). VectorJSON maintains a **live JS object** that grows incrementally on each `feed()`, so `getValue()` is O(1). Total work: O(n).
 
+### Why this matters: main thread availability
+
+The real cost isn't just CPU time — it's blocking the agent's main thread. Simulating an Anthropic `tool_use` content block (`str_replace_editor`) streamed in ~12-char chunks:
+
+`bun --expose-gc bench/time-to-first-action.mjs`
+
+| Payload | Stock total | VectorJSON total | Main thread freed |
+|---------|-----------|-----------------|-------------------|
+| 10 KB | 24 ms | 1 ms | 23 ms sooner |
+| 100 KB | 1.5 s | 3 ms | **1.5 seconds sooner** |
+| 500 KB | 39 s | 29 ms | **39 seconds sooner** |
+| 1 MB | 2 min 41 s | 44 ms | **161 seconds sooner** |
+
+Both approaches detect the tool name (`.name`) at the same chunk — the LLM hasn't streamed more yet. But while VectorJSON finishes processing all chunks in milliseconds, the stock parser blocks the main thread for the entire duration. The agent can't render UI, stream code to the editor, or start running tools until parsing is done.
+
 For even more control, use `createEventParser()` for field-level subscriptions or only call `getValue()` once when `feed()` returns `"complete"`.
 
 <details>

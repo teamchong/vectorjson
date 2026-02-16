@@ -59,7 +59,39 @@ jobs:
         run: cd bench/ai-parsers && bun install
 
       - name: Benchmark — Parse & Stream
-        run: bun --expose-gc bench/parse-stream.mjs
+        run: |
+          bun --expose-gc bench/parse-stream.mjs 2>&1 | tee /tmp/bench-parse.txt
+
+      - name: Benchmark — Time to First Action
+        run: |
+          bun --expose-gc bench/time-to-first-action.mjs 2>&1 | tee /tmp/bench-ttfa.txt
 
       - name: Benchmark — AI SDK Comparison
-        run: cd bench/ai-parsers && bun --expose-gc bench.mjs
+        run: |
+          cd bench/ai-parsers && bun --expose-gc bench.mjs 2>&1 | tee /tmp/bench-ai.txt
+
+      - name: Post benchmark results to summary
+        if: always()
+        run: |
+          echo '## Benchmark Results' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Parse & Stream</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench-parse.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output'>> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Time to First Action</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench-ttfa.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>AI SDK Comparison</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench-ai.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
