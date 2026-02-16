@@ -84,7 +84,7 @@ export fn stream_get_status(id: i32) i32 {
 
 export fn stream_get_buffer_ptr(id: i32) u32 {
     const s = getStream(id) orelse return 0;
-    return @intFromPtr(s.getBuffer().ptr);
+    return @intFromPtr(s.getBufferPtr());
 }
 
 export fn stream_get_value_len(id: i32) u32 {

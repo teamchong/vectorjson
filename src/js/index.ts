@@ -704,9 +704,7 @@ export async function init(options?: {
     },
 
     parsePartialJson(input: string): PartialJsonResult {
-      if (!input || input.trim().length === 0) {
-        return { value: undefined, state: "failed-parse" };
-      }
+      if (!input) return { value: undefined, state: "failed-parse" };
       const result = _instance!.parse(input);
       switch (result.status) {
         case "complete":
@@ -714,7 +712,6 @@ export async function init(options?: {
           return { value: result.toJSON(), state: "successful-parse" };
         case "incomplete":
           return { value: result.toJSON(), state: "repaired-parse" };
-        case "invalid":
         default:
           return { value: undefined, state: "failed-parse" };
       }

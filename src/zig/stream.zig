@@ -1,8 +1,7 @@
 ///! VectorJSON Streaming Parser
 ///!
-///! Lightweight streaming layer that accumulates JSON chunks in linear memory,
-///! tracks JSON structural completeness (brackets, braces, string state),
-///! and maintains a path stack for path-based queries.
+///! Lightweight streaming layer that accumulates JSON chunks in linear memory
+///! and tracks JSON structural completeness (brackets, braces, string state).
 ///!
 ///! Design: each byte is scanned once for structure tracking (O(n) total).
 ///! Actual parsing via zimdjson's FullParser happens lazily when values are queried.
@@ -35,7 +34,6 @@ pub const StreamState = struct {
 
     // --- Status ---
     status: FeedStatus = .incomplete,
-    error_offset: u32 = 0,
     remaining_offset: u32 = 0,
 
     // Root value tracking
@@ -156,7 +154,6 @@ pub const StreamState = struct {
                     }
                     if (self.depth < 0) {
                         self.status = .err;
-                        self.error_offset = i;
                         self.scan_offset = i + 1;
                         return;
                     }
@@ -213,11 +210,8 @@ pub const StreamState = struct {
         self.remaining_offset = end_offset;
     }
 
-    pub fn getBuffer(self: *StreamState) struct { ptr: [*]const u8, len: u32 } {
-        return .{
-            .ptr = self.buffer orelse @as([*]const u8, @ptrFromInt(1)),
-            .len = self.buffer_len,
-        };
+    pub fn getBufferPtr(self: *StreamState) [*]const u8 {
+        return self.buffer orelse @ptrFromInt(1);
     }
 
     /// Get the length of the complete JSON value (excluding trailing data).
