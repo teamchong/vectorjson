@@ -12,6 +12,9 @@
  *   bun examples/anthropic-tool-call.ts --mock
  *   bun examples/anthropic-tool-call.ts          # auto-mocks when no key set
  *
+ *   # Early abort demo:
+ *   bun examples/anthropic-tool-call.ts --mock --wrong-tool
+ *
  * What this shows:
  *   1. Raw fetch() to Anthropic Messages API with streaming + tool use
  *   2. SSE frame parsing to extract `input_json_delta` chunks
@@ -36,8 +39,13 @@ if (USE_MOCK && !process.argv.includes("--mock")) {
   );
 }
 
-const EXPECTED_TOOL = "str_replace_editor";
+const WRONG_TOOL_MODE = process.argv.includes("--wrong-tool");
+const EXPECTED_TOOL = WRONG_TOOL_MODE ? "nonexistent_tool" : "str_replace_editor";
 const MODEL = "claude-sonnet-4-20250514";
+
+if (WRONG_TOOL_MODE) {
+  console.log("⚡ --wrong-tool mode: expecting \"nonexistent_tool\" to trigger early abort\n");
+}
 
 // ─────────────────────────────────────────────────────────
 // SSE types

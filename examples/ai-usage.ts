@@ -211,6 +211,9 @@ async function openaiStreamExample(vj: VectorJSON) {
 // 4. Anthropic Messages — streaming SSE
 // ─────────────────────────────────────────────────────────
 //
+// 👉 For a **runnable** version with EventParser field-level streaming,
+//    early abort, and mock mode, see: examples/anthropic-tool-call.ts
+//
 // Wire format:
 //   event: message_start
 //   data: {"type":"message_start","message":{"id":"msg_...","model":"claude-3-opus-20240229",...}}

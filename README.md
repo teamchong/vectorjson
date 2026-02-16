@@ -520,6 +520,25 @@ const vj = await init({ engineWasm: wasmBytes });
 
 Bundle size: ~92 KB WASM + ~20 KB JS (~37 KB gzipped total). No runtime dependencies.
 
+## Runnable Examples
+
+The `examples/` directory has working demos you can run immediately:
+
+```bash
+# Anthropic tool call — streams fields as they arrive, early abort demo
+bun examples/anthropic-tool-call.ts --mock
+bun examples/anthropic-tool-call.ts --mock --wrong-tool   # early abort
+
+# OpenAI function call — streams function arguments via EventParser
+bun examples/openai-function-call.ts --mock
+
+# With a real API key:
+ANTHROPIC_API_KEY=sk-ant-... bun examples/anthropic-tool-call.ts
+OPENAI_API_KEY=sk-...       bun examples/openai-function-call.ts
+```
+
+See also `examples/ai-usage.ts` for additional patterns (MCP stdio, Vercel AI SDK `streamObject`, NDJSON embeddings).
+
 ## Building from Source
 
 Requires: [Zig](https://ziglang.org/) 0.15+, [Bun](https://bun.sh/) or Node.js 20+, [Binaryen](https://github.com/WebAssembly/binaryen) (`wasm-opt`).
