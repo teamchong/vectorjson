@@ -218,10 +218,7 @@ pub const StreamState = struct {
     /// For "complete" status, this is the full buffer length.
     /// For "end_early", this is the offset where the first value ends.
     pub fn getValueLen(self: *StreamState) u32 {
-        if (self.status == .end_early) {
-            return self.remaining_offset;
-        }
-        return self.buffer_len;
+        return if (self.status == .end_early) self.remaining_offset else self.buffer_len;
     }
 
     pub fn getRemaining(self: *StreamState) struct { ptr: [*]const u8, len: u32 } {

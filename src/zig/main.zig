@@ -730,11 +730,9 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
             write_pos = strip_to;
         }
         w.append("\"");
-    } else if (after_colon) {
-        w.append("null");
     } else if (after_comma_in_obj) {
         w.append("\"\":null");
-    } else if (after_comma_in_arr) {
+    } else if (after_colon or after_comma_in_arr) {
         w.append("null");
     }
 
