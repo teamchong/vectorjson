@@ -127,7 +127,7 @@ async function run() {
   }
 
   console.log("\n╔══════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║                Deep Compare Benchmark — Equal Objects                       ║");
+  console.log("║                Deep Compare Benchmark — Equal Objects                        ║");
   console.log("╚══════════════════════════════════════════════════════════════════════════════╝\n");
 
   for (const name of fixtures) {
@@ -166,7 +166,7 @@ async function run() {
   // Compare with differences
   // ==============================================
   console.log("╔══════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║              Deep Compare Benchmark — With Differences                      ║");
+  console.log("║              Deep Compare Benchmark — With Differences                       ║");
   console.log("╚══════════════════════════════════════════════════════════════════════════════╝\n");
 
   for (const name of ["medium", "large"]) {

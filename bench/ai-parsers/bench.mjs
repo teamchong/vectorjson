@@ -335,14 +335,14 @@ async function main() {
   try { anthropicPatched = (await Bun.file("./node_modules/@anthropic-ai/sdk/lib/MessageStream.mjs").text()).includes("__vjParsers"); } catch {}
   try { tanstackPatched = (await Bun.file("./node_modules/@tanstack/ai/dist/esm/activities/chat/stream/processor.js").text()).includes("__vjParsers"); } catch {}
 
-  console.log("╔══════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║   AI SDK Streaming JSON Benchmark — Stock vs VectorJSON                      ║");
-  console.log("║                                                                              ║");
+  console.log("╔═════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║   AI SDK Streaming JSON Benchmark — Stock vs VectorJSON                     ║");
+  console.log("║                                                                             ║");
   console.log("║   Stock: buffer += chunk; parse(buffer)   ← O(n²) re-parse entire buffer    ║");
   console.log("║   VJ:    parser.feed(chunk)                ← O(n) scan only new bytes       ║");
-  console.log("║                                                                              ║");
-  console.log("║   ~12 chars/chunk (typical LLM token size).                                  ║");
-  console.log("╚══════════════════════════════════════════════════════════════════════════════╝");
+  console.log("║                                                                             ║");
+  console.log("║   ~12 chars/chunk (typical LLM token size).                                 ║");
+  console.log("╚═════════════════════════════════════════════════════════════════════════════╝");
 
   // ── Patch status ──────────────────────────────────────
   console.log(`\n  Patch status (real SDK pipelines modified in node_modules):`);
@@ -393,10 +393,10 @@ async function main() {
   // This isolates the JSON parsing cost with zero pipeline overhead.
   // ═══════════════════════════════════════════════════════
 
-  console.log("\n╔══════════════════════════════════════════════════════════════════════════════╗");
+  console.log("\n╔═════════════════════════════════════════════════════════════════════════════╗");
   console.log("║   Parser Benchmark: buffer += chunk; parse(buffer) vs parser.feed(chunk)    ║");
   console.log("║   Apple-to-apple — same loop, only the parser function differs.             ║");
-  console.log("╚══════════════════════════════════════════════════════════════════════════════╝");
+  console.log("╚═════════════════════════════════════════════════════════════════════════════╝");
 
   const sizes = [1, 5, 10, 50, 100];
 

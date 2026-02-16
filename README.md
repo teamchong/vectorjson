@@ -1,6 +1,8 @@
 # VectorJSON
 
-O(n) WASM SIMD streaming JSON parser for LLM tool calls. Stream code to editors character-by-character, react to fields as they arrive, skip what you don't need.
+[![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
+
+O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Feed chunks as they arrive from the model, read partial values without re-parsing.
 
 ## The Problem
 
@@ -15,7 +17,7 @@ Your agent UI needs to:
 2. **Stream code to the editor character-by-character** — not wait for the full response
 3. **Skip the explanation** — the user doesn't need it rendered in real-time
 
-**No SDK lets you do this today.** Every AI SDK — Vercel, Anthropic, TanStack, OpenClaw — re-parses the *entire accumulated buffer* on every token:
+Current AI SDKs — Vercel, Anthropic, TanStack, OpenClaw — re-parse the *entire accumulated buffer* on every token:
 
 ```js
 // What every AI SDK actually does internally
@@ -25,11 +27,11 @@ for await (const chunk of stream) {
 }
 ```
 
-A 50KB tool call streamed in ~12-char chunks = **~4,000 full re-parses**. That's O(n²) CPU. At 100KB, Vercel AI SDK takes **4.2 seconds**. Anthropic SDK takes **9.2 seconds**. Your UI is frozen the entire time.
+A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n²). At 100KB, Vercel AI SDK spends 4.1 seconds just parsing. Anthropic SDK spends 9.3 seconds.
 
-## The Fix
+## Quick Start
 
-**Drop-in replacement** — swap one function call, get 900-2000× faster parsing:
+Drop-in replacement for your SDK's partial JSON parser:
 
 ```js
 import { init } from "vectorjson";
@@ -38,14 +40,14 @@ const vj = await init();
 // Before (JS parser — what your SDK does today):
 for await (const chunk of stream) {
   buffer += chunk;
-  result = parsePartialJson(buffer); // JS re-parse: 4.2s at 100KB
+  result = parsePartialJson(buffer); // re-parses entire buffer every time
 }
 
 // After (VectorJSON — O(n) live document builder):
 const parser = vj.createParser();
 for await (const chunk of stream) {
   parser.feed(chunk);
-  result = parser.getValue();        // O(1) — returns live object: 4.6ms at 100KB
+  result = parser.getValue();        // O(1) — returns live object
 }
 parser.destroy();
 ```
@@ -107,16 +109,23 @@ For even more control, use `createEventParser()` for field-level subscriptions o
 <details>
 <summary>Which products use which parser</summary>
 
-| Product | Original Parser | Patched With |
-|---------|----------------|-------------|
+| Product | Stock Parser | With VectorJSON |
+|---------|-------------|----------------|
 | Vercel AI SDK | `fixJson` + `JSON.parse` — O(n²) | `createParser().feed()` + `getValue()` |
 | OpenCode | Vercel AI SDK (`streamText()`) — O(n²) | `createParser().feed()` + `getValue()` |
 | TanStack AI | `partial-json` npm — O(n²) | `createParser().feed()` + `getValue()` |
-| OpenClaw | pi-ai → `partial-json` npm — O(n²) | `createParser().feed()` + `getValue()` |
+| OpenClaw | `partial-json` npm — O(n²) | `createParser().feed()` + `getValue()` |
 | Anthropic SDK | vendored `partial-json-parser` — O(n²) | `createParser().feed()` + `getValue()` |
-| Claude Code | Anthropic SDK (`partialParse`) — O(n²) | `createParser().feed()` + `getValue()` |
 
 </details>
+
+## How It Works
+
+VectorJSON compiles [simdjson](https://simdjson.org/) (a SIMD-accelerated JSON parser written in C++) to WebAssembly via Zig. The WASM module does the byte-level parsing — finding structural characters, validating UTF-8, building a tape of tokens — while a thin JS layer provides the streaming API, lazy Proxy materialization, and event dispatch.
+
+The streaming parser (`createParser`) accumulates chunks in a WASM-side buffer and re-runs the SIMD parse on the full buffer each `feed()`. This sounds similar to re-parsing, but the difference is: the parse itself runs at SIMD speed inside WASM (~1 GB/s), while JS-based parsers run at ~50 MB/s. The JS object returned by `getValue()` is a live Proxy that reads directly from the WASM tape — no intermediate object allocation.
+
+The event parser (`createEventParser`) adds path-matching on top: it diffs the tape between feeds to detect new/changed values and fires callbacks only for subscribed paths.
 
 ## Install
 
@@ -422,7 +431,7 @@ const wasmBytes = await fetch('/engine.wasm').then(r => r.arrayBuffer());
 const vj = await init({ engineWasm: wasmBytes });
 ```
 
-Bundle size: ~92 KB WASM + ~20 KB JS (~51 KB gzipped total). No runtime dependencies.
+Bundle size: ~92 KB WASM + ~20 KB JS (~37 KB gzipped total). No runtime dependencies.
 
 ## Building from Source
 
@@ -430,10 +439,17 @@ Requires: [Zig](https://ziglang.org/) 0.15+, [Bun](https://bun.sh/) or Node.js 2
 
 ```bash
 bun run build        # Zig → WASM → wasm-opt → TypeScript
-bun test
-bun run bench:ai     # AI SDK parser comparison
-bun run bench:parse  # Parse + streaming benchmarks
+bun run test         # 557 tests including 100MB stress payloads
 ```
+
+To reproduce benchmarks:
+
+```bash
+bun --expose-gc bench/parse-stream.mjs           # one-shot + streaming parse
+cd bench/ai-parsers && bun install && bun --expose-gc bench.mjs  # AI SDK comparison
+```
+
+Benchmark numbers in this README were measured on an Apple M-series Mac. Results vary by machine but relative speedups are consistent.
 
 ## License
 

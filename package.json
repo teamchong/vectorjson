@@ -32,7 +32,8 @@
     "bench": "bun --expose-gc bench/parse-stream.mjs",
     "bench:parse": "bun --expose-gc bench/parse-stream.mjs",
     "bench:e2e": "bun --expose-gc bench/end-to-end.mjs",
-    "bench:ai": "cd bench/ai-parsers && bun --expose-gc bench.mjs"
+    "bench:ai": "cd bench/ai-parsers && bun --expose-gc bench.mjs",
+    "prepublishOnly": "bun run build"
   },
   "keywords": [
     "json",
