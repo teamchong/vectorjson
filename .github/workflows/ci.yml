@@ -32,6 +32,12 @@ jobs:
       - name: Test
         run: bun run test
 
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Test — Worker Transferable (Playwright)
+        run: npx playwright test --config test/browser/playwright.config.ts
+
   benchmark:
     runs-on: ubuntu-latest
     needs: test
@@ -60,15 +66,22 @@ jobs:
 
       - name: Benchmark — Parse & Stream
         run: |
-          bun --expose-gc bench/parse-stream.mjs 2>&1 | tee /tmp/bench-parse.txt
+          timeout 300 bun --expose-gc bench/parse-stream.mjs 2>&1 | tee /tmp/bench-parse.txt || echo '⏱ Exceeded 5 min timeout' >> /tmp/bench-parse.txt
 
       - name: Benchmark — Time to First Action
         run: |
-          bun --expose-gc bench/time-to-first-action.mjs 2>&1 | tee /tmp/bench-ttfa.txt
+          timeout 300 bun --expose-gc bench/time-to-first-action.mjs 2>&1 | tee /tmp/bench-ttfa.txt || echo '⏱ Exceeded 5 min timeout' >> /tmp/bench-ttfa.txt
 
       - name: Benchmark — AI SDK Comparison
         run: |
-          cd bench/ai-parsers && bun --expose-gc bench.mjs 2>&1 | tee /tmp/bench-ai.txt
+          cd bench/ai-parsers && timeout 300 bun --expose-gc bench.mjs 2>&1 | tee /tmp/bench-ai.txt || echo '⏱ Exceeded 5 min timeout' >> /tmp/bench-ai.txt
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Benchmark — Worker Transfer vs Clone (Playwright)
+        run: |
+          npx playwright test --config bench/browser/playwright.config.ts 2>&1 | tee /tmp/bench-worker.txt || true
 
       - name: Post benchmark results to summary
         if: always()
@@ -93,5 +106,12 @@ jobs:
           echo '' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat /tmp/bench-ai.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Worker Transfer vs Clone (Browser)</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench-worker.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo '</details>' >> $GITHUB_STEP_SUMMARY

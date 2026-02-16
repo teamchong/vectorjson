@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
 
-O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents start acting on partial data immediately, detect wrong outputs early to abort and save tokens, and never block the main thread.
+O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and never block the main thread — Worker + transferable ArrayBuffer = O(1) transfer.
 
 ## The Problem
 
@@ -100,6 +100,23 @@ for await (const chunk of llmStream({ signal: abort.signal })) {
 }
 ```
 
+**Worker transfer** — never block the main thread, even for large payloads:
+
+Moving `JSON.parse` to a Worker doesn't eliminate O(n) cost — `postMessage(obj)` uses the structured clone algorithm, which walks every property. VectorJSON's `getRawBuffer()` returns flat bytes that transfer in O(1):
+
+```js
+// In Worker:
+parser.feed(chunk);
+const buf = parser.getRawBuffer();
+postMessage(buf, [buf]); // O(1) transfer — moves pointer, no copy
+
+// On Main thread:
+const result = vj.parse(new Uint8Array(buf)); // lazy Proxy
+result.value.name; // only materializes what you touch
+```
+
+Even non-streaming `vj.parse()` benefits from this pattern — parse in a Worker, transfer raw bytes, access lazily on the main thread.
+
 ## Benchmarks
 
 Apple-to-apple: both sides produce a materialized partial object on every chunk. Same payload, same chunks (~12 chars, typical LLM token).
@@ -139,6 +156,12 @@ The real cost isn't just CPU time — it's blocking the agent's main thread. Sim
 Both approaches detect the tool name (`.name`) at the same chunk — the LLM hasn't streamed more yet. But while VectorJSON finishes processing all chunks in milliseconds, the stock parser blocks the main thread for the entire duration. The agent can't render UI, stream code to the editor, or start running tools until parsing is done.
 
 For even more control, use `createEventParser()` for field-level subscriptions or only call `getValue()` once when `feed()` returns `"complete"`.
+
+### Worker Transfer: O(1) vs O(n) structured clone
+
+`bun run bench:worker` (requires Playwright + Chromium)
+
+Measures Worker→Main thread transfer pipeline in a real browser. VectorJSON's `getRawBuffer()` produces a transferable ArrayBuffer — `postMessage(buf, [buf])` moves the backing store pointer in O(1), while `JSON.parse` results require O(n) structured clone.
 
 <details>
 <summary>Which products use which parser</summary>
@@ -366,6 +389,7 @@ interface StreamingParser<T = unknown> {
   feed(chunk: Uint8Array | string): FeedStatus;
   getValue(): T | undefined;  // autocompleted partial while incomplete, final when complete
   getRemaining(): Uint8Array | null;
+  getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
   getStatus(): FeedStatus;
   destroy(): void;
 }
@@ -418,6 +442,7 @@ interface EventParser {
   feed(chunk: string | Uint8Array): FeedStatus;
   getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
   getRemaining(): Uint8Array | null;
+  getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
   getStatus(): FeedStatus;
   destroy(): void;
 }
@@ -504,6 +529,7 @@ sudo apt-get install -y binaryen
 ```bash
 bun run build        # Zig → WASM → wasm-opt → TypeScript
 bun run test         # 557 tests including 100MB stress payloads
+bun run test:worker  # Worker transferable tests (Playwright + Chromium)
 ```
 
 To reproduce benchmarks:
@@ -511,6 +537,7 @@ To reproduce benchmarks:
 ```bash
 bun --expose-gc bench/parse-stream.mjs           # one-shot + streaming parse
 cd bench/ai-parsers && bun install && bun --expose-gc bench.mjs  # AI SDK comparison
+bun run bench:worker                             # Worker transfer vs structured clone benchmark
 ```
 
 Benchmark numbers in this README were measured on an Apple M-series Mac. Results vary by machine but relative speedups are consistent.

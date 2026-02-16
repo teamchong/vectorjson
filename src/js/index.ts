@@ -50,6 +50,8 @@ export interface StreamingParser<T = unknown> {
   getRemaining(): Uint8Array | null;
   /** Get the current status without feeding data. */
   getStatus(): FeedStatus;
+  /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
+  getRawBuffer(): ArrayBuffer | null;
   /** Destroy the parser and free all resources. */
   destroy(): void;
 }
@@ -106,6 +108,8 @@ export interface EventParser {
   getValue(): unknown | undefined;
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
+  /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
+  getRawBuffer(): ArrayBuffer | null;
   destroy(): void;
 }
 
@@ -1559,6 +1563,16 @@ export async function init(options?: {
           return FEED_STATUS[engine.stream_get_status(streamId)] || "error";
         },
 
+        getRawBuffer(): ArrayBuffer | null {
+          if (destroyed) return null;
+          const bufPtr = engine.stream_get_buffer_ptr(streamId) >>> 0;
+          const bufLen = engine.stream_get_buffer_len(streamId);
+          if (bufLen === 0) return null;
+          const copy = new ArrayBuffer(bufLen);
+          new Uint8Array(copy).set(new Uint8Array(engine.memory.buffer, bufPtr, bufLen));
+          return copy;
+        },
+
         destroy(): void {
           if (!destroyed) {
             engine.stream_destroy(streamId);
@@ -1894,6 +1908,16 @@ export async function init(options?: {
           if (destroyed) return "error";
           const status = engine.stream_get_status(streamId);
           return FEED_STATUS[status] || "error";
+        },
+
+        getRawBuffer(): ArrayBuffer | null {
+          if (destroyed) return null;
+          const bufPtr = engine.stream_get_buffer_ptr(streamId) >>> 0;
+          const bufLen = engine.stream_get_buffer_len(streamId);
+          if (bufLen === 0) return null;
+          const copy = new ArrayBuffer(bufLen);
+          new Uint8Array(copy).set(new Uint8Array(engine.memory.buffer, bufPtr, bufLen));
+          return copy;
         },
 
         destroy(): void {
