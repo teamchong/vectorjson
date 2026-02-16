@@ -30,23 +30,16 @@ for await (const chunk of stream) {
 }
 ```
 
-A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n²). At 100KB, Vercel AI SDK spends 4.1 seconds just parsing. Anthropic SDK spends 9.3 seconds.
+A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n²). At 100KB, Vercel AI SDK spends 5.6 seconds just parsing. Anthropic SDK spends 12.7 seconds.
 
 ## Quick Start
 
-Drop-in replacement for your SDK's partial JSON parser:
+O(n) streaming JSON parser — feed chunks, get a live object:
 
 ```js
 import { init } from "vectorjson";
 const vj = await init();
 
-// Before (JS parser — what your SDK does today):
-for await (const chunk of stream) {
-  buffer += chunk;
-  result = parsePartialJson(buffer); // re-parses entire buffer every time
-}
-
-// After (VectorJSON — O(n) live document builder):
 const parser = vj.createParser();
 for await (const chunk of stream) {
   parser.feed(chunk);
@@ -201,9 +194,9 @@ yarn add vectorjson
 
 ## Usage
 
-### Drop-in: Replace your SDK's partial JSON parser
+### Streaming parse
 
-Every AI SDK has a `parsePartialJson` function that re-parses the full buffer on every chunk. Replace it with VectorJSON's streaming parser:
+Feed chunks as they arrive from any source — raw fetch, WebSocket, SSE, or your own transport:
 
 ```js
 import { init } from "vectorjson";
@@ -218,7 +211,9 @@ const result = parser.getValue(); // lazy Proxy — materializes on access
 parser.destroy();
 ```
 
-Or use the Vercel AI SDK-compatible signature as a 1-line swap:
+### Vercel AI SDK-compatible signature
+
+If you have code that calls `parsePartialJson`, VectorJSON provides a compatible function:
 
 ```js
 // Before
@@ -230,6 +225,8 @@ import { init } from "vectorjson";
 const vj = await init();
 const { value, state } = vj.parsePartialJson(buffer);
 ```
+
+> **Note:** AI SDKs (Vercel, Anthropic, TanStack) parse JSON internally inside `streamObject()`, `MessageStream`, etc. — you don't get access to the raw chunks. To use VectorJSON today, either work with the raw LLM stream directly or wait for SDKs to adopt VectorJSON upstream. We're working on PRs to the major SDKs.
 
 ### Event-driven: React to fields as they stream in
 
