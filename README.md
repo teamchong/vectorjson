@@ -1,83 +1,103 @@
 # VectorJSON
 
-O(n) WASM SIMD streaming JSON parser. Parses incomplete JSON, returns lazy proxies, tracks what's real vs autocompleted.
+O(n) WASM SIMD streaming JSON parser for LLM tool calls. Stream code to editors character-by-character, react to fields as they arrive, skip what you don't need.
 
-## Why
+## The Problem
 
-**1. `buffer += chunk` creates garbage faster than GC collects it.**
-Every concat allocates a new string. The old one is garbage. Longer responses = bigger garbage, arriving faster than GC can free it.
+When an LLM writes code via a tool call, it streams JSON like this:
 
-**2. You can't act on partial data.**
-LLM generates 100 tasks in a JSON array — you want to start on task 1 immediately. Current parsers fail on incomplete JSON or force full materialization. VectorJSON returns lazy proxies on truncated input; `isComplete()` tells you what's real vs autocompleted.
+```json
+{"tool":"file_edit","path":"app.ts","code":"function hello() {\n  ...5KB of code...\n}","explanation":"I refactored the..."}
+```
 
-**3. O(n²) re-parsing on every chunk.**
-Every AI SDK re-parses the full buffer on every chunk:
+Your agent UI needs to:
+1. **Show the tool name immediately** — so the user sees "Editing app.ts" before the code arrives
+2. **Stream code to the editor character-by-character** — not wait for the full response
+3. **Skip the explanation** — the user doesn't need it rendered in real-time
+
+**No SDK lets you do this today.** Every AI SDK — Vercel, Anthropic, TanStack, OpenClaw — re-parses the *entire accumulated buffer* on every token:
 
 ```js
-// What Vercel AI SDK, Anthropic SDK, and TanStack AI actually do
+// What every AI SDK actually does internally
 for await (const chunk of stream) {
   buffer += chunk;
   result = parsePartialJson(buffer); // re-parses ENTIRE buffer every chunk
 }
 ```
 
-For a 100KB response in 12-char chunks, that's ~8,500 full parses — O(n²) CPU time.
+A 50KB tool call streamed in ~12-char chunks = **~4,000 full re-parses**. That's O(n²) CPU. At 100KB, Vercel AI SDK takes **3.7 seconds**. Anthropic SDK takes **8.8 seconds**. Your UI is frozen the entire time.
 
-**VectorJSON:**
+## The Fix
+
+**Drop-in replacement** — swap one function call, everything else stays the same:
 
 ```js
-// O(n) streaming — each feed() processes only new bytes
+import { init } from "vectorjson";
+const vj = await init();
+
+// Before (O(n²) — what your SDK does today):
+for await (const chunk of stream) {
+  buffer += chunk;
+  result = parsePartialJson(buffer); // 3.7s at 100KB
+}
+
+// After (O(n) — only new bytes processed):
 const parser = vj.createParser();
 for await (const chunk of stream) {
-  const s = parser.feed(chunk);
+  const s = parser.feed(chunk);      // 2.3ms at 100KB
   if (s === "complete" || s === "end_early") break;
 }
-const result = parser.getValue(); // lazy Proxy — zero-copy access
+const result = parser.getValue();
 parser.destroy();
 ```
 
+**Event-driven** — react to fields as they arrive instead of polling the whole object:
+
 ```js
-// Act on elements as they arrive — don't wait for the full array
-let next = 0;
-for await (const chunk of stream) {
-  buffer += chunk;
-  const result = vj.parse(buffer);
-  const tasks = result.value.tasks;
-  if (result.status === "complete" || result.status === "complete_early") {
-    for (; next < tasks.length; next++) execute(tasks[next]);
-    break;
-  }
-  while (tasks[next] !== undefined && result.isComplete(tasks[next])) {
-    execute(tasks[next++]);
-  }
+const parser = vj.createEventParser();
+
+parser.on('tool', (e) => showToolUI(e.value));             // fires immediately
+parser.onDelta('code', (e) => editor.append(e.value));      // streams char-by-char
+parser.skip('explanation');                                  // never materialized
+
+for await (const chunk of llmStream) {
+  parser.feed(chunk);  // O(n) — only new bytes scanned
 }
+parser.destroy();
 ```
 
 ## Benchmarks
 
-~12 chars/chunk, parser called after every chunk (what AI SDKs actually do).
+Each product benchmarked twice: original parser, then patched with VectorJSON. Same payload, same chunks (~12 chars, typical LLM token).
 
 `bun --expose-gc bench/ai-parsers/bench.mjs`
 
-| Payload | Vercel AI SDK | Anthropic SDK | TanStack AI | VectorJSON | Speedup |
-|---------|--------------|---------------|-------------|------------|---------|
-| 1 KB    | 1.4 ms       | 1.5 ms        | 1.6 ms      | 0.3 ms     | 3–5×    |
-| 5 KB    | 13 ms        | 24 ms         | 24 ms       | 0.3 ms     | 38–71×  |
-| 10 KB   | 49 ms        | 97 ms         | 96 ms       | 0.6 ms     | 80–160× |
-| 50 KB   | 1,162 ms     | 2,653 ms      | 2,491 ms    | 4.0 ms     | 292–686×  |
-| 100 KB  | 4,224 ms     | 9,191 ms      | 7,294 ms    | 4.4 ms     | 933–2,195× |
+| Payload | Product | Original | + VectorJSON | Speedup |
+|---------|---------|----------|-------------|---------|
+| 1 KB | Vercel AI SDK | 2.0 ms | 0.1 ms | 15× |
+| | TanStack AI | 1.5 ms | 0.04 ms | 35× |
+| | OpenClaw | 1.7 ms | 0.04 ms | 46× |
+| | Anthropic SDK | 1.9 ms | 0.09 ms | 20× |
+| 10 KB | Vercel AI SDK | 48 ms | 0.2 ms | 238× |
+| | TanStack AI | 93 ms | 0.2 ms | 422× |
+| | OpenClaw | 104 ms | 0.4 ms | 272× |
+| | Anthropic SDK | 92 ms | 0.2 ms | 445× |
+| 100 KB | Vercel AI SDK | 3.7 s | 2.3 ms | 1,624× |
+| | TanStack AI | 6.5 s | 2.3 ms | 2,775× |
+| | OpenClaw | 7.7 s | 2.4 ms | 3,251× |
+| | Anthropic SDK | 8.8 s | 2.8 ms | 3,145× |
 
 <details>
 <summary>Which products use which parser</summary>
 
-| Product | Parser | Complexity |
-|---------|--------|------------|
-| Vercel AI SDK | `fixJson` + `JSON.parse` | O(n²) |
-| OpenCode | Vercel AI SDK (`streamText()`) | O(n²) |
-| TanStack AI | `partial-json` npm | O(n²) |
-| Anthropic SDK | vendored `partial-json-parser` | O(n²) |
-| Claude Code | Anthropic SDK (`partialParse`) | O(n²) |
-| VectorJSON | `createParser().feed()` WASM SIMD | O(n) |
+| Product | Original Parser | Patched With |
+|---------|----------------|-------------|
+| Vercel AI SDK | `fixJson` + `JSON.parse` — O(n²) | `createParser().feed()` — O(n) |
+| OpenCode | Vercel AI SDK (`streamText()`) — O(n²) | `createParser().feed()` — O(n) |
+| TanStack AI | `partial-json` npm — O(n²) | `createParser().feed()` — O(n) |
+| OpenClaw | pi-ai → `partial-json` npm — O(n²) | `createParser().feed()` — O(n) |
+| Anthropic SDK | vendored `partial-json-parser` — O(n²) | `createParser().feed()` — O(n) |
+| Claude Code | Anthropic SDK (`partialParse`) — O(n²) | `createParser().feed()` — O(n) |
 
 </details>
 
@@ -87,31 +107,125 @@ for await (const chunk of stream) {
 npm install vectorjson
 ```
 
-## Quick Start
+## Usage
+
+### Drop-in: Replace your SDK's partial JSON parser
+
+Every AI SDK has a `parsePartialJson` function that re-parses the full buffer on every chunk. Replace it with VectorJSON's streaming parser:
 
 ```js
 import { init } from "vectorjson";
 const vj = await init();
 
-// One-shot
+const parser = vj.createParser();
+for await (const chunk of stream) {
+  const s = parser.feed(chunk);
+  if (s === "complete" || s === "end_early") break;
+}
+const result = parser.getValue(); // lazy Proxy — materializes on access
+parser.destroy();
+```
+
+Or use the Vercel AI SDK-compatible signature as a 1-line swap:
+
+```js
+// Before
+import { parsePartialJson } from "ai";
+const { value, state } = parsePartialJson(buffer);
+
+// After
+import { init } from "vectorjson";
+const vj = await init();
+const { value, state } = vj.parsePartialJson(buffer);
+```
+
+### Event-driven: React to fields as they stream in
+
+When an LLM streams a tool call, you usually care about specific fields at specific times. `createEventParser` lets you subscribe to paths and get notified the moment a value completes or a string grows:
+
+```js
+const parser = vj.createEventParser();
+
+// Get the tool name the moment it's complete
+parser.on('tool_calls[*].name', (e) => {
+  console.log(e.value);   // "search"
+  console.log(e.index);   // 0 (which tool call)
+});
+
+// Stream code to the editor as it arrives
+parser.onDelta('tool_calls[0].args.code', (e) => {
+  editor.append(e.value); // just the new characters, decoded
+});
+
+// Don't waste CPU on fields you don't need
+parser.skip('tool_calls[*].args.explanation');
+
+for await (const chunk of llmStream) {
+  parser.feed(chunk);
+}
+parser.destroy();
+```
+
+### Multi-root / NDJSON
+
+Some LLM APIs stream multiple JSON values separated by newlines. VectorJSON auto-resets between values:
+
+```js
+const parser = vj.createEventParser({
+  multiRoot: true,
+  onRoot(event) {
+    console.log(`Root #${event.index}:`, event.value);
+  }
+});
+
+for await (const chunk of ndjsonStream) {
+  parser.feed(chunk);
+}
+parser.destroy();
+```
+
+### Mixed LLM output (chain-of-thought, code fences)
+
+Some models emit thinking text before JSON, or wrap JSON in code fences. VectorJSON finds the JSON automatically:
+
+```js
+const parser = vj.createEventParser();
+parser.on('answer', (e) => console.log(e.value));
+parser.onText((text) => thinkingPanel.append(text)); // opt-in
+
+// All of these work:
+// <think>reasoning</think>{"answer": 42}
+// ```json\n{"answer": 42}\n```
+// Here's the result:\n{"answer": 42}
+parser.feed(llmOutput);
+```
+
+### Schema validation
+
+Filter events with Zod, Valibot, ArkType, or any lib with `.safeParse()`:
+
+```js
+import { z } from 'zod';
+
+const ToolCall = z.object({ name: z.string(), args: z.record(z.unknown()) });
+
+parser.on('tool_calls[*]', ToolCall, (event) => {
+  event.value.name; // typed as string
+  // Only fires when value passes schema validation
+});
+```
+
+### One-shot parse
+
+For non-streaming use cases:
+
+```js
 const result = vj.parse('{"users": [{"name": "Alice"}]}');
 result.status;       // "complete" | "complete_early" | "incomplete" | "invalid"
 result.value.users;  // lazy Proxy — materializes on access
-
-// Streaming
-const parser = vj.createParser();
-parser.feed('{"hel');
-parser.feed('lo": "wor');
-parser.feed('ld"}');
-console.log(parser.getValue()); // { hello: "world" }
-parser.destroy();
-
-// AI SDK compatible
-const partial = vj.parsePartialJson('{"a": 1, "b": ');
-// { value: { a: 1, b: null }, state: "repaired-parse" }
 ```
 
-## API
+## API Reference
 
 ### `init(options?): Promise<VectorJSON>`
 
@@ -158,6 +272,63 @@ Compatible with Vercel AI SDK's `parsePartialJson` signature. Returns a plain JS
 interface PartialJsonResult {
   value: unknown;
   state: "successful-parse" | "repaired-parse" | "failed-parse";
+}
+```
+
+### `vj.createEventParser(options?): EventParser`
+
+Event-driven streaming parser. Events fire synchronously during `feed()`.
+
+```ts
+interface EventParser {
+  on(path: string, callback: (event: PathEvent) => void): EventParser;
+  on<T>(path: string, schema: { safeParse: Function }, callback: (event: PathEvent & { value: T }) => void): EventParser;
+  onDelta(path: string, callback: (event: DeltaEvent) => void): EventParser;
+  onText(callback: (text: string) => void): EventParser;
+  skip(...paths: string[]): EventParser;
+  off(path: string, callback?: Function): EventParser;
+  feed(chunk: string | Uint8Array): FeedStatus;
+  getValue(): unknown;
+  getRemaining(): Uint8Array | null;
+  getStatus(): FeedStatus;
+  destroy(): void;
+}
+```
+
+All methods return `self` for chaining: `parser.on(...).onDelta(...).skip(...)`.
+
+**Path syntax:**
+- `foo.bar` — exact key
+- `foo[0]` — array index
+- `foo[*]` — any array index (wildcard)
+- `foo.*.bar` — wildcard single segment (any key or index)
+
+**Event types:**
+
+```ts
+interface PathEvent {
+  type: 'value';
+  path: string;           // resolved path: "items.2.name" (concrete indices)
+  value: unknown;         // parsed JS value
+  offset: number;         // byte offset in accumulated buffer
+  length: number;         // byte length of raw value
+  index?: number;         // last wildcard-matched array index
+  key?: string;           // last wildcard-matched object key
+  matches: (string | number)[];  // all wildcard-matched segments
+}
+
+interface DeltaEvent {
+  type: 'delta';
+  path: string;           // resolved path
+  value: string;          // decoded characters (escapes like \n are resolved)
+  offset: number;         // byte offset of delta in buffer (raw bytes)
+  length: number;         // byte length of delta (raw bytes, not char count)
+}
+
+interface RootEvent {
+  type: 'root';
+  index: number;          // which root value (0, 1, 2...)
+  value: unknown;         // parsed via doc_parse
 }
 ```
 

@@ -56,6 +56,50 @@ export interface ParseResult {
   toJSON(): unknown;
 }
 
+// --- EventParser Types ---
+
+/** Compiled path segment: string = key, number = index, '*' = wildcard */
+export type PathSegment = string | number;
+
+export interface PathEvent {
+  type: 'value';
+  path: string;
+  value: unknown;
+  offset: number;
+  length: number;
+  index?: number;
+  key?: string;
+  matches: (string | number)[];
+}
+
+export interface DeltaEvent {
+  type: 'delta';
+  path: string;
+  value: string;
+  offset: number;
+  length: number;
+}
+
+export interface RootEvent {
+  type: 'root';
+  index: number;
+  value: unknown;
+}
+
+export interface EventParser {
+  on(path: string, callback: (event: PathEvent) => void): EventParser;
+  on<T>(path: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }, callback: (event: PathEvent & { value: T }) => void): EventParser;
+  onDelta(path: string, callback: (event: DeltaEvent) => void): EventParser;
+  onText(callback: (text: string) => void): EventParser;
+  skip(...paths: string[]): EventParser;
+  off(path: string, callback?: Function): EventParser;
+  feed(chunk: string | Uint8Array): FeedStatus;
+  getValue(): unknown;
+  getRemaining(): Uint8Array | null;
+  getStatus(): FeedStatus;
+  destroy(): void;
+}
+
 export interface VectorJSON {
   /**
    * Parse a JSON string or Uint8Array into a value.
@@ -103,6 +147,14 @@ export interface VectorJSON {
    * ```
    */
   parsePartialJson(input: string): PartialJsonResult;
+  /**
+   * Create an event-driven streaming parser with path subscriptions,
+   * string delta emission, multi-root support, and JSON boundary detection.
+   */
+  createEventParser(options?: {
+    multiRoot?: boolean;
+    onRoot?: (event: RootEvent) => void;
+  }): EventParser;
 }
 
 // --- Error codes from Zig engine ---
@@ -139,9 +191,10 @@ interface EngineExports {
   doc_get_src_pos(docId: number, index: number): number;
   doc_get_close_index(docId: number, index: number): number;
   doc_find_field(docId: number, objIndex: number, keyPtr: number, keyLen: number): number;
+  doc_get_input_ptr(docId: number): number;
   doc_batch_ptr(): number;
-  doc_array_elements(docId: number, arrIndex: number): number;
-  doc_object_keys(docId: number, objIndex: number): number;
+  doc_array_elements(docId: number, arrIndex: number, resumeAt: number): number;
+  doc_object_keys(docId: number, objIndex: number, resumeAt: number): number;
   stream_create(): number;
   stream_destroy(id: number): void;
   stream_feed(id: number, ptr: number, len: number): number;
@@ -150,6 +203,8 @@ interface EngineExports {
   stream_get_value_len(id: number): number;
   stream_get_remaining_ptr(id: number): number;
   stream_get_remaining_len(id: number): number;
+  stream_get_buffer_len(id: number): number;
+  stream_reset_for_next(id: number): number;
   classify_input(ptr: number, len: number): number;
   autocomplete_input(ptr: number, len: number, buf_cap: number): number;
   get_value_end(): number;
@@ -263,6 +318,7 @@ export async function init(options?: {
     ({ docId, generation }: { docId: number; generation: number }) => {
       if (docGenerations.get(docId) !== generation) return; // stale callback
       docGenerations.delete(docId);
+      docInputs.delete(docId);
       engine.doc_free(docId);
     },
   );
@@ -274,48 +330,90 @@ export async function init(options?: {
     return copy;
   }
 
-  // --- Read a doc string at a tape index into a JS string ---
-  function docReadString(docId: number, index: number): string {
-    const len = engine.doc_read_string_raw(docId, index);
-    // WASM returns u32 but JS sees i32 — guard against corrupted lengths
-    // (can happen when SIMD parsing reads past truncated unicode escapes)
-    if (len <= 0 || len > 0x7FFFFFFF) return "";
+  /** Read all batch indices with pagination for >16384 items. */
+  function readBatchPaginated(
+    fn: (docId: number, idx: number, resume: number) => number,
+    docId: number, idx: number,
+  ): Uint32Array {
+    const BATCH_CAP = 16384;
+    let count = fn(docId, idx, 0);
+    if (count < BATCH_CAP) return copyBatchIndices(count);
+    const all: number[] = [];
+    let page = copyBatchIndices(count);
+    for (let i = 0; i < count; i++) all.push(page[i]);
+    while (count === BATCH_CAP) {
+      const resumeAt = new Uint32Array(engine.memory.buffer, batchAddr + BATCH_CAP * 4, 1)[0];
+      count = fn(docId, idx, resumeAt);
+      page = copyBatchIndices(count);
+      for (let i = 0; i < count; i++) all.push(page[i]);
+    }
+    return new Uint32Array(all);
+  }
 
-    const ptr = new Uint32Array(engine.memory.buffer, batchAddr, 2)[0];
-    return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
+  // --- Per-document original input tracking (for ASCII fast-path) ---
+  // When input is a JS string and all chars are ASCII (byteLen === str.length),
+  // we can slice the original string directly instead of reading WASM memory.
+  const docInputs = new Map<number, string>();
+
+  // --- Read a doc string at a tape index into a JS string ---
+  // Strings are stored as source offsets into the original input.
+  // The escape flag (batch_buffer[2]) tells us if decoding is needed,
+  // avoiding a linear scan with includes('\\').
+  function docReadString(docId: number, index: number): string {
+    const rawLen = engine.doc_read_string_raw(docId, index);
+    // WASM returns u32 but JS sees i32 — guard against corrupted lengths
+    if (rawLen <= 0 || rawLen > 0x7FFFFFFF) return "";
+
+    const batch = new Uint32Array(engine.memory.buffer, batchAddr, 3);
+    const srcOffset = batch[0];
+    const hasEscapes = batch[2];
+
+    // ASCII fast-path: if original JS string is available and was ASCII,
+    // slice directly — no WASM memory read, no TextDecoder overhead.
+    const asciiInput = docInputs.get(docId);
+    if (asciiInput !== undefined) {
+      const raw = asciiInput.slice(srcOffset, srcOffset + rawLen);
+      return hasEscapes ? JSON.parse('"' + raw + '"') : raw;
+    }
+
+    const inputPtr = engine.doc_get_input_ptr(docId);
+    const raw = utf8Decoder.decode(
+      new Uint8Array(engine.memory.buffer, inputPtr + srcOffset, rawLen),
+    );
+    // has_escapes flag from SIMD skipString — no need for includes('\\')
+    return hasEscapes ? JSON.parse('"' + raw + '"') : raw;
   }
 
   // --- Deep materialize from document tape ---
+  // For containers (objects/arrays), slices the source span from WASM memory
+  // and delegates to native JSON.parse — faster than recursive tape walking.
+  // For primitives, reads directly from the tape.
   function deepMaterializeDoc(docId: number, index: number): unknown {
     const tag = engine.doc_get_tag(docId, index);
-    switch (tag) {
-      case TAG_NULL:
-        return null;
-      case TAG_TRUE:
-        return true;
-      case TAG_FALSE:
-        return false;
-      case TAG_NUMBER:
-        return engine.doc_get_number(docId, index);
-      case TAG_STRING:
-        return docReadString(docId, index);
-      case TAG_ARRAY:
-        return Array.from(copyBatchIndices(engine.doc_array_elements(docId, index)),
-          (idx) => deepMaterializeDoc(docId, idx));
-      case TAG_OBJECT:
-        return Object.fromEntries(Array.from(
-          copyBatchIndices(engine.doc_object_keys(docId, index)),
-          (idx) => [docReadString(docId, idx), deepMaterializeDoc(docId, idx + 1)]));
-      default:
-        return null;
+    if (tag === TAG_NULL) return null;
+    if (tag === TAG_TRUE) return true;
+    if (tag === TAG_FALSE) return false;
+    if (tag === TAG_NUMBER) return engine.doc_get_number(docId, index);
+    if (tag === TAG_STRING) return docReadString(docId, index);
+    if (tag === TAG_OBJECT || tag === TAG_ARRAY) {
+      // Get source span: opening bracket → closing bracket (inclusive)
+      // doc_get_close_index returns one-past-end (simdjson convention for skipping).
+      // The actual closing bracket is at closeIdx - 1.
+      const startPos = engine.doc_get_src_pos(docId, index);
+      const closingTapeIdx = engine.doc_get_close_index(docId, index) - 1;
+      const closePos = engine.doc_get_src_pos(docId, closingTapeIdx);
+      const inputPtr = engine.doc_get_input_ptr(docId);
+      const raw = new Uint8Array(
+        engine.memory.buffer, inputPtr + startPos, closePos + 1 - startPos,
+      );
+      return JSON.parse(utf8Decoder.decode(raw));
     }
+    return null;
   }
 
-  /** Batch-read all element tape indices for an array. ONE WASM call → O(1) per access. */
+  /** Batch-read all element tape indices for an array (cached). */
   function batchElemIndices(target: any): Uint32Array {
-    if (target._e) return target._e;
-    target._e = copyBatchIndices(engine.doc_array_elements(target._d, target._i));
-    return target._e;
+    return target._e || (target._e = readBatchPaginated(engine.doc_array_elements, target._d, target._i));
   }
 
   /** Resolve a tape value: primitives return directly.
@@ -415,6 +513,9 @@ export async function init(options?: {
   };
 
   // --- Shared Proxy handler for doc-backed object proxies (incomplete parses) ---
+  // doc_find_field compares raw source bytes against the key. For keys with
+  // escape sequences (\n, \uXXXX), raw comparison fails — we fall back to
+  // ownKeys iteration which properly decodes each key via docReadString.
   const docObjHandler: ProxyHandler<any> = {
     get(target, prop, _receiver) {
       if (prop === 'free' || prop === Symbol.dispose) return target._f;
@@ -424,8 +525,18 @@ export async function init(options?: {
       if (prop in target._c) return target._c[prop];
       const { ptr, len } = writeKeyToMemory(prop);
       const valIdx = engine.doc_find_field(target._d, target._i, ptr, len);
-      if (valIdx === 0) return undefined;
-      const val = resolveValue(target._d, valIdx, target._k, target._g, target._f, true);
+      if (valIdx !== 0) {
+        // Fast path: key matched raw source bytes (no escapes)
+        const val = resolveValue(target._d, valIdx, target._k, target._g, target._f, true);
+        target._c[prop] = val;
+        return val;
+      }
+      // Fallback: escaped keys won't match raw bytes — iterate all keys
+      const keys = this.ownKeys!(target) as string[];
+      const keyIdx = keys.indexOf(prop);
+      if (keyIdx === -1) return undefined;
+      // Resolve value via cached key tape indices
+      const val = resolveValue(target._d, target._ki[keyIdx] + 1, target._k, target._g, target._f, true);
       target._c[prop] = val;
       return val;
     },
@@ -433,11 +544,15 @@ export async function init(options?: {
       if (prop === LAZY_PROXY || prop === 'free' || prop === Symbol.dispose) return true;
       if (typeof prop !== 'string') return false;
       const { ptr, len } = writeKeyToMemory(prop);
-      return engine.doc_find_field(target._d, target._i, ptr, len) !== 0;
+      if (engine.doc_find_field(target._d, target._i, ptr, len) !== 0) return true;
+      // Fallback for escaped keys
+      const keys = this.ownKeys!(target) as string[];
+      return keys.includes(prop);
     },
     ownKeys(target) {
       if (!target._keys) {
-        const indices = copyBatchIndices(engine.doc_object_keys(target._d, target._i));
+        const indices = readBatchPaginated(engine.doc_object_keys, target._d, target._i);
+        target._ki = indices;
         target._keys = Array.from(indices, (idx) => docReadString(target._d, idx));
       }
       return target._keys;
@@ -468,6 +583,7 @@ export async function init(options?: {
         : rootTag === TAG_FALSE ? false
         : rootTag === TAG_NUMBER ? engine.doc_get_number(docId, 1)
         : docReadString(docId, 1);
+      docInputs.delete(docId);
       engine.doc_free(docId);
       return value;
     }
@@ -480,6 +596,7 @@ export async function init(options?: {
       void keepAlive; // prevent GC of sentinel
       if (docGenerations.get(docId) !== generation) return;
       docGenerations.delete(docId);
+      docInputs.delete(docId);
       engine.doc_free(docId);
       docRegistry.unregister(keepAlive);
     };
@@ -498,6 +615,23 @@ export async function init(options?: {
       }
     }
     return docId;
+  }
+
+  // --- Path Pattern Compiler ---
+  // Segments: string = key, number = index, '*' = wildcard
+
+  function compilePath(pattern: string): PathSegment[] {
+    return pattern.replace(/\[(\*|\d+)\]/g, '.$1').split('.').filter(Boolean)
+      .map(s => s === '*' ? '*' : /^\d+$/.test(s) ? +s : s);
+  }
+
+  function buildResolvedPath(keyStack: (string | null)[], indexStack: (number | null)[], depth: number): string {
+    const parts: string[] = [];
+    for (let i = 0; i < depth; i++) {
+      if (keyStack[i] !== null) parts.push(keyStack[i]!);
+      else if (indexStack[i] !== null) parts.push(String(indexStack[i]));
+    }
+    return parts.join('.');
   }
 
   // --- Public API ---
@@ -556,9 +690,14 @@ export async function init(options?: {
         return makeResult("invalid", undefined, Infinity, undefined, undefined, msg);
       };
 
+      // Track whether input is an ASCII JS string (byteLen === str.length).
+      // If so, docReadString can slice the original string directly.
+      const isAsciiStr = typeof input === "string" && len === input.length;
+
       // ── Happy path: try doc_parse directly (no classify overhead) ──
       let docId = tryDocParse(ptr, len);
       if (docId >= 0) {
+        if (isAsciiStr) docInputs.set(docId, input as string);
         // For string input at full length, reuse the original string (avoids decode)
         const toJSONStr = typeof input === "string" ? input
           : utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
@@ -582,6 +721,7 @@ export async function init(options?: {
         const toJSONStr = utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
         docId = tryDocParse(ptr, parseLen);
         if (docId >= 0) {
+          if (isAsciiStr) docInputs.set(docId, input as string);
           return makeResult("complete_early", buildDocRoot(docId), Infinity, toJSONStr, remainingCopy);
         }
         return invalidResult();
@@ -596,6 +736,8 @@ export async function init(options?: {
         const toJSONStr = utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
         docId = tryDocParse(ptr, parseLen);
         if (docId >= 0) {
+          // Don't use ASCII fast-path for incomplete: autocomplete appended
+          // closing tokens that aren't in the original JS string.
           return makeResult("incomplete", buildDocRoot(docId, true), len, toJSONStr);
         }
         return invalidResult();
@@ -622,6 +764,614 @@ export async function init(options?: {
         default:
           return { value: undefined, state: "failed-parse" };
       }
+    },
+
+    createEventParser(options?: {
+      multiRoot?: boolean;
+      onRoot?: (event: RootEvent) => void;
+    }): EventParser {
+      const multiRoot = options?.multiRoot ?? false;
+      const onRootCb = options?.onRoot;
+
+      const streamId = engine.stream_create();
+      if (streamId < 0) {
+        throw new Error("VectorJSON: Failed to create event parser (max 4 concurrent)");
+      }
+
+      let destroyed = false;
+      let rootIndex = 0;
+
+      // --- Subscription storage ---
+      type Sub = { segments: PathSegment[]; callback: Function; schema?: { safeParse: Function } };
+      const pathSubs: Sub[] = [];
+      const deltaSubs: Sub[] = [];
+      const skipPatterns: PathSegment[][] = [];
+      const textCallbacks: ((text: string) => void)[] = [];
+
+      // --- JSON Seeker state ---
+      const SEEKER_SEEKING = 0, SEEKER_IN_THINK = 1, SEEKER_IN_FENCE = 2, SEEKER_FEEDING = 3;
+      let seekerState = SEEKER_SEEKING;
+      let seekerBuf = ''; // accumulates non-JSON text for seeking
+      let fenceBacktickCount = 0;
+
+      function seekerFeed(text: string): string | null {
+        // In FEEDING state, pass through directly
+        if (seekerState === SEEKER_FEEDING) return text;
+
+        let result = '';
+        let i = 0;
+
+        while (i < text.length) {
+          if (seekerState === SEEKER_FEEDING) {
+            result += text.slice(i);
+            break;
+          }
+
+          if (seekerState === SEEKER_IN_THINK) {
+            const closeIdx = text.indexOf('</think>', i);
+            if (closeIdx === -1) {
+              const captured = text.slice(i);
+              for (const cb of textCallbacks) cb(captured);
+              i = text.length;
+            } else {
+              const captured = text.slice(i, closeIdx);
+              if (captured) for (const cb of textCallbacks) cb(captured);
+              i = closeIdx + '</think>'.length;
+              seekerState = SEEKER_SEEKING;
+              seekerBuf = '';
+            }
+            continue;
+          }
+
+          if (seekerState === SEEKER_IN_FENCE) {
+            // Look for closing fence
+            const closeFence = '`'.repeat(fenceBacktickCount);
+            const closeIdx = text.indexOf(closeFence, i);
+            if (closeIdx === -1) {
+              result += text.slice(i);
+              i = text.length;
+            } else {
+              result += text.slice(i, closeIdx);
+              i = closeIdx + fenceBacktickCount;
+              fenceBacktickCount = 0;
+              seekerState = SEEKER_SEEKING;
+              seekerBuf = '';
+            }
+            continue;
+          }
+
+          // SEEKING state
+          const ch = text[i];
+
+          // Definitive JSON start characters → switch to FEEDING
+          // Only { [ " are reliable indicators — bare keywords (t/f/n) and
+          // digits can appear in prose, so we only treat them as JSON start
+          // if they're not part of other content.
+          if (ch === '{' || ch === '[' || ch === '"') {
+            // Flush remaining seeker buf as text
+            if (seekerBuf) {
+              for (const cb of textCallbacks) cb(seekerBuf);
+              seekerBuf = '';
+            }
+            seekerState = SEEKER_FEEDING;
+            result += text.slice(i);
+            break;
+          }
+
+          // Check for <think> tag
+          seekerBuf += ch;
+          if (seekerBuf.endsWith('<think>')) {
+            const beforeTag = seekerBuf.slice(0, -'<think>'.length);
+            if (beforeTag) for (const cb of textCallbacks) cb(beforeTag);
+            seekerState = SEEKER_IN_THINK;
+            seekerBuf = '';
+            i++;
+            continue;
+          }
+
+          // Check for code fence (``` with optional label)
+          if (ch === '`') {
+            // Count consecutive backticks
+            let btCount = 0;
+            let j = i;
+            while (j < text.length && text[j] === '`') { btCount++; j++; }
+            if (btCount >= 3) {
+              // Skip label (e.g., "json") until newline
+              while (j < text.length && text[j] !== '\n') j++;
+              if (j < text.length) j++; // skip the newline
+              fenceBacktickCount = btCount;
+              seekerState = SEEKER_IN_FENCE;
+              const beforeFence = seekerBuf.slice(0, -1); // remove only the 1 backtick appended to seekerBuf
+              if (beforeFence) for (const cb of textCallbacks) cb(beforeFence);
+              seekerBuf = '';
+              i = j;
+              continue;
+            }
+          }
+
+          // Whitespace and other non-JSON chars — keep seeking
+          i++;
+
+          // Flush accumulated non-JSON text periodically
+          if (seekerBuf.length > 1024) {
+            for (const cb of textCallbacks) cb(seekerBuf);
+            seekerBuf = '';
+          }
+        }
+
+        if (result.length > 0) return result;
+        return null;
+      }
+
+      // --- PathTracker state ---
+      let ptDepth = 0;
+      let ptInString = false;
+      let ptEscapeNext = false;
+      let ptContextStack: ('o' | 'a')[] = [];       // object or array at each level
+      let ptKeyStack: (string | null)[] = [];        // current key at each depth
+      let ptIndexStack: (number | null)[] = [];      // current array index at each depth
+      let ptValueStartStack: number[] = [];          // byte offset where value started
+      let ptSkipDepth = -1;                          // if >= 0, we're inside a skipped path
+      let ptExpectingKey = false;
+      let ptAfterColon = false;
+      let ptKeyAccum = '';
+      let ptAccumulatingKey = false;
+      let ptStringValueStart = -1;
+      let ptInStringValue = false;
+      let ptDeltaAccum = '';
+      let ptDeltaByteStart = 0;                      // byte offset where current delta accumulation started
+      let ptInScalar = false;                        // tracking a scalar that may span chunks
+      let ptScalarStart = -1;                        // byte offset where current scalar started
+
+      function ptReset() {
+        ptDepth = 0; ptInString = false; ptEscapeNext = false;
+        ptContextStack.length = 0; ptKeyStack.length = 0;
+        ptIndexStack.length = 0; ptValueStartStack.length = 0;
+        ptSkipDepth = -1; ptExpectingKey = false; ptAfterColon = false;
+        ptKeyAccum = ''; ptAccumulatingKey = false;
+        ptStringValueStart = -1; ptInStringValue = false;
+        ptDeltaAccum = ''; ptDeltaByteStart = 0;
+        ptInScalar = false; ptScalarStart = -1;
+      }
+
+      /** Unified path matcher: exact = segments.length must equal depth, prefix = <= depth.
+       *  Returns wildcard matches on success, null on failure. */
+      function matchPath(segments: PathSegment[], exact: boolean): (string | number)[] | null {
+        const len = segments.length;
+        if (exact ? len !== ptDepth : len > ptDepth) return null;
+        const matches: (string | number)[] = [];
+        for (let s = 0; s < len; s++) {
+          const seg = segments[s];
+          const key = ptKeyStack[s], idx = ptIndexStack[s];
+          if (seg === '*') matches.push(idx !== null ? idx : (key ?? ''));
+          else if (typeof seg === 'number' ? idx !== seg : key !== seg) return null;
+        }
+        return matches;
+      }
+
+      function isPathSkipped(): boolean {
+        return skipPatterns.length > 0 && skipPatterns.some(p => matchPath(p, false) !== null);
+      }
+
+      function fireValueComplete(valueBytes: Uint8Array, offset: number, length: number) {
+        if (pathSubs.length === 0) return;
+        const resolvedPath = buildResolvedPath(ptKeyStack, ptIndexStack, ptDepth);
+        for (const sub of pathSubs) {
+          const matches = matchPath(sub.segments, true);
+          if (!matches) continue;
+          let value: unknown;
+          try { value = JSON.parse(utf8Decoder.decode(valueBytes)); } catch { continue; }
+          if (sub.schema) {
+            const result = sub.schema.safeParse(value);
+            if (!result.success) continue;
+            value = result.data;
+          }
+          const event: PathEvent = { type: 'value', path: resolvedPath, value, offset, length, matches };
+          for (let i = matches.length - 1; i >= 0; i--) {
+            const m = matches[i];
+            if (typeof m === 'number' && event.index === undefined) event.index = m;
+            if (typeof m === 'string' && event.key === undefined) event.key = m;
+          }
+          sub.callback(event as any);
+        }
+      }
+
+      function fireDelta(value: string, offset: number, length: number) {
+        if (deltaSubs.length === 0) return;
+        const resolvedPath = buildResolvedPath(ptKeyStack, ptIndexStack, ptDepth);
+        for (const sub of deltaSubs) {
+          if (!matchPath(sub.segments, true)) continue;
+          sub.callback({ type: 'delta', path: resolvedPath, value, offset, length });
+        }
+      }
+
+      function ptScan(buf: Uint8Array, from: number, to: number) {
+        for (let i = from; i < to; i++) {
+          const c = buf[i];
+
+          // Check if we're continuing a scalar from a previous chunk
+          if (ptInScalar) {
+            if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
+              // Scalar ended — fire value complete for the whole span
+              const scalarLen = i - ptScalarStart;
+              fireValueComplete(buf.slice(ptScalarStart, i), ptScalarStart, scalarLen);
+              ptInScalar = false;
+              ptScalarStart = -1;
+              // Re-process this delimiter char (it may be comma/close bracket)
+              i--;
+              continue;
+            }
+            // Still inside the scalar, keep scanning
+            continue;
+          }
+
+          if (ptEscapeNext) {
+            ptEscapeNext = false;
+            if (ptInStringValue && ptSkipDepth < 0) {
+              // Decode escape for delta
+              let decoded: string;
+              switch (c) {
+                case 0x6E: decoded = '\n'; break;   // n
+                case 0x72: decoded = '\r'; break;   // r
+                case 0x74: decoded = '\t'; break;   // t
+                case 0x22: decoded = '"'; break;     // "
+                case 0x5C: decoded = '\\'; break;    // \
+                case 0x2F: decoded = '/'; break;     // /
+                case 0x62: decoded = '\b'; break;    // b
+                case 0x66: decoded = '\f'; break;    // f
+                default: decoded = String.fromCharCode(c); break;
+              }
+              ptDeltaAccum += decoded;
+              if (ptAccumulatingKey) ptKeyAccum += decoded;
+            } else if (ptAccumulatingKey) {
+              ptKeyAccum += String.fromCharCode(c);
+            }
+            continue;
+          }
+
+          if (ptInString) {
+            if (c === 0x5C) { // backslash
+              ptEscapeNext = true;
+              continue;
+            }
+            if (c === 0x22) { // closing quote
+              ptInString = false;
+              if (ptAccumulatingKey) {
+                ptAccumulatingKey = false;
+                // Store key at parent depth (ptDepth-1) since we're inside the container
+                if (ptDepth > 0) ptKeyStack[ptDepth - 1] = ptKeyAccum;
+                ptKeyAccum = '';
+                continue;
+              }
+              // End of string value
+              if (ptInStringValue && ptSkipDepth < 0) {
+                // Flush final delta — use tracked byte offsets, not decoded char count
+                if (ptDeltaAccum && deltaSubs.length > 0) {
+                  const deltaByteLen = i - ptDeltaByteStart; // raw bytes from start to closing quote
+                  fireDelta(ptDeltaAccum, ptDeltaByteStart, deltaByteLen);
+                }
+                ptDeltaAccum = '';
+                // Fire value complete for the string
+                const start = ptStringValueStart;
+                const len = i + 1 - start;
+                fireValueComplete(buf.slice(start, i + 1), start, len);
+              }
+              ptInStringValue = false;
+              ptStringValueStart = -1;
+              continue;
+            }
+            // Regular string character
+            if (ptInStringValue && ptSkipDepth < 0) {
+              const ch = String.fromCharCode(c);
+              ptDeltaAccum += ch;
+              if (ptAccumulatingKey) ptKeyAccum += ch;
+            } else if (ptAccumulatingKey) {
+              ptKeyAccum += String.fromCharCode(c);
+            }
+            continue;
+          }
+
+          // Not in string
+          switch (c) {
+            case 0x7B: { // {
+              ptContextStack[ptDepth] = 'o';
+              ptKeyStack[ptDepth] = null;
+              ptIndexStack[ptDepth] = null;
+              ptValueStartStack[ptDepth] = i;
+              ptDepth++;
+              ptExpectingKey = true;
+              ptAfterColon = false;
+              // Check if we should skip this depth
+              if (ptSkipDepth < 0 && isPathSkipped()) {
+                ptSkipDepth = ptDepth - 1;
+              }
+              break;
+            }
+            case 0x5B: { // [
+              ptContextStack[ptDepth] = 'a';
+              ptKeyStack[ptDepth] = null;
+              ptIndexStack[ptDepth] = 0;
+              ptValueStartStack[ptDepth] = i;
+              ptDepth++;
+              ptExpectingKey = false;
+              ptAfterColon = false;
+              if (ptSkipDepth < 0 && isPathSkipped()) {
+                ptSkipDepth = ptDepth - 1;
+              }
+              break;
+            }
+            case 0x7D: // }
+            case 0x5D: { // ]
+              ptDepth--;
+              const wasSkipped = ptSkipDepth >= 0;
+              if (wasSkipped && ptDepth <= ptSkipDepth) {
+                ptSkipDepth = -1;
+              }
+              // Fire value complete for the container (only if not exiting a skipped path)
+              if (ptDepth >= 0 && ptSkipDepth < 0 && !wasSkipped) {
+                const start = ptValueStartStack[ptDepth];
+                const len = i + 1 - start;
+                fireValueComplete(buf.slice(start, i + 1), start, len);
+              }
+              // Restore parent context
+              if (ptDepth > 0) {
+                const parentCtx = ptContextStack[ptDepth - 1];
+                ptExpectingKey = parentCtx === 'o';
+                ptAfterColon = false;
+              }
+              break;
+            }
+            case 0x22: { // opening quote
+              ptInString = true;
+              if (ptExpectingKey && ptSkipDepth < 0) {
+                // Start accumulating key
+                ptAccumulatingKey = true;
+                ptKeyAccum = '';
+              } else if (ptAfterColon || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
+                // String value — only track if not in a skipped path
+                if (ptSkipDepth < 0 && !isPathSkipped()) {
+                  ptInStringValue = true;
+                  ptStringValueStart = i;
+                  ptDeltaAccum = '';
+                  ptDeltaByteStart = i + 1; // byte after opening quote
+                }
+                ptAfterColon = false;
+              }
+              break;
+            }
+            case 0x3A: { // colon
+              ptExpectingKey = false;
+              ptAfterColon = true;
+              break;
+            }
+            case 0x2C: { // comma
+              // In array: increment index
+              if (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a') {
+                const idx = ptIndexStack[ptDepth - 1];
+                ptIndexStack[ptDepth - 1] = (idx ?? -1) + 1;
+                // Check skip for new array index
+                if (ptSkipDepth < 0 && isPathSkipped()) {
+                  ptSkipDepth = ptDepth - 1;
+                }
+              }
+              // In object: expect next key
+              if (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'o') {
+                ptExpectingKey = true;
+                ptKeyStack[ptDepth - 1] = null;
+              }
+              ptAfterColon = false;
+              break;
+            }
+            default: {
+              // Scalar values (numbers, true, false, null)
+              if (ptAfterColon || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
+                if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
+                  // Find end of scalar
+                  if (ptSkipDepth < 0 && !isPathSkipped()) {
+                    let j = i + 1;
+                    while (j < to) {
+                      const sc = buf[j];
+                      if (sc === 0x2C || sc === 0x7D || sc === 0x5D || sc === 0x20 || sc === 0x0A || sc === 0x0D || sc === 0x09) break;
+                      j++;
+                    }
+                    if (j < to) {
+                      // Complete scalar
+                      fireValueComplete(buf.slice(i, j), i, j - i);
+                      i = j - 1; // -1 because loop will increment
+                    } else {
+                      // Scalar extends past this chunk — track it
+                      ptInScalar = true;
+                      ptScalarStart = i;
+                      i = to; // skip to end, will resume on next feed
+                    }
+                  }
+                  ptAfterColon = false;
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // Flush accumulated deltas at end of each feed for in-progress strings
+        // This ensures onDelta fires incrementally per feed(), not just at string close
+        if (ptInStringValue && ptDeltaAccum.length > 0 && ptSkipDepth < 0 && deltaSubs.length > 0) {
+          fireDelta(ptDeltaAccum, ptDeltaByteStart, to - ptDeltaByteStart);
+          ptDeltaAccum = '';
+          ptDeltaByteStart = to;
+        }
+      }
+
+      // --- EventParser object ---
+      const self: EventParser = {
+        on(path: string, ...args: any[]): EventParser {
+          let schema: { safeParse: Function } | undefined;
+          let callback: (event: PathEvent) => void;
+          if (args.length === 2 && typeof args[0] === 'object' && args[0] !== null && 'safeParse' in args[0]) {
+            schema = args[0];
+            callback = args[1];
+          } else {
+            callback = args[0];
+          }
+          pathSubs.push({ segments: compilePath(path), callback, schema });
+          return self;
+        },
+
+        onDelta(path: string, callback: (event: DeltaEvent) => void): EventParser {
+          deltaSubs.push({ segments: compilePath(path), callback });
+          return self;
+        },
+
+        onText(callback: (text: string) => void): EventParser {
+          textCallbacks.push(callback);
+          return self;
+        },
+
+        skip(...paths: string[]): EventParser {
+          for (const p of paths) skipPatterns.push(compilePath(p));
+          return self;
+        },
+
+        off(path: string, callback?: Function): EventParser {
+          const compiled = compilePath(path);
+          const eq = (a: PathSegment[], b: PathSegment[]) =>
+            a.length === b.length && a.every((s, i) => s === b[i]);
+          const remove = (subs: Sub[]) => {
+            for (let i = subs.length - 1; i >= 0; i--) {
+              if (eq(subs[i].segments, compiled) && (!callback || subs[i].callback === callback))
+                subs.splice(i, 1);
+            }
+          };
+          remove(pathSubs);
+          remove(deltaSubs);
+          return self;
+        },
+
+        feed(chunk: string | Uint8Array): FeedStatus {
+          if (destroyed) throw new Error("EventParser already destroyed");
+
+          // Run through JSON seeker first
+          let jsonContent: string | Uint8Array | null;
+          if (typeof chunk === 'string') {
+            jsonContent = seekerFeed(chunk);
+            if (jsonContent === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+          } else if (seekerState === SEEKER_FEEDING) {
+            // Fast path: skip string conversion when seeker is already feeding JSON
+            jsonContent = chunk;
+          } else {
+            const str = utf8Decoder.decode(chunk);
+            const result = seekerFeed(str);
+            if (result === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+            jsonContent = encoder.encode(result);
+          }
+
+          // Feed to WASM stream
+          const { ptr, len } = writeToWasm(jsonContent, feedBuf, 0, 4096);
+          const prevLen = engine.stream_get_buffer_len(streamId);
+          const status = engine.stream_feed(streamId, ptr, len);
+          const newLen = engine.stream_get_buffer_len(streamId);
+
+          // Scan new bytes with PathTracker
+          if (newLen > prevLen && (pathSubs.length > 0 || deltaSubs.length > 0)) {
+            const bufPtr = engine.stream_get_buffer_ptr(streamId);
+            const wasmBuf = new Uint8Array(engine.memory.buffer, bufPtr, newLen);
+            ptScan(wasmBuf, prevLen, newLen);
+          }
+
+          const feedStatus = FEED_STATUS[status] || "error";
+
+          // Multi-root handling: drain all complete values
+          if (multiRoot && (feedStatus === 'complete' || feedStatus === 'end_early')) {
+            let loopGuard = 0;
+            while (loopGuard++ < 10000) {
+              const curStatus = engine.stream_get_status(streamId);
+              if (curStatus !== 1 && curStatus !== 3) break; // not complete/end_early
+
+              // Copy value bytes before reset (SIMD padding would overwrite remaining)
+              const bp = engine.stream_get_buffer_ptr(streamId);
+              const vl = engine.stream_get_value_len(streamId);
+              const valueCopy = new Uint8Array(vl + 64);
+              valueCopy.set(new Uint8Array(engine.memory.buffer, bp, vl));
+              // Pad copy for SIMD safety
+              valueCopy.fill(0x20, vl);
+
+              // Reset stream for next value BEFORE parsing (preserves remaining bytes)
+              const remaining = engine.stream_reset_for_next(streamId);
+              ptReset();
+
+              // Now parse the copied value bytes
+              const parsePtr = engine.alloc(valueCopy.length);
+              if (parsePtr) {
+                new Uint8Array(engine.memory.buffer, parsePtr, valueCopy.length).set(valueCopy);
+                const did = engine.doc_parse(parsePtr, vl);
+                engine.dealloc(parsePtr, valueCopy.length);
+                if (did >= 0 && onRootCb) {
+                  onRootCb({ type: 'root', index: rootIndex++, value: buildDocRoot(did) });
+                }
+              }
+
+              // Scan remaining bytes with PathTracker
+              if (remaining > 0 && (pathSubs.length > 0 || deltaSubs.length > 0)) {
+                const nbp = engine.stream_get_buffer_ptr(streamId);
+                const nbl = engine.stream_get_buffer_len(streamId);
+                if (nbl > 0) {
+                  const wb = new Uint8Array(engine.memory.buffer, nbp, nbl);
+                  ptScan(wb, 0, nbl);
+                }
+              }
+
+              if (remaining === 0) break;
+            }
+            return FEED_STATUS[engine.stream_get_status(streamId)] || "incomplete";
+          }
+
+          return feedStatus;
+        },
+
+        getValue(): unknown {
+          if (destroyed) throw new Error("EventParser already destroyed");
+          const status = engine.stream_get_status(streamId);
+          if (status === 0) throw new Error("VectorJSON: JSON is incomplete, feed more data");
+          if (status === 2) throw new SyntaxError("VectorJSON: Parse error in stream");
+
+          const bufPtr = engine.stream_get_buffer_ptr(streamId);
+          const valueLen = engine.stream_get_value_len(streamId);
+          new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
+          const docId = engine.doc_parse(bufPtr, valueLen);
+          if (docId < 0) {
+            const errorCode = engine.get_error_code();
+            const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+            throw new SyntaxError(`VectorJSON: ${msg}`);
+          }
+          return buildDocRoot(docId);
+        },
+
+        getRemaining(): Uint8Array | null {
+          if (destroyed) return null;
+          const rPtr = engine.stream_get_remaining_ptr(streamId);
+          const rLen = engine.stream_get_remaining_len(streamId);
+          if (rLen > 0) {
+            const copy = new Uint8Array(rLen);
+            copy.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
+            return copy;
+          }
+          return null;
+        },
+
+        getStatus(): FeedStatus {
+          if (destroyed) return "error";
+          return FEED_STATUS[engine.stream_get_status(streamId)] || "error";
+        },
+
+        destroy(): void {
+          if (!destroyed) {
+            engine.stream_destroy(streamId);
+            destroyed = true;
+          }
+        },
+      };
+
+      return self;
     },
 
     createParser(): StreamingParser {
