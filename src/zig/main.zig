@@ -61,12 +61,9 @@ export fn stream_create() i32 {
 }
 
 export fn stream_destroy(id: i32) void {
-    if (id < 0 or id >= streams.len) return;
-    const uid: usize = @intCast(id);
-    if (streams[uid]) |s| {
-        s.deinit();
-        streams[uid] = null;
-    }
+    const s = getStream(id) orelse return;
+    s.deinit();
+    streams[@intCast(id)] = null;
 }
 
 export fn stream_feed(id: i32, ptr: [*]const u8, len: u32) i32 {
@@ -316,9 +313,8 @@ export fn doc_get_count(doc_id: i32, index: u32) u32 {
 /// Lazily builds the src_positions array on first call (only needed for incomplete parses).
 /// Returns 0xFFFFFFFF if the doc or index is invalid.
 export fn doc_get_src_pos(doc_id: i32, idx: u32) u32 {
-    if (doc_id < 0 or doc_id >= MAX_DOC_SLOTS) return 0xFFFFFFFF;
+    _ = getDocParser(doc_id) orelse return 0xFFFFFFFF;
     const uid: usize = @intCast(doc_id);
-    if (!doc_active[uid]) return 0xFFFFFFFF;
     if (!doc_src_pos_built[uid]) {
         buildDocSrcPositions(uid);
         doc_src_pos_built[uid] = true;
