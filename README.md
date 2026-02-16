@@ -457,7 +457,15 @@ Bundle size: ~92 KB WASM + ~20 KB JS (~37 KB gzipped total). No runtime dependen
 
 ## Building from Source
 
-Requires: [Zig](https://ziglang.org/) 0.15+, [Bun](https://bun.sh/) or Node.js 20+.
+Requires: [Zig](https://ziglang.org/) 0.15+, [Bun](https://bun.sh/) or Node.js 20+, [Binaryen](https://github.com/WebAssembly/binaryen) (`wasm-opt`).
+
+```bash
+# macOS
+brew install binaryen
+
+# Ubuntu / Debian
+sudo apt-get install -y binaryen
+```
 
 ```bash
 bun run build        # Zig → WASM → wasm-opt → TypeScript
