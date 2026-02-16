@@ -261,6 +261,9 @@ export async function init(options?: {
   }
 
   // --- Constants ---
+  // Batch buffer address is a fixed global in WASM — cache to avoid repeated WASM calls
+  const batchAddr = engine.doc_batch_ptr();
+
   const TAG_NULL = 0;
   const TAG_TRUE = 1;
   const TAG_FALSE = 2;
@@ -297,7 +300,7 @@ export async function init(options?: {
     // WASM returns u32 but JS sees i32 — guard against corrupted lengths
     // (can happen when SIMD parsing reads past truncated unicode escapes)
     if (len <= 0 || len > 0x7FFFFFFF) return "";
-    const batchPtr = engine.doc_batch_ptr();
+    const batchPtr = batchAddr;
     const ptr = new Uint32Array(engine.memory.buffer, batchPtr, 2)[0];
     return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
   }
@@ -318,7 +321,7 @@ export async function init(options?: {
         return docReadString(docId, index);
       case TAG_ARRAY: {
         const count = engine.doc_array_elements(docId, index);
-        const batchPtr = engine.doc_batch_ptr();
+        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
         idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         const arr: unknown[] = [];
@@ -329,7 +332,7 @@ export async function init(options?: {
       }
       case TAG_OBJECT: {
         const count = engine.doc_object_keys(docId, index);
-        const batchPtr = engine.doc_batch_ptr();
+        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
         idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         const obj: Record<string, unknown> = {};
@@ -347,7 +350,7 @@ export async function init(options?: {
   function batchElemIndices(target: any): Uint32Array {
     if (target._e) return target._e;
     const count = engine.doc_array_elements(target._d, target._i);
-    const batchPtr = engine.doc_batch_ptr();
+    const batchPtr = batchAddr;
     const indices = new Uint32Array(count);
     indices.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
     target._e = indices;
@@ -489,7 +492,7 @@ export async function init(options?: {
       if (!target._keys) {
         target._keys = [];
         const count = engine.doc_object_keys(target._d, target._i);
-        const batchPtr = engine.doc_batch_ptr();
+        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
         idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         for (let i = 0; i < count; i++) {
@@ -544,7 +547,7 @@ export async function init(options?: {
       docRegistry.unregister(keepAlive);
     };
     // Root always gets Proxy so .free() is accessible; force objects to Proxy for isComplete()
-    return resolveValue(docId, 1, keepAlive, generation, freeFn, rootTag === TAG_OBJECT ? true : proxyObjects);
+    return resolveValue(docId, 1, keepAlive, generation, freeFn, rootTag === TAG_OBJECT || proxyObjects);
   }
 
   // --- Helper: retry doc_parse with GC on slot exhaustion ---
