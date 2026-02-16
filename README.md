@@ -267,6 +267,26 @@ parser.on('tool_calls[*]', ToolCall, (event) => {
 
 Schema-agnostic: any object with `{ safeParse(v) → { success: boolean; data?: T } }` works.
 
+### Lazy access — only materialize what you touch
+
+`vj.parse()` returns a lazy Proxy backed by the WASM tape. Fields are only materialized into JS objects when you access them. On a 2 MB payload, reading one field is 2× faster than `JSON.parse` because the other 99% is never allocated:
+
+```js
+const result = vj.parse(huge2MBToolCall);
+result.value.tool;   // "file_edit" — reads from WASM tape, 2.3ms
+result.value.path;   // "app.ts"
+// result.value.code (the 50KB field) is never materialized in JS memory
+```
+
+```
+bun --expose-gc bench/partial-access.mjs
+
+  2.2 MB payload, 10K items:
+  Access 1 field    JSON.parse 4.6ms    VectorJSON 2.3ms    2× faster
+  Access 10 items   JSON.parse 4.5ms    VectorJSON 2.6ms    1.7× faster
+  Full access       JSON.parse 4.8ms    VectorJSON 4.6ms    ~equal
+```
+
 ### One-shot parse
 
 For non-streaming use cases:

@@ -114,8 +114,8 @@ async function run() {
     "VectorJSON.parse → .total",
     bench(() => {
       const r = vj.parse(syntheticJson);
-      const v = r.total;
-      r.free(); // release doc slot for hot-loop reuse
+      const v = r.value.total;
+      r.value.free();
       return v;
     })
   );
@@ -146,8 +146,8 @@ async function run() {
     "VectorJSON.parse → .items[0].name",
     bench(() => {
       const r = vj.parse(syntheticJson);
-      const v = r.items[0].name;
-      r.free();
+      const v = r.value.items[0].name;
+      r.value.free();
       return v;
     })
   );
@@ -190,10 +190,10 @@ async function run() {
       const r = vj.parse(syntheticJson);
       let sum = 0;
       for (let i = 0; i < 10; i++) {
-        sum += r.items[i].id;
-        void r.items[i].name;
+        sum += r.value.items[i].id;
+        void r.value.items[i].name;
       }
-      r.free();
+      r.value.free();
       return sum;
     })
   );
@@ -239,12 +239,12 @@ async function run() {
     bench(
       () => {
         const r = vj.parse(syntheticJson);
-        const items = r.items;
+        const items = r.value.items;
         let sum = 0;
         for (let i = 0; i < items.length; i++) {
           sum += items[i].id;
         }
-        r.free();
+        r.value.free();
         return sum;
       },
       { durationMs: 1500 }
@@ -294,8 +294,8 @@ async function run() {
       `VectorJSON.parse → .${firstKey}`,
       bench(() => {
         const r = vj.parse(json);
-        const v = r[firstKey];
-        r.free();
+        const v = r.value[firstKey];
+        r.value.free();
         return v;
       })
     );
@@ -306,8 +306,8 @@ async function run() {
     }).opsPerSec;
     const speedupVJ = bench(() => {
       const r = vj.parse(json);
-      const v = r[firstKey];
-      r.free();
+      const v = r.value[firstKey];
+      r.value.free();
       return v;
     }).opsPerSec;
     console.log(

@@ -1,0 +1,43 @@
+.{
+    .name = .zimdjson,
+    .version = "0.1.1",
+
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0xd4076c57c560daf3,
+
+    .dependencies = .{
+        .@"simdjson-data" = .{
+            .url = "https://github.com/simdjson/simdjson-data/archive/a5b13babe65c1bba7186b41b43d4cbdc20a5c470.tar.gz",
+            .hash = "N-V-__8AAMQVtAG4iSZdo-C8RxpTgDeGrWpPTuI_vfmvaDr0",
+            .lazy = true,
+        },
+        .parse_number_fxx = .{
+            .url = "https://github.com/nigeltao/parse-number-fxx-test-data/archive/55d79b184b7d8fac2e143e89dc19b766ec4e54b8.tar.gz",
+            .hash = "N-V-__8AACBIdhAWVvf7hKnMY8ipBn3kNaIe-6ctQddchTVC",
+            .lazy = true,
+        },
+        .simdjson = .{
+            .url = "https://github.com/simdjson/simdjson/archive/refs/tags/v3.10.1.tar.gz",
+            .hash = "N-V-__8AAP3gugBlcehtzstAJiwgQGMwxp3kYs98-Rbb1Iqa",
+            .lazy = true,
+        },
+        .yyjson = .{
+            .url = "https://github.com/ibireme/yyjson/archive/refs/tags/0.10.0.tar.gz",
+            .hash = "N-V-__8AAKmVZgBC79tIB3maNh7YdYQE39JZZXV4Es5Ye-oP",
+            .lazy = true,
+        },
+        .rapidjson = .{
+            .url = "https://github.com/EzequielRamis/rapidjson/archive/bf11b43f8eac3173ca88f82430917ad919feee2b.tar.gz",
+            .hash = "N-V-__8AAOiaNQDzwFr-sTlIRWyxtJgAqqpN_6WJAQvck3Pr",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
