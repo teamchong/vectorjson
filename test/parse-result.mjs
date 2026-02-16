@@ -729,7 +729,7 @@ test("complete → stringify → parse round-trip", () => {
   for (const input of inputs) {
     const r1 = vj.parse(input);
     assertEqual(r1.status, "complete");
-    const json = vj.stringify(r1.value);
+    const json = JSON.stringify(r1.value);
     const r2 = vj.parse(json);
     assertEqual(r2.status, "complete");
     assertEqual(JSON.stringify(vj.materialize(r2.value)), JSON.stringify(vj.materialize(r1.value)));
@@ -740,7 +740,7 @@ test("incomplete → autocomplete → re-parse produces complete", () => {
   // Parse incomplete JSON, stringify the autocompleted result, re-parse — now it's complete
   const r1 = vj.parse('[1,2,{"a":');
   assertEqual(r1.status, "incomplete");
-  const complete = vj.stringify(r1.value);
+  const complete = JSON.stringify(r1.value);
   const r2 = vj.parse(complete);
   assertEqual(r2.status, "complete");
   assertEqual(r2.value, [1, 2, { a: null }]);

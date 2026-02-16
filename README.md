@@ -1,18 +1,16 @@
 # VectorJSON
 
-SIMD-accelerated streaming JSON parser for JavaScript. Replaces the O(n²) partial-JSON parsers in Vercel AI SDK, Anthropic SDK, and TanStack AI with an O(n) WASM streaming parser.
+O(n) WASM SIMD streaming JSON parser. Parses incomplete JSON, returns lazy proxies, tracks what's real vs autocompleted.
 
 ## Why
 
-Three problems with how AI SDKs parse streaming JSON today:
+**1. `buffer += chunk` creates garbage faster than GC collects it.**
+Every concat allocates a new string. The old one is garbage. Longer responses = bigger garbage, arriving faster than GC can free it.
 
-**1. Buffer strings grow faster than GC can free them.**
-Every `buffer += chunk` allocates a new, longer string — the old one becomes garbage. As LLMs get faster and responses get longer, each discarded buffer is larger than the last, and new ones arrive before GC can collect the old.
+**2. You can't act on partial data.**
+LLM generates 100 tasks in a JSON array — you want to start on task 1 immediately. Current parsers fail on incomplete JSON or force full materialization. VectorJSON returns lazy proxies on truncated input; `isComplete()` tells you what's real vs autocompleted.
 
-**2. The agent bottleneck is data, not CPU — but you can't act on partial data.**
-When an LLM generates 100 tasks in a JSON array, you could start executing task 1 as soon as it arrives. But current parsers either fail on incomplete JSON or force you to materialize the entire tree. VectorJSON parses incomplete JSON into lazy proxies — access only what you need, and `isComplete()` tells you which elements are real vs autocompleted.
-
-**3. O(n²) parsing at streaming frequency.**
+**3. O(n²) re-parsing on every chunk.**
 Every AI SDK re-parses the full buffer on every chunk:
 
 ```js
@@ -25,7 +23,7 @@ for await (const chunk of stream) {
 
 For a 100KB response in 12-char chunks, that's ~8,500 full parses — O(n²) CPU time.
 
-**VectorJSON solves all three:**
+**VectorJSON:**
 
 ```js
 const parser = vj.createParser();
@@ -47,9 +45,9 @@ for (const task of tasks) {
 
 ## Benchmarks
 
-Simulates real AI SDK streaming: ~12 chars/chunk, parser called after every chunk.
+~12 chars/chunk, parser called after every chunk (what AI SDKs actually do).
 
-Run: `bun --expose-gc bench/ai-parsers/bench.mjs`
+`bun --expose-gc bench/ai-parsers/bench.mjs`
 
 | Payload | Vercel AI SDK | Anthropic SDK | TanStack AI | VectorJSON | Speedup |
 |---------|--------------|---------------|-------------|------------|---------|
@@ -85,12 +83,12 @@ npm install vectorjson
 import { init } from "vectorjson";
 const vj = await init();
 
-// One-shot parse (returns lazy Proxy — values materialize on access)
+// One-shot
 const result = vj.parse('{"users": [{"name": "Alice"}]}');
-console.log(result.status);       // "complete" | "complete_early" | "incomplete" | "invalid"
-console.log(result.value.users);  // lazy — only materializes when accessed
+result.status;       // "complete" | "complete_early" | "incomplete" | "invalid"
+result.value.users;  // lazy Proxy — materializes on access
 
-// Streaming parse
+// Streaming
 const parser = vj.createParser();
 parser.feed('{"hel');
 parser.feed('lo": "wor');
@@ -98,22 +96,18 @@ parser.feed('ld"}');
 console.log(parser.getValue()); // { hello: "world" }
 parser.destroy();
 
-// Drop-in replacement for AI SDK partial JSON parsers
+// AI SDK compatible
 const partial = vj.parsePartialJson('{"a": 1, "b": ');
-// partial.value = { a: 1, b: null }, partial.state = "repaired-parse"
+// { value: { a: 1, b: null }, state: "repaired-parse" }
 ```
 
 ## API
 
 ### `init(options?): Promise<VectorJSON>`
 
-Initialize and return the cached singleton. Loads the WASM module once.
-
-Options: `{ engineWasm?: string | URL | BufferSource }` — custom WASM location.
+Loads WASM once, returns cached singleton. `{ engineWasm?: string | URL | BufferSource }` for custom WASM location.
 
 ### `vj.parse(input: string | Uint8Array): ParseResult`
-
-Parse JSON into a `ParseResult`:
 
 ```ts
 interface ParseResult {
@@ -126,16 +120,14 @@ interface ParseResult {
 }
 ```
 
-- **`complete`** — valid JSON, fully parsed
-- **`complete_early`** — valid JSON with trailing data (NDJSON). Use `remaining` for the rest.
-- **`incomplete`** — truncated JSON (e.g. mid-stream). Value is autocompleted and accessible.
-- **`invalid`** — structurally broken JSON
-
-For incomplete parses, `isComplete(element)` distinguishes real elements from autocompleted ones — useful for streaming UIs that render partial results.
+- **`complete`** — valid JSON
+- **`complete_early`** — valid JSON with trailing data (NDJSON); use `remaining` for the rest
+- **`incomplete`** — truncated JSON; value is autocompleted, `isComplete()` tells you what's real
+- **`invalid`** — broken JSON
 
 ### `vj.createParser(): StreamingParser`
 
-Incremental streaming parser. Each `feed()` processes only new bytes.
+Each `feed()` processes only new bytes — O(n) total.
 
 ```ts
 interface StreamingParser {
@@ -150,7 +142,7 @@ type FeedStatus = "incomplete" | "complete" | "error" | "end_early";
 
 ### `vj.parsePartialJson(input: string): PartialJsonResult`
 
-Drop-in replacement for Vercel AI SDK's `parsePartialJson`. Returns a plain JS object (not a Proxy).
+Compatible with Vercel AI SDK's `parsePartialJson` signature. Returns a plain JS object (not a Proxy).
 
 ```ts
 interface PartialJsonResult {
@@ -161,11 +153,7 @@ interface PartialJsonResult {
 
 ### `vj.materialize(value): unknown`
 
-Eagerly convert a lazy Proxy into a plain JS object tree. No-op on plain values.
-
-### `vj.stringify(value): string`
-
-Delegates to `JSON.stringify`.
+Convert a lazy Proxy into a plain JS object tree. No-op on plain values.
 
 ## Building from Source
 

@@ -89,8 +89,6 @@ export interface VectorJSON {
    * If the value is already a plain JS value, returns it as-is.
    */
   materialize(value: unknown): unknown;
-  /** Stringify a JS value to a JSON string (delegates to native JSON.stringify). */
-  stringify(value: unknown): string;
   /**
    * Drop-in replacement for AI SDK partial JSON parsers.
    * Parses a potentially incomplete JSON string and returns a plain JS object.
@@ -612,10 +610,6 @@ export async function init(options?: {
       return deepMaterializeDoc(docId, index);
     },
 
-    stringify(value: unknown): string {
-      return JSON.stringify(value);
-    },
-
     parsePartialJson(input: string): PartialJsonResult {
       if (!input) return { value: undefined, state: "failed-parse" };
       const result = _instance!.parse(input);
@@ -727,15 +721,6 @@ export async function init(options?: {
 export async function parse(input: string | Uint8Array): Promise<ParseResult> {
   const vj = await init();
   return vj.parse(input);
-}
-
-/**
- * Convenience: stringify a JS value using a pre-initialized instance.
- * Initializes on first call.
- */
-export async function stringify(value: unknown): Promise<string> {
-  const vj = await init();
-  return vj.stringify(value);
 }
 
 /**

@@ -147,55 +147,9 @@ async function run() {
   assert(vj.parse("'hello'").status !== "complete", "single-quoted string");
 
   // =============================================
-  // Stringify standards compliance
+  // Parse → stringify round-trip
   // =============================================
-  console.log("\nStringify — RFC 8259 compliance:");
-  assertEqual(vj.stringify(null), "null", "null");
-  assertEqual(vj.stringify(true), "true", "true");
-  assertEqual(vj.stringify(false), "false", "false");
-  assertEqual(vj.stringify(0), "0", "zero");
-  assertEqual(vj.stringify(-0), "0", "-0 → 0");
-  assertEqual(vj.stringify(1), "1", "integer");
-  assertEqual(vj.stringify(-1), "-1", "negative integer");
-  assertEqual(vj.stringify(""), '""', "empty string");
-  assertEqual(vj.stringify([]), "[]", "empty array");
-  assertEqual(vj.stringify({}), "{}", "empty object");
-
-  console.log("\nStringify — Escape sequences:");
-  assertEqual(vj.stringify('"'), '"\\""', "quote");
-  assertEqual(vj.stringify("\\"), '"\\\\"', "backslash");
-  assertEqual(vj.stringify("\n"), '"\\n"', "newline");
-  assertEqual(vj.stringify("\r"), '"\\r"', "carriage return");
-  assertEqual(vj.stringify("\t"), '"\\t"', "tab");
-  assertEqual(vj.stringify("\b"), '"\\b"', "backspace");
-  assertEqual(vj.stringify("\f"), '"\\f"', "form feed");
-  assertEqual(
-    vj.stringify("\x00"),
-    JSON.stringify("\x00"),
-    "null byte escaped"
-  );
-  assertEqual(
-    vj.stringify("\x1F"),
-    JSON.stringify("\x1F"),
-    "control char 0x1F escaped"
-  );
-
-  console.log("\nStringify — Special values:");
-  assertEqual(vj.stringify(NaN), "null", "NaN → null");
-  assertEqual(vj.stringify(Infinity), "null", "Infinity → null");
-  assertEqual(vj.stringify(-Infinity), "null", "-Infinity → null");
-  assertEqual(
-    vj.stringify({ a: undefined }),
-    "{}",
-    "undefined property omitted"
-  );
-  assertEqual(
-    vj.stringify([undefined]),
-    "[null]",
-    "undefined in array → null"
-  );
-
-  console.log("\nStringify — Round-trip correctness:");
+  console.log("\nRound-trip correctness:");
   const roundTripCases = [
     '{"key":"value"}',
     "[1,2,3,4,5]",
@@ -215,7 +169,7 @@ async function run() {
   ];
   for (const json of roundTripCases) {
     const parsed = vj.parse(json).value;
-    const restr = vj.stringify(parsed);
+    const restr = JSON.stringify(parsed);
     assertEqual(restr, json, `roundtrip: ${json.slice(0, 40)}`);
   }
 
