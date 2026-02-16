@@ -677,9 +677,20 @@ export async function init(options?: {
       }
 
       let destroyed = false;
-      let cachedValue: unknown = undefined;
-      let valueResolved = false;
+      let cachedValue: unknown = UNCACHED;
       let cachedRemaining: Uint8Array | null | undefined; // undefined = not yet cached
+
+      const ensureRemaining = () => {
+        if (cachedRemaining !== undefined) return;
+        const rPtr = engine.stream_get_remaining_ptr(streamId);
+        const rLen = engine.stream_get_remaining_len(streamId);
+        if (rLen > 0) {
+          cachedRemaining = new Uint8Array(rLen);
+          cachedRemaining.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
+        } else {
+          cachedRemaining = null;
+        }
+      };
 
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
@@ -693,7 +704,7 @@ export async function init(options?: {
 
         getValue(): unknown {
           if (destroyed) throw new Error("Parser already destroyed");
-          if (valueResolved) return cachedValue;
+          if (cachedValue !== UNCACHED) return cachedValue;
 
           const status = engine.stream_get_status(streamId);
           if (status === 0) {
@@ -709,16 +720,7 @@ export async function init(options?: {
 
           // Save remaining bytes BEFORE SIMD padding (padding starts at bufPtr + valueLen,
           // which is exactly where remaining bytes live in the end_early case)
-          if (cachedRemaining === undefined) {
-            const rPtr = engine.stream_get_remaining_ptr(streamId);
-            const rLen = engine.stream_get_remaining_len(streamId);
-            if (rLen > 0) {
-              cachedRemaining = new Uint8Array(rLen);
-              cachedRemaining.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
-            } else {
-              cachedRemaining = null;
-            }
-          }
+          ensureRemaining();
 
           // Pad for SIMD safety (zimdjson needs 64 bytes of padding)
           new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
@@ -729,22 +731,13 @@ export async function init(options?: {
             const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
             throw new SyntaxError(`VectorJSON: ${msg}`);
           }
-          cachedValue = buildDocRoot(docId);
-
-          valueResolved = true;
-          return cachedValue;
+          return (cachedValue = buildDocRoot(docId));
         },
 
         getRemaining(): Uint8Array | null {
           if (destroyed) return null;
-          // Return cached copy if getValue() already saved it (padding may have overwritten original)
-          if (cachedRemaining !== undefined) return cachedRemaining;
-          const rPtr = engine.stream_get_remaining_ptr(streamId);
-          const rLen = engine.stream_get_remaining_len(streamId);
-          if (rLen === 0) { cachedRemaining = null; return null; }
-          cachedRemaining = new Uint8Array(rLen);
-          cachedRemaining.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
-          return cachedRemaining;
+          ensureRemaining();
+          return cachedRemaining!;
         },
 
         getStatus(): FeedStatus {
@@ -757,8 +750,7 @@ export async function init(options?: {
           if (!destroyed) {
             engine.stream_destroy(streamId);
             destroyed = true;
-            cachedValue = undefined;
-            valueResolved = false;
+            cachedValue = UNCACHED;
           }
         },
       };
