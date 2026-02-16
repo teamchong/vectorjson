@@ -443,8 +443,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     var depth_val: i32 = 0;
     var in_string: bool = false;
     var escape_next: bool = false;
-    var root_completed: bool = false;
-    var root_type: enum { none, string, scalar } = .none;
+    var root_state: enum { none, string, scalar, completed } = .none;
     var scalar_start: u32 = 0;
 
     var i: u32 = 0;
@@ -462,8 +461,8 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 escape_next = true;
             } else if (c == '"') {
                 in_string = false;
-                if (depth_val == 0 and root_type == .string and !root_completed) {
-                    root_completed = true;
+                if (depth_val == 0 and root_state == .string) {
+                    root_state = .completed;
                     classify_value_end = i + 1;
                 }
             }
@@ -473,17 +472,17 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
 
         // Any non-scalar-body char at depth 0 terminates a pending scalar
         // Scalar body: digits, signs, decimal, exponent, plus keyword letters (true/false/null)
-        if (depth_val == 0 and root_type == .scalar and !root_completed) {
+        if (depth_val == 0 and root_state == .scalar) {
             switch (c) {
                 'a'...'z', '0'...'9', '-', '.', '+', 'E' => {},
-                else => { root_completed = true; classify_value_end = i; },
+                else => { root_state = .completed; classify_value_end = i; },
             }
         }
 
         switch (c) {
             '"' => {
-                if (depth_val == 0 and !root_completed and root_type == .none) {
-                    root_type = .string;
+                if (depth_val == 0 and root_state == .none) {
+                    root_state = .string;
                 }
                 in_string = true;
             },
@@ -493,14 +492,14 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
             '}', ']' => {
                 depth_val -= 1;
                 if (depth_val < 0) return 3; // invalid: unmatched closing bracket
-                if (depth_val == 0 and !root_completed) {
-                    root_completed = true;
+                if (depth_val == 0 and root_state != .completed) {
+                    root_state = .completed;
                     classify_value_end = i + 1;
                 }
             },
             't', 'f', 'n', '-', '0'...'9' => {
-                if (depth_val == 0 and !root_completed and root_type != .scalar) {
-                    root_type = .scalar;
+                if (depth_val == 0 and root_state == .none) {
+                    root_state = .scalar;
                     scalar_start = i;
                 }
             },
@@ -512,7 +511,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     // Handle pending scalar at EOF (e.g. "42" with no trailing whitespace)
     // Must validate that the scalar is actually complete — partial keywords
     // like "tr", "fal", "nul" should be treated as incomplete, not complete.
-    if (!root_completed and depth_val == 0 and !in_string and root_type == .scalar) {
+    if (root_state == .scalar and depth_val == 0 and !in_string) {
         const scalar = ptr[scalar_start..len];
         // Partial keyword prefix → incomplete (e.g. "tr", "fal", "nul")
         for ([_][]const u8{ "true", "false", "null" }) |kw| {
@@ -525,11 +524,11 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 return 0;
             }
         }
-        root_completed = true;
+        root_state = .completed;
         classify_value_end = len;
     }
 
-    if (!root_completed) {
+    if (root_state != .completed) {
         // Nothing started, still mid-string, or depth > 0 → incomplete
         return 0;
     }
