@@ -222,57 +222,29 @@ export async function init(options?: {
 
   const encoder = new TextEncoder();
 
-  // --- Persistent input buffer — grows to accommodate largest input, never shrinks ---
-  let inputBufPtr = 0;
-  let inputBufLen = 0;
+  // --- Reusable WASM buffers — grow-only, shared allocator pattern ---
+  const inputBuf = { ptr: 0, cap: 0 };
+  const keyBuf = { ptr: 0, cap: 0 };
+  const feedBuf = { ptr: 0, cap: 0 };
 
-  function ensureInputBuffer(needed: number): number {
-    if (needed <= inputBufLen) return inputBufPtr;
-    // Free old buffer
-    if (inputBufPtr !== 0) engine.dealloc(inputBufPtr, inputBufLen);
-    // Allocate with doubling strategy (minimum 4KB)
-    let cap = inputBufLen === 0 ? 4096 : inputBufLen;
+  function ensureBuf(buf: typeof inputBuf, needed: number, minCap: number): number {
+    if (needed <= buf.cap) return buf.ptr;
+    if (buf.ptr !== 0) engine.dealloc(buf.ptr, buf.cap);
+    let cap = buf.cap === 0 ? minCap : buf.cap;
     while (cap < needed) cap *= 2;
-    const ptr = engine.alloc(cap);
-    if (ptr === 0) throw new Error("VectorJSON: Failed to allocate input buffer");
-    inputBufPtr = ptr;
-    inputBufLen = cap;
-    return ptr;
-  }
-
-  // --- Reusable key buffer — avoids alloc/dealloc per property access ---
-  let keyBufPtr = 0;
-  let keyBufCap = 0;
-
-  // --- Reusable feed buffer — avoids alloc/dealloc per stream chunk ---
-  let feedBufPtr = 0;
-  let feedBufCap = 0;
-
-  function ensureFeedBuffer(needed: number): number {
-    if (needed <= feedBufCap) return feedBufPtr;
-    if (feedBufPtr !== 0) engine.dealloc(feedBufPtr, feedBufCap);
-    let cap = feedBufCap === 0 ? 4096 : feedBufCap;
-    while (cap < needed) cap *= 2;
-    feedBufPtr = engine.alloc(cap);
-    if (feedBufPtr === 0) throw new Error("VectorJSON: Failed to allocate feed buffer");
-    feedBufCap = cap;
-    return feedBufPtr;
+    buf.ptr = engine.alloc(cap);
+    if (buf.ptr === 0) throw new Error("VectorJSON: allocation failed");
+    buf.cap = cap;
+    return buf.ptr;
   }
 
   function writeKeyToMemory(str: string): { ptr: number; len: number } {
     if (str.length === 0) return { ptr: 1, len: 0 };
     const maxBytes = str.length * 3;
-    if (maxBytes > keyBufCap) {
-      if (keyBufPtr !== 0) engine.dealloc(keyBufPtr, keyBufCap);
-      let cap = keyBufCap === 0 ? 256 : keyBufCap;
-      while (cap < maxBytes) cap *= 2;
-      keyBufPtr = engine.alloc(cap);
-      if (keyBufPtr === 0) throw new Error("VectorJSON: Failed to allocate key buffer");
-      keyBufCap = cap;
-    }
-    const target = new Uint8Array(engine.memory.buffer, keyBufPtr, maxBytes);
+    ensureBuf(keyBuf, maxBytes, 256);
+    const target = new Uint8Array(engine.memory.buffer, keyBuf.ptr, maxBytes);
     const result = encoder.encodeInto(str, target);
-    return { ptr: keyBufPtr, len: result.written! };
+    return { ptr: keyBuf.ptr, len: result.written! };
   }
 
   // --- Constants ---
@@ -586,13 +558,13 @@ export async function init(options?: {
       let len: number;
       if (typeof input === "string") {
         const maxBytes = input.length * 3 + 64;
-        ptr = ensureInputBuffer(maxBytes);
+        ptr = ensureBuf(inputBuf, maxBytes, 4096);
         const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
         const result = encoder.encodeInto(input, target);
         len = result.written!;
       } else {
         len = input.byteLength;
-        ptr = ensureInputBuffer(len + 64);
+        ptr = ensureBuf(inputBuf, len + 64, 4096);
         new Uint8Array(engine.memory.buffer, ptr, len).set(input);
       }
       // Pad after input for SIMD safety
@@ -685,7 +657,7 @@ export async function init(options?: {
       }
 
       if (classification === CLASSIFY_INCOMPLETE) {
-        const parseLen = engine.autocomplete_input(ptr, len, inputBufLen);
+        const parseLen = engine.autocomplete_input(ptr, len, inputBuf.cap);
         if (parseLen === 0) {
           if (len === 0) return makeResult("incomplete", undefined, len, undefined);
           return invalidResult("Invalid JSON structure");
@@ -744,13 +716,13 @@ export async function init(options?: {
           if (typeof chunk === "string") {
             if (chunk.length === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
             const maxBytes = chunk.length * 3;
-            ptr = ensureFeedBuffer(maxBytes);
+            ptr = ensureBuf(feedBuf, maxBytes, 4096);
             const result = encoder.encodeInto(chunk, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
             len = result.written!;
           } else {
             len = chunk.byteLength;
             if (len === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-            ptr = ensureFeedBuffer(len);
+            ptr = ensureBuf(feedBuf, len, 4096);
             new Uint8Array(engine.memory.buffer, ptr, len).set(chunk);
           }
           const status = engine.stream_feed(streamId, ptr, len);
