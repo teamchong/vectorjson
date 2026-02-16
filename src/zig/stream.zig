@@ -18,18 +18,8 @@ pub const FeedStatus = enum(i32) {
     end_early = 3,
 };
 
-/// Maximum nesting depth for path tracking
-const MAX_DEPTH = 256;
 /// Maximum total buffer size (64 MB)
 const MAX_BUFFER_SIZE = 64 * 1024 * 1024;
-
-/// Path segment: either an object key or an array index
-const PathSegment = struct {
-    /// For arrays: current element index
-    array_index: u32 = 0,
-    /// 'o' for object, 'a' for array
-    container_type: u8 = 0,
-};
 
 pub const StreamState = struct {
     // --- Accumulation buffer ---
@@ -42,10 +32,6 @@ pub const StreamState = struct {
     in_string: bool = false,
     escape_next: bool = false,
     scan_offset: u32 = 0,
-
-    // --- Path tracking ---
-    path_stack: [MAX_DEPTH]PathSegment = undefined,
-    path_depth: u16 = 0,
 
     // --- Status ---
     status: FeedStatus = .incomplete,
@@ -165,19 +151,9 @@ pub const StreamState = struct {
                         self.root_value_start = i;
                     }
                     self.depth += 1;
-                    if (self.path_depth < MAX_DEPTH) {
-                        self.path_stack[self.path_depth] = .{
-                            .container_type = c,
-                            .array_index = 0,
-                        };
-                        self.path_depth += 1;
-                    }
                 },
                 '}', ']' => {
                     self.depth -= 1;
-                    if (self.path_depth > 0) {
-                        self.path_depth -= 1;
-                    }
                     if (self.depth == 0) {
                         self.markRootComplete(i + 1);
                     }
@@ -198,14 +174,6 @@ pub const StreamState = struct {
                 ' ', '\t', '\n', '\r' => {
                     if (self.depth == 0 and self.pending_scalar_root) {
                         self.markRootComplete(i);
-                    }
-                },
-                ',' => {
-                    if (self.path_depth > 0) {
-                        const seg = &self.path_stack[self.path_depth - 1];
-                        if (seg.container_type == '[') {
-                            seg.array_index += 1;
-                        }
                     }
                 },
                 else => {},

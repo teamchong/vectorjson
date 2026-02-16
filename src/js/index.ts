@@ -459,11 +459,7 @@ export async function init(options?: {
       if (typeof prop === 'string') {
         const idx = Number(prop);
         if (Number.isInteger(idx) && idx >= 0 && idx < target._l) {
-          const indices = batchElemIndices(target);
-          return {
-            value: resolveValue(target._d, indices[idx], target._k, target._g, target._f, target._p),
-            writable: false, enumerable: true, configurable: true,
-          };
+          return { value: this.get!(target, prop, target), writable: false, enumerable: true, configurable: true };
         }
       }
       return undefined;
