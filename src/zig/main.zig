@@ -341,6 +341,17 @@ export fn doc_get_close_index(doc_id: i32, index: u32) u32 {
     };
 }
 
+/// Advance past one tape value, returning the index of the next entry.
+/// Containers jump to their closing bracket's successor; numbers skip their data word.
+inline fn nextTapeEntry(tape: anytype, val_idx: u32) u32 {
+    const w = tape.get(val_idx);
+    return switch (w.tag) {
+        .array_opening, .object_opening => w.data.ptr,
+        .unsigned, .signed, .double => val_idx + 2,
+        else => val_idx + 1,
+    };
+}
+
 /// Find a field in an object by key. Returns the tape index of the VALUE,
 /// or 0 if not found (0 is the root word, never a valid value position).
 export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_len: u32) u32 {
@@ -360,12 +371,7 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
         }
 
         // Skip to next key: advance past key + value
-        const val_w = p.tape.get(curr + 1);
-        curr = switch (val_w.tag) {
-            .array_opening, .object_opening => val_w.data.ptr, // past closing bracket
-            .unsigned, .signed, .double => curr + 3, // key + value_tag + number_data
-            else => curr + 2, // key + value
-        };
+        curr = nextTapeEntry(p.tape, curr + 1);
     }
 }
 
@@ -396,13 +402,7 @@ export fn doc_array_elements(doc_id: i32, arr_index: u32) u32 {
         if (w.tag == .array_closing) break;
         batch_buffer[count] = curr;
         count += 1;
-
-        // Advance to next element
-        curr = switch (w.tag) {
-            .array_opening, .object_opening => w.data.ptr,
-            .unsigned, .signed, .double => curr + 2,
-            else => curr + 1,
-        };
+        curr = nextTapeEntry(p.tape, curr);
     }
     return count;
 }
@@ -422,14 +422,7 @@ export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
         if (w.tag == .object_closing) break;
         batch_buffer[count] = curr; // key index
         count += 1;
-
-        // Skip past key + value
-        const val_w = p.tape.get(curr + 1);
-        curr = switch (val_w.tag) {
-            .array_opening, .object_opening => val_w.data.ptr,
-            .unsigned, .signed, .double => curr + 3,
-            else => curr + 2,
-        };
+        curr = nextTapeEntry(p.tape, curr + 1);
     }
     return count;
 }
