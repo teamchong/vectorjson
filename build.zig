@@ -3,14 +3,16 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
+    });
+
     // --- zimdjson module (local patched copy) ---
     const zimdjson = b.addModule("zimdjson", .{
         .root_source_file = b.path("deps/zimdjson/src/zimdjson.zig"),
-        .target = b.resolveTargetQuery(.{
-            .cpu_arch = .wasm32,
-            .os_tag = .freestanding,
-            .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
-        }),
+        .target = wasm_target,
         .optimize = optimize,
     });
 
@@ -25,11 +27,7 @@ pub fn build(b: *std.Build) void {
         .name = "engine",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/zig/main.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .wasm32,
-                .os_tag = .freestanding,
-                .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
-            }),
+            .target = wasm_target,
             .optimize = optimize,
         }),
     });
