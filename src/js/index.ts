@@ -260,7 +260,7 @@ export async function init(options?: {
     return { ptr: keyBufPtr, len: result.written! };
   }
 
-  // --- Tag constants ---
+  // --- Constants ---
   const TAG_NULL = 0;
   const TAG_TRUE = 1;
   const TAG_FALSE = 2;
@@ -268,6 +268,11 @@ export async function init(options?: {
   const TAG_STRING = 4;
   const TAG_OBJECT = 5;
   const TAG_ARRAY = 6;
+
+  const FEED_STATUS: readonly FeedStatus[] = ["incomplete", "complete", "error", "end_early"];
+  const CLASSIFY_INCOMPLETE = 0;
+  const CLASSIFY_COMPLETE_EARLY = 2;
+  const CLASSIFY_INVALID = 3;
 
   // --- Sentinel to mark lazy proxy objects ---
   const LAZY_PROXY = Symbol("vectorjson.lazy");
@@ -546,13 +551,22 @@ export async function init(options?: {
     return resolveValue(docId, 1, keepAlive, generation, freeFn, rootTag === TAG_OBJECT ? true : proxyObjects);
   }
 
+  // --- Helper: retry doc_parse with GC on slot exhaustion ---
+  function tryDocParse(p: number, l: number): number {
+    let docId = engine.doc_parse(p, l);
+    if (docId < 0) {
+      const errCode = engine.get_error_code();
+      if (errCode === 2 || errCode === 13) {
+        if (typeof globalThis.gc === "function") globalThis.gc();
+        docId = engine.doc_parse(p, l);
+      }
+    }
+    return docId;
+  }
+
   // --- Public API ---
   _instance = {
     parse(input: string | Uint8Array): ParseResult {
-      const CLASSIFY_INCOMPLETE = 0;
-      const CLASSIFY_COMPLETE_EARLY = 2;
-      const CLASSIFY_INVALID = 3;
-
       // Write input into reusable WASM buffer with extra headroom for autocomplete
       let ptr: number;
       let len: number;
@@ -569,19 +583,6 @@ export async function init(options?: {
       }
       // Pad after input for SIMD safety
       new Uint8Array(engine.memory.buffer, ptr + len, 64).fill(0x20);
-
-      // Helper: retry doc_parse with GC on slot exhaustion
-      const tryDocParse = (p: number, l: number): number => {
-        let docId = engine.doc_parse(p, l);
-        if (docId < 0) {
-          const errCode = engine.get_error_code();
-          if (errCode === 2 || errCode === 13) {
-            if (typeof globalThis.gc === "function") globalThis.gc();
-            docId = engine.doc_parse(p, l);
-          }
-        }
-        return docId;
-      };
 
       // Helper: build ParseResult with isComplete() and toJSON()
       const makeResult = (
@@ -718,13 +719,6 @@ export async function init(options?: {
     },
 
     createParser(): StreamingParser {
-      const STATUS_MAP: Record<number, FeedStatus> = {
-        0: "incomplete",
-        1: "complete",
-        2: "error",
-        3: "end_early",
-      };
-
       const streamId = engine.stream_create();
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
@@ -741,7 +735,7 @@ export async function init(options?: {
           const bytes =
             typeof chunk === "string" ? encoder.encode(chunk) : chunk;
           const len = bytes.byteLength;
-          if (len === 0) return STATUS_MAP[engine.stream_get_status(streamId)]!;
+          if (len === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
 
           // Allocate in engine memory and copy the chunk
           const ptr = engine.alloc(len);
@@ -750,7 +744,7 @@ export async function init(options?: {
           try {
             new Uint8Array(engine.memory.buffer, ptr, len).set(bytes);
             const status = engine.stream_feed(streamId, ptr, len);
-            return STATUS_MAP[status] || "error";
+            return FEED_STATUS[status] || "error";
           } finally {
             engine.dealloc(ptr, len);
           }
@@ -815,7 +809,7 @@ export async function init(options?: {
         getStatus(): FeedStatus {
           if (destroyed) return "error";
           const status = engine.stream_get_status(streamId);
-          return STATUS_MAP[status] || "error";
+          return FEED_STATUS[status] || "error";
         },
 
         destroy(): void {
