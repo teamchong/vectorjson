@@ -101,12 +101,14 @@ async function testPayload(label, text, bytes, expected) {
     parser.destroy();
   });
 
-  // 6. parsePartialJson() on complete input
-  await test(`${label} (${sizeKB}KB): parsePartialJson(complete)`, () => {
-    const { value, state } = vj.parsePartialJson(text);
-    assert(state === "successful-parse", `state=${state}`);
-    assertEqual(value, expected);
-  });
+  // 6. parsePartialJson() on complete input (skip for >10MB — materializes full object, heavy on memory)
+  if (size <= 10 * 1024 * 1024) {
+    await test(`${label} (${sizeKB}KB): parsePartialJson(complete)`, () => {
+      const { value, state } = vj.parsePartialJson(text);
+      assert(state === "successful-parse", `state=${state}`);
+      assertEqual(value, expected);
+    });
+  }
 }
 
 // ============================================================
@@ -218,6 +220,30 @@ console.log("\n--- Synthetic large payloads ---");
   const text = JSON.stringify(bigArr);
   const bytes = new TextEncoder().encode(text);
   await testPayload("Synthetic 500KB stress payload", text, bytes, bigArr);
+}
+
+// 2g. ~10MB stress test
+{
+  const arr = [];
+  for (let i = 0; i < 40000; i++)
+    arr.push({ id: i, name: `user_${i}`, email: `u${i}@test.com`, bio: "x".repeat(150), score: i * 0.01 });
+  const text = JSON.stringify(arr);
+  const bytes = new TextEncoder().encode(text);
+  await testPayload("Synthetic ~10MB payload", text, bytes, arr);
+}
+
+// 2h. ~100MB stress test — proves we handle large inputs end-to-end
+{
+  const arr = [];
+  for (let i = 0; i < 200000; i++)
+    arr.push({
+      id: i,
+      content: "The quick brown fox jumps over the lazy dog. ".repeat(8) + `Record #${i}`,
+      values: [i, i + 1, i + 2, i + 3, i + 4],
+    });
+  const text = JSON.stringify(arr);
+  const bytes = new TextEncoder().encode(text);
+  await testPayload("Synthetic ~100MB payload", text, bytes, arr);
 }
 
 // ============================================================
