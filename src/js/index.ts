@@ -1862,11 +1862,8 @@ export async function init(options?: {
             }
 
             if (value === undefined) return undefined;
-            if (schema) {
-              const result = schema.safeParse(value);
-              if (!result.success) return undefined;
-              value = result.data;
-            }
+            // Incomplete: return partial value without schema gating.
+            // User checks getStatus() to know it's not final.
             return value;
           }
 

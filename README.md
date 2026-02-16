@@ -230,7 +230,7 @@ parser.feed(llmOutput);
 
 Validate and auto-infer types with Zod, Valibot, ArkType, or any lib with `.safeParse()`. Works on all three APIs:
 
-**Streaming parser** — `getValue()` returns `undefined` until the value passes the schema:
+**Streaming parser with typed partial objects** — like Vercel AI SDK's `output`, but O(n) instead of O(n²):
 
 ```ts
 import { z } from 'zod';
@@ -238,10 +238,12 @@ const User = z.object({ name: z.string(), age: z.number() });
 
 const parser = vj.createParser(User);       // T inferred from schema
 for await (const chunk of stream) {
-  const s = parser.feed(chunk);
-  if (s === "complete") break;
+  parser.feed(chunk);
+  const partial = parser.getValue();         // { name: "Ali" } mid-stream — always available
+  const done = parser.getStatus() === "complete";
+  updateUI(partial, done);                   // render as fields arrive
 }
-const user = parser.getValue();              // { name: string; age: number } | undefined ✅
+// On complete: getValue() runs safeParse → returns validated data or undefined
 parser.destroy();
 ```
 

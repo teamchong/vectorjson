@@ -267,12 +267,13 @@ await test("schema: createParser(schema) rejects all → undefined", () => {
   p.destroy();
 });
 
-await test("schema: createParser(schema) on incomplete returns undefined when schema fails", () => {
+await test("schema: createParser(schema) on incomplete returns partial value without schema gating", () => {
   const p = vj.createParser(userSchema);
   p.feed('{"name":"Ali');
-  // Incomplete → autocompleted to {"name":"Ali"} → schema fails (missing age) → undefined
+  // Incomplete → returns partial value as-is (user checks getStatus() for completeness)
   const val = p.getValue();
-  assertEqual(val, undefined);
+  assertEqual(val, { name: "Ali" });
+  assertEqual(p.getStatus(), "incomplete");
   p.destroy();
 });
 
