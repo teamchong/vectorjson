@@ -570,9 +570,7 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
     var stack_depth: u32 = 0;
     var in_string: bool = false;
     var escape_next: bool = false;
-    var after_colon: bool = false; // true when we just saw ':' and no value yet
-    var after_comma_in_obj: bool = false; // true when last significant token was ',' inside object
-    var after_comma_in_arr: bool = false; // true when last significant token was ',' inside array
+    var pending: enum { none, colon, comma_obj, comma_arr } = .none;
 
     var i: u32 = 0;
     while (i < len) {
@@ -596,27 +594,14 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
         }
 
         // Non-whitespace tokens always clear pending-value flags
-        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
-            after_colon = false;
-            after_comma_in_obj = false;
-            after_comma_in_arr = false;
-        }
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') pending = .none;
         switch (c) {
-            ':' => after_colon = true,
-            ',' => {
-                after_comma_in_obj = stack_depth > 0 and container_stack[stack_depth - 1] == '{';
-                after_comma_in_arr = !after_comma_in_obj;
-            },
+            ':' => pending = .colon,
+            ',' => pending = if (stack_depth > 0 and container_stack[stack_depth - 1] == '{') .comma_obj else .comma_arr,
             '"' => in_string = true,
-            '{' => {
+            '{', '[' => {
                 if (stack_depth < container_stack.len) {
-                    container_stack[stack_depth] = '{';
-                    stack_depth += 1;
-                }
-            },
-            '[' => {
-                if (stack_depth < container_stack.len) {
-                    container_stack[stack_depth] = '[';
+                    container_stack[stack_depth] = c;
                     stack_depth += 1;
                 }
             },
@@ -650,7 +635,7 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
     // ── Partial atom completion ──
     // Detect and complete partial atoms (booleans, null, numbers with trailing dot)
     // at the tail of the input. These occur when an LLM streams mid-token.
-    if (!in_string and !escape_next and !after_colon and !after_comma_in_obj and !after_comma_in_arr) {
+    if (!in_string and !escape_next and pending == .none) {
         // Scan backwards past the trailing atom characters to find the atom start
         var atom_end = len;
         while (atom_end > 0) {
@@ -728,9 +713,9 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
             write_pos = strip_to;
         }
         w.append("\"");
-    } else if (after_comma_in_obj) {
+    } else if (pending == .comma_obj) {
         w.append("\"\":null");
-    } else if (after_colon or after_comma_in_arr) {
+    } else if (pending == .colon or pending == .comma_arr) {
         w.append("null");
     }
 
