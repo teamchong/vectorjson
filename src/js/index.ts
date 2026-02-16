@@ -237,13 +237,25 @@ export async function init(options?: {
     return buf.ptr;
   }
 
-  function writeKeyToMemory(str: string): { ptr: number; len: number } {
-    if (str.length === 0) return { ptr: 1, len: 0 };
-    const maxBytes = str.length * 3;
-    ensureBuf(keyBuf, maxBytes, 256);
-    const target = new Uint8Array(engine.memory.buffer, keyBuf.ptr, maxBytes);
-    const result = encoder.encodeInto(str, target);
-    return { ptr: keyBuf.ptr, len: result.written! };
+  /** Encode string or copy Uint8Array into a reusable WASM buffer. Returns { ptr, len }. */
+  function writeToWasm(
+    input: string | Uint8Array, buf: typeof inputBuf, extraCap: number, minCap: number,
+  ): { ptr: number; len: number } {
+    if (typeof input === "string") {
+      const maxBytes = input.length * 3 + extraCap;
+      const ptr = ensureBuf(buf, maxBytes, minCap);
+      const result = encoder.encodeInto(input, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+      return { ptr, len: result.written! };
+    }
+    const len = input.byteLength;
+    const ptr = ensureBuf(buf, len + extraCap, minCap);
+    new Uint8Array(engine.memory.buffer, ptr, len).set(input);
+    return { ptr, len };
+  }
+
+  function writeKeyToMemory(key: string): { ptr: number; len: number } {
+    if (key.length === 0) return { ptr: 1, len: 0 };
+    return writeToWasm(key, keyBuf, 0, 256);
   }
 
   // --- Constants ---
@@ -542,19 +554,7 @@ export async function init(options?: {
   _instance = {
     parse(input: string | Uint8Array): ParseResult {
       // Write input into reusable WASM buffer with extra headroom for autocomplete
-      let ptr: number;
-      let len: number;
-      if (typeof input === "string") {
-        const maxBytes = input.length * 3 + 64;
-        ptr = ensureBuf(inputBuf, maxBytes, 4096);
-        const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
-        const result = encoder.encodeInto(input, target);
-        len = result.written!;
-      } else {
-        len = input.byteLength;
-        ptr = ensureBuf(inputBuf, len + 64, 4096);
-        new Uint8Array(engine.memory.buffer, ptr, len).set(input);
-      }
+      const { ptr, len } = writeToWasm(input, inputBuf, 64, 4096);
       // Pad after input for SIMD safety
       new Uint8Array(engine.memory.buffer, ptr + len, 64).fill(0x20);
 
@@ -695,20 +695,9 @@ export async function init(options?: {
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
           if (destroyed) throw new Error("Parser already destroyed");
-          let ptr: number;
-          let len: number;
-          if (typeof chunk === "string") {
-            if (chunk.length === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-            const maxBytes = chunk.length * 3;
-            ptr = ensureBuf(feedBuf, maxBytes, 4096);
-            const result = encoder.encodeInto(chunk, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
-            len = result.written!;
-          } else {
-            len = chunk.byteLength;
-            if (len === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-            ptr = ensureBuf(feedBuf, len, 4096);
-            new Uint8Array(engine.memory.buffer, ptr, len).set(chunk);
-          }
+          const chunkLen = typeof chunk === "string" ? chunk.length : chunk.byteLength;
+          if (chunkLen === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+          const { ptr, len } = writeToWasm(chunk, feedBuf, 0, 4096);
           const status = engine.stream_feed(streamId, ptr, len);
           return FEED_STATUS[status] || "error";
         },
