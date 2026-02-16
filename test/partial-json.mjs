@@ -202,6 +202,24 @@ test("standalone minus → invalid (not a real LLM streaming scenario)", () => {
   assertEqual(r.status, "invalid");
 });
 
+test("trailing 'e-' stripped iteratively: '1.23e-' → 1.23", () => {
+  const r = vj.parse('{"a": 1.23e-');
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), { a: 1.23 });
+});
+
+test("trailing 'e+' stripped iteratively: '1e+' → 1", () => {
+  const r = vj.parse('{"a": 1e+');
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), { a: 1 });
+});
+
+test("trailing 'e-' in array: [1, 2.5e-", () => {
+  const r = vj.parse("[1, 2.5e-");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), [1, 2.5]);
+});
+
 test("valid number not modified: 42", () => {
   const r = vj.parse('{"a": 42');
   assertEqual(r.status, "incomplete");

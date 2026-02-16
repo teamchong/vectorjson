@@ -298,7 +298,7 @@ export async function init(options?: {
     // (can happen when SIMD parsing reads past truncated unicode escapes)
     if (len <= 0 || len > 0x7FFFFFFF) return "";
     const batchPtr = engine.doc_batch_ptr();
-    const ptr = new Uint32Array(engine.memory.buffer, batchPtr as unknown as number, 2)[0];
+    const ptr = new Uint32Array(engine.memory.buffer, batchPtr, 2)[0];
     return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
   }
 
@@ -491,7 +491,7 @@ export async function init(options?: {
         const count = engine.doc_object_keys(target._d, target._i);
         const batchPtr = engine.doc_batch_ptr();
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr as unknown as number, count));
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
         for (let i = 0; i < count; i++) {
           target._keys.push(docReadString(target._d, idxCopy[i]));
         }
@@ -500,13 +500,9 @@ export async function init(options?: {
     },
     getOwnPropertyDescriptor(target, prop) {
       if (typeof prop !== 'string') return undefined;
-      // Trigger get() to populate cache, then return descriptor from cache
+      // JSON cannot produce undefined — get() returning undefined means field not found
       const val = this.get!(target, prop, target);
-      if (val === undefined) {
-        // Check if field actually exists (val could be legitimately undefined)
-        const { ptr, len } = writeKeyToMemory(prop);
-        if (engine.doc_find_field(target._d, target._i, ptr, len) === 0) return undefined;
-      }
+      if (val === undefined) return undefined;
       return { value: val, writable: false, enumerable: true, configurable: true };
     },
   };

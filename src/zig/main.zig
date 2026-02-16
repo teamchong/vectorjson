@@ -120,11 +120,12 @@ var doc_active: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 
 // --- Source position tracking ---
 // Per-slot arrays mapping tape index → byte offset in the parsed input.
-// Built post-parse by correlating tape words with token indices.
+// Built lazily on first doc_get_src_pos call by correlating tape words with token indices.
 // Used by JS isComplete() to check if a value was autocompleted.
 var doc_src_positions: [MAX_DOC_SLOTS]?[*]u32 = .{null} ** MAX_DOC_SLOTS;
 var doc_src_pos_cap: [MAX_DOC_SLOTS]u32 = .{0} ** MAX_DOC_SLOTS;
 var doc_src_pos_len: [MAX_DOC_SLOTS]u32 = .{0} ** MAX_DOC_SLOTS;
+var doc_src_pos_built: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 
 /// Build source position array for a document slot by walking tape + tokens in parallel.
 /// Token indices contain byte offsets of ALL structural characters ({, }, [, ], :, ", etc.).
@@ -252,9 +253,7 @@ export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     };
 
     doc_active[uid] = true;
-
-    // Build source position mapping (tape index → input byte offset)
-    buildDocSrcPositions(uid);
+    doc_src_pos_built[uid] = false; // mark for lazy build on first src_pos query
 
     return slot_id;
 }
@@ -323,10 +322,16 @@ export fn doc_get_count(doc_id: i32, index: u32) u32 {
 }
 
 /// Get the source byte offset of a tape entry in the parsed input.
+/// Lazily builds the src_positions array on first call (only needed for incomplete parses).
 /// Returns 0xFFFFFFFF if the doc or index is invalid.
 export fn doc_get_src_pos(doc_id: i32, idx: u32) u32 {
     if (doc_id < 0 or doc_id >= MAX_DOC_SLOTS) return 0xFFFFFFFF;
     const uid: usize = @intCast(doc_id);
+    if (!doc_active[uid]) return 0xFFFFFFFF;
+    if (!doc_src_pos_built[uid]) {
+        buildDocSrcPositions(uid);
+        doc_src_pos_built[uid] = true;
+    }
     if (idx >= doc_src_pos_len[uid]) return 0xFFFFFFFF;
     const positions = doc_src_positions[uid] orelse return 0xFFFFFFFF;
     return positions[idx];
@@ -733,13 +738,20 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                         break;
                     }
                 }
-                // Strip invalid trailing number chars: "1." "1e" "1+" "-"
+                // Strip trailing incomplete number chars iteratively:
+                // "1.23e-" → strip "-" → "1.23e" → strip "e" → "1.23"
+                // "1." → strip "." → "1"
+                // "-" → strip all → atom_start (no valid prefix → leaves invalid)
                 if (!atom_handled and atom.len > 0) {
-                    const last_ch = atom[atom.len - 1];
-                    if (last_ch == '.' or last_ch == 'e' or last_ch == 'E') {
-                        write_pos = atom_start + atom.len - 1;
-                    } else if (last_ch == '-' or last_ch == '+') {
-                        write_pos = atom_start;
+                    var strip_pos = atom_start + atom.len;
+                    while (strip_pos > atom_start) {
+                        const ch = ptr[strip_pos - 1];
+                        if (ch == '.' or ch == 'e' or ch == 'E' or ch == '-' or ch == '+') {
+                            strip_pos -= 1;
+                        } else break;
+                    }
+                    if (strip_pos < atom_start + atom.len) {
+                        write_pos = if (strip_pos > atom_start) strip_pos else atom_start;
                     }
                 }
             }
