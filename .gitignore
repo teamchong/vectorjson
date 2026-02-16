@@ -22,4 +22,7 @@ deps/
 # Log files
 *.log
 
+# Test results
+test-results/
+
 # Generated benchmark files
