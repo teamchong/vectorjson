@@ -17,8 +17,8 @@ pub const FeedStatus = enum(i32) {
     end_early = 3,
 };
 
-/// Maximum total buffer size (64 MB)
-const MAX_BUFFER_SIZE = 64 * 1024 * 1024;
+/// Maximum total buffer size (1 GB)
+const MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 
 pub const StreamState = struct {
     // --- Accumulation buffer ---

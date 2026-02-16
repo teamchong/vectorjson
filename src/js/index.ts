@@ -299,7 +299,7 @@ export async function init(options?: {
     if (buf.ptr !== 0) engine.dealloc(buf.ptr, buf.cap);
     let cap = buf.cap === 0 ? minCap : buf.cap;
     while (cap < needed) cap *= 2;
-    buf.ptr = engine.alloc(cap);
+    buf.ptr = engine.alloc(cap) >>> 0;
     if (buf.ptr === 0) throw new Error("VectorJSON: allocation failed");
     buf.cap = cap;
     return buf.ptr;
@@ -310,9 +310,16 @@ export async function init(options?: {
     input: string | Uint8Array, buf: typeof inputBuf, extraCap: number, minCap: number,
   ): { ptr: number; len: number } {
     if (typeof input === "string") {
-      const maxBytes = input.length * 3 + extraCap;
-      const ptr = ensureBuf(buf, maxBytes, minCap);
-      const result = encoder.encodeInto(input, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+      // Try optimistic allocation (1x for likely-ASCII), fall back to 3x for multi-byte
+      let maxBytes = input.length + extraCap;
+      let ptr = ensureBuf(buf, maxBytes, minCap);
+      let result = encoder.encodeInto(input, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+      if (result.read! < input.length) {
+        // Input has multi-byte chars — reallocate with worst-case 3x
+        maxBytes = input.length * 3 + extraCap;
+        ptr = ensureBuf(buf, maxBytes, minCap);
+        result = encoder.encodeInto(input, new Uint8Array(engine.memory.buffer, ptr, maxBytes));
+      }
       return { ptr, len: result.written! };
     }
     const len = input.byteLength;
@@ -328,7 +335,7 @@ export async function init(options?: {
 
   // --- Constants ---
   // Batch buffer address is a fixed global in WASM — cache to avoid repeated WASM calls
-  const batchAddr = engine.doc_batch_ptr();
+  const batchAddr = engine.doc_batch_ptr() >>> 0;
 
   const TAG_NULL = 0;
   const TAG_TRUE = 1;
@@ -399,9 +406,8 @@ export async function init(options?: {
   // The escape flag (batch_buffer[2]) tells us if decoding is needed,
   // avoiding a linear scan with includes('\\').
   function docReadString(docId: number, index: number): string {
-    const rawLen = engine.doc_read_string_raw(docId, index);
-    // WASM returns u32 but JS sees i32 — guard against corrupted lengths
-    if (rawLen <= 0 || rawLen > 0x7FFFFFFF) return "";
+    const rawLen = engine.doc_read_string_raw(docId, index) >>> 0;
+    if (rawLen === 0) return "";
 
     const batch = new Uint32Array(engine.memory.buffer, batchAddr, 3);
     const srcOffset = batch[0];
@@ -415,7 +421,7 @@ export async function init(options?: {
       return hasEscapes ? JSON.parse('"' + raw + '"') : raw;
     }
 
-    const inputPtr = engine.doc_get_input_ptr(docId);
+    const inputPtr = engine.doc_get_input_ptr(docId) >>> 0;
     const raw = utf8Decoder.decode(
       new Uint8Array(engine.memory.buffer, inputPtr + srcOffset, rawLen),
     );
@@ -438,10 +444,10 @@ export async function init(options?: {
       // Get source span: opening bracket → closing bracket (inclusive)
       // doc_get_close_index returns one-past-end (simdjson convention for skipping).
       // The actual closing bracket is at closeIdx - 1.
-      const startPos = engine.doc_get_src_pos(docId, index);
+      const startPos = (engine.doc_get_src_pos(docId, index) >>> 0);
       const closingTapeIdx = engine.doc_get_close_index(docId, index) - 1;
       const closePos = engine.doc_get_src_pos(docId, closingTapeIdx);
-      const inputPtr = engine.doc_get_input_ptr(docId);
+      const inputPtr = engine.doc_get_input_ptr(docId) >>> 0;
       const raw = new Uint8Array(
         engine.memory.buffer, inputPtr + startPos, closePos + 1 - startPos,
       );
@@ -705,7 +711,7 @@ export async function init(options?: {
               const tag = engine.doc_get_tag(handle.docId, handle.index!);
               if (tag === TAG_OBJECT || tag === TAG_ARRAY) {
                 const closeIdx = engine.doc_get_close_index(handle.docId, handle.index!);
-                const closeSrcPos = engine.doc_get_src_pos(handle.docId, closeIdx);
+                const closeSrcPos = engine.doc_get_src_pos(handle.docId, closeIdx) >>> 0;
                 return closeSrcPos < autocompleteBoundary;
               }
               return true;
@@ -1427,7 +1433,7 @@ export async function init(options?: {
 
           // Scan new bytes with PathTracker (always runs — needed for live document builder)
           if (newLen > prevLen) {
-            const bufPtr = engine.stream_get_buffer_ptr(streamId);
+            const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
             // For end_early/complete: only scan up to the value boundary
             const scanEnd = (status === 1 || status === 3)
               ? Math.min(newLen, engine.stream_get_value_len(streamId))
@@ -1455,7 +1461,7 @@ export async function init(options?: {
               if (curStatus !== 1 && curStatus !== 3) break; // not complete/end_early
 
               // Copy value bytes before reset (SIMD padding would overwrite remaining)
-              const bp = engine.stream_get_buffer_ptr(streamId);
+              const bp = (engine.stream_get_buffer_ptr(streamId) >>> 0);
               const vl = engine.stream_get_value_len(streamId);
               const valueCopy = new Uint8Array(vl + 64);
               valueCopy.set(new Uint8Array(engine.memory.buffer, bp, vl));
@@ -1467,7 +1473,7 @@ export async function init(options?: {
               ptReset();
 
               // Now parse the copied value bytes
-              const parsePtr = engine.alloc(valueCopy.length);
+              const parsePtr = engine.alloc(valueCopy.length) >>> 0;
               if (parsePtr) {
                 new Uint8Array(engine.memory.buffer, parsePtr, valueCopy.length).set(valueCopy);
                 const did = engine.doc_parse(parsePtr, vl);
@@ -1479,7 +1485,7 @@ export async function init(options?: {
 
               // Scan remaining bytes with PathTracker
               if (remaining > 0 && (pathSubs.length > 0 || deltaSubs.length > 0)) {
-                const nbp = engine.stream_get_buffer_ptr(streamId);
+                const nbp = (engine.stream_get_buffer_ptr(streamId) >>> 0);
                 const nbl = engine.stream_get_buffer_len(streamId);
                 if (nbl > 0) {
                   const wb = new Uint8Array(engine.memory.buffer, nbp, nbl);
@@ -1524,7 +1530,7 @@ export async function init(options?: {
           }
 
           // complete or end_early — do a final WASM parse for correctness
-          const bufPtr = engine.stream_get_buffer_ptr(streamId);
+          const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
           const valueLen = engine.stream_get_value_len(streamId);
           new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
           const docId = engine.doc_parse(bufPtr, valueLen);
@@ -1538,7 +1544,7 @@ export async function init(options?: {
 
         getRemaining(): Uint8Array | null {
           if (destroyed) return null;
-          const rPtr = engine.stream_get_remaining_ptr(streamId);
+          const rPtr = (engine.stream_get_remaining_ptr(streamId) >>> 0);
           const rLen = engine.stream_get_remaining_len(streamId);
           if (rLen > 0) {
             const copy = new Uint8Array(rLen);
@@ -1787,7 +1793,7 @@ export async function init(options?: {
 
       const ensureRemaining = () => {
         if (cachedRemaining !== undefined) return;
-        const rPtr = engine.stream_get_remaining_ptr(streamId);
+        const rPtr = (engine.stream_get_remaining_ptr(streamId) >>> 0);
         const rLen = engine.stream_get_remaining_len(streamId);
         if (rLen > 0) {
           cachedRemaining = new Uint8Array(rLen);
@@ -1809,7 +1815,7 @@ export async function init(options?: {
           // Scan new bytes for live document building
           const newLen = engine.stream_get_buffer_len(streamId);
           if (newLen > prevLen) {
-            const bufPtr = engine.stream_get_buffer_ptr(streamId);
+            const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
             // For end_early/complete: only scan up to the value boundary, not trailing data
             const scanEnd = (rawStatus === 1 || rawStatus === 3)
               ? Math.min(newLen, engine.stream_get_value_len(streamId))
