@@ -116,10 +116,8 @@ var doc_active: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 // Per-slot arrays mapping tape index → byte offset in the parsed input.
 // Built lazily on first doc_get_src_pos call by correlating tape words with token indices.
 // Used by JS isComplete() to check if a value was autocompleted.
-var doc_src_positions: [MAX_DOC_SLOTS]?[*]u32 = .{null} ** MAX_DOC_SLOTS;
-var doc_src_pos_cap: [MAX_DOC_SLOTS]u32 = .{0} ** MAX_DOC_SLOTS;
-var doc_src_pos_len: [MAX_DOC_SLOTS]u32 = .{0} ** MAX_DOC_SLOTS;
-var doc_src_pos_built: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
+const DocSrcPos = struct { positions: ?[*]u32 = null, cap: u32 = 0, len: u32 = 0, built: bool = false };
+var doc_src: [MAX_DOC_SLOTS]DocSrcPos = .{DocSrcPos{}} ** MAX_DOC_SLOTS;
 
 /// Build source position array for a document slot by walking tape + tokens in parallel.
 /// Token indices contain byte offsets of ALL structural characters ({, }, [, ], :, ", etc.).
@@ -127,6 +125,7 @@ var doc_src_pos_built: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 /// produce tape entries.
 fn buildDocSrcPositions(uid: usize) void {
     const p = &doc_parsers[uid];
+    const sp = &doc_src[uid];
 
     // Compute tape length from root word (non-streaming mode uses pointer arithmetic,
     // so words.items().len is 0; the root word stores the closing root index).
@@ -135,22 +134,20 @@ fn buildDocSrcPositions(uid: usize) void {
     const tape_count: u32 = closing_root_idx + 1;
 
     // Reuse existing allocation if large enough, else grow
-    if (doc_src_pos_cap[uid] < tape_count) {
-        if (doc_src_positions[uid]) |old_ptr| {
-            gpa.free(old_ptr[0..doc_src_pos_cap[uid]]);
+    if (sp.cap < tape_count) {
+        if (sp.positions) |old_ptr| {
+            gpa.free(old_ptr[0..sp.cap]);
         }
         const positions = gpa.alloc(u32, tape_count) catch {
-            doc_src_positions[uid] = null;
-            doc_src_pos_cap[uid] = 0;
-            doc_src_pos_len[uid] = 0;
+            sp.* = .{};
             return;
         };
-        doc_src_positions[uid] = positions.ptr;
-        doc_src_pos_cap[uid] = tape_count;
+        sp.positions = positions.ptr;
+        sp.cap = tape_count;
     }
 
-    const positions = doc_src_positions[uid] orelse return;
-    doc_src_pos_len[uid] = tape_count;
+    const positions = sp.positions orelse return;
+    sp.len = tape_count;
 
     // Access token indices and input document
     const tok_items = p.tape.tokens.indexes.items;
@@ -241,7 +238,7 @@ export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     };
 
     doc_active[uid] = true;
-    doc_src_pos_built[uid] = false; // mark for lazy build on first src_pos query
+    doc_src[uid].built = false; // mark for lazy build on first src_pos query
 
     return @intCast(uid);
 }
@@ -315,13 +312,13 @@ export fn doc_get_count(doc_id: i32, index: u32) u32 {
 export fn doc_get_src_pos(doc_id: i32, idx: u32) u32 {
     _ = getDocParser(doc_id) orelse return 0xFFFFFFFF;
     const uid: usize = @intCast(doc_id);
-    if (!doc_src_pos_built[uid]) {
+    const sp = &doc_src[uid];
+    if (!sp.built) {
         buildDocSrcPositions(uid);
-        doc_src_pos_built[uid] = true;
+        sp.built = true;
     }
-    if (idx >= doc_src_pos_len[uid]) return 0xFFFFFFFF;
-    const positions = doc_src_positions[uid] orelse return 0xFFFFFFFF;
-    return positions[idx];
+    if (idx >= sp.len) return 0xFFFFFFFF;
+    return (sp.positions orelse return 0xFFFFFFFF)[idx];
 }
 
 /// Get the tape index of a container's closing bracket.
