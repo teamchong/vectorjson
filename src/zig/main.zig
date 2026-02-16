@@ -7,10 +7,7 @@ const zimdjson = @import("zimdjson");
 const simd = @import("simd.zig");
 
 // --- Allocator ---
-// WASM linear memory page allocator (child allocator for arena)
-const page_alloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllocator.vtable };
-// General-purpose allocator (used for long-lived allocs like alloc/dealloc exports)
-const gpa = page_alloc;
+const gpa: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllocator.vtable };
 
 // --- Parser state ---
 const DomParser = zimdjson.dom.FullParser(.default);
@@ -233,20 +230,14 @@ fn readTapeString(p: *DomParser, index: u32) []const u8 {
 export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     last_error_code = 0;
 
-    // Find a free slot
-    var slot_id: i32 = -1;
-    for (&doc_active, 0..) |*active, i| {
-        if (!active.*) {
-            slot_id = @intCast(i);
-            break;
-        }
-    }
-    if (slot_id < 0) {
+    // Find a free slot (for/else returns first free index or early-returns -1)
+    const uid: usize = for (doc_active, 0..) |active, i| {
+        if (!active) break i;
+    } else {
         last_error_code = 2; // ExceededCapacity
         return -1;
-    }
+    };
 
-    const uid: usize = @intCast(slot_id);
     _ = doc_parsers[uid].parseFromSlice(gpa, ptr[0..len]) catch |err| {
         last_error_code = mapError(err);
         return -1;
@@ -255,7 +246,7 @@ export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     doc_active[uid] = true;
     doc_src_pos_built[uid] = false; // mark for lazy build on first src_pos query
 
-    return slot_id;
+    return @intCast(uid);
 }
 
 /// Free a document slot, marking it available for reuse.
