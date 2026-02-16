@@ -171,7 +171,7 @@ Requires: [Zig](https://ziglang.org/) 0.15+, [Bun](https://bun.sh/) or Node.js 2
 
 ```bash
 bun run build        # Zig → WASM → wasm-opt → TypeScript
-bun test             # 358 tests across 9 suites
+bun test
 bun run bench:ai     # AI SDK parser comparison
 bun run bench:parse  # Parse + streaming benchmarks
 ```
