@@ -1,6 +1,9 @@
 # VectorJSON
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/vectorjson)](https://www.npmjs.com/package/vectorjson)
+[![bundle size](https://img.shields.io/bundlephobia/minzip/vectorjson)](https://bundlephobia.com/package/vectorjson)
+[![license](https://img.shields.io/npm/l/vectorjson)](https://github.com/teamchong/vectorjson/blob/main/LICENSE)
 
 O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and offload parsing to Workers with transferable ArrayBuffers.
 
@@ -125,18 +128,18 @@ Apple-to-apple: both sides produce a materialized partial object on every chunk.
 
 | Payload | Product | Original | + VectorJSON | Speedup |
 |---------|---------|----------|-------------|---------|
-| 1 KB | Vercel AI SDK | 4.2 ms | 162 µs | **26×** |
-| | Anthropic SDK | 1.6 ms | 162 µs | **10×** |
-| | TanStack AI | 1.8 ms | 162 µs | **11×** |
-| | OpenClaw | 2.0 ms | 162 µs | **12×** |
-| 10 KB | Vercel AI SDK | 49 ms | 470 µs | **104×** |
-| | Anthropic SDK | 93 ms | 470 µs | **198×** |
-| | TanStack AI | 96 ms | 470 µs | **204×** |
-| | OpenClaw | 113 ms | 470 µs | **240×** |
-| 100 KB | Vercel AI SDK | 4.1 s | 4.6 ms | **892×** |
-| | Anthropic SDK | 9.3 s | 4.6 ms | **2016×** |
-| | TanStack AI | 7.5 s | 4.6 ms | **1644×** |
-| | OpenClaw | 8.1 s | 4.6 ms | **1757×** |
+| 1 KB | Vercel AI SDK | 4.3 ms | 268 µs | **16×** |
+| | Anthropic SDK | 2.3 ms | 268 µs | **9×** |
+| | TanStack AI | 2.4 ms | 268 µs | **9×** |
+| | OpenClaw | 1.9 ms | 268 µs | **7×** |
+| 10 KB | Vercel AI SDK | 70 ms | 666 µs | **106×** |
+| | Anthropic SDK | 139 ms | 666 µs | **209×** |
+| | TanStack AI | 97 ms | 666 µs | **145×** |
+| | OpenClaw | 109 ms | 666 µs | **164×** |
+| 100 KB | Vercel AI SDK | 5.6 s | 6.1 ms | **907×** |
+| | Anthropic SDK | 12.7 s | 6.1 ms | **2065×** |
+| | TanStack AI | 6.6 s | 6.1 ms | **1079×** |
+| | OpenClaw | 7.6 s | 6.1 ms | **1238×** |
 
 Stock parsers re-parse the full buffer on every chunk — O(n²). VectorJSON maintains a **live JS object** that grows incrementally on each `feed()`, so `getValue()` is O(1). Total work: O(n).
 
@@ -148,10 +151,10 @@ The real cost isn't just CPU time — it's blocking the agent's main thread. Sim
 
 | Payload | Stock total | VectorJSON total | Main thread freed |
 |---------|-----------|-----------------|-------------------|
-| 10 KB | 24 ms | 1 ms | 23 ms sooner |
-| 100 KB | 1.5 s | 3 ms | **1.5 seconds sooner** |
-| 500 KB | 39 s | 29 ms | **39 seconds sooner** |
-| 1 MB | 2 min 41 s | 44 ms | **161 seconds sooner** |
+| 1 KB | 3.7 ms | 2.0 ms | 1.7 ms sooner |
+| 10 KB | 38 ms | 2 ms | 36 ms sooner |
+| 50 KB | 657 ms | 3 ms | **654 ms sooner** |
+| 100 KB | 2.3 s | 6 ms | **2.3 seconds sooner** |
 
 Both approaches detect the tool name (`.name`) at the same chunk — the LLM hasn't streamed more yet. But while VectorJSON finishes processing all chunks in milliseconds, the stock parser blocks the main thread for the entire duration. The agent can't render UI, stream code to the editor, or start running tools until parsing is done.
 
@@ -188,6 +191,12 @@ The event parser (`createEventParser`) adds path-matching on top: it diffs the t
 
 ```bash
 npm install vectorjson
+# or
+pnpm add vectorjson
+# or
+bun add vectorjson
+# or
+yarn add vectorjson
 ```
 
 ## Usage
@@ -540,7 +549,7 @@ cd bench/ai-parsers && bun install && bun --expose-gc bench.mjs  # AI SDK compar
 bun run bench:worker                             # Worker transfer vs structured clone benchmark
 ```
 
-Benchmark numbers in this README were measured on an Apple M-series Mac. Results vary by machine but relative speedups are consistent.
+Benchmark numbers in this README were measured on GitHub Actions (Ubuntu, x86_64). Results vary by machine but relative speedups are consistent.
 
 ## License
 
