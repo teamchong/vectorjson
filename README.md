@@ -7,7 +7,7 @@ SIMD-accelerated streaming JSON parser for JavaScript. Replaces the O(n²) parti
 Three problems with how AI SDKs parse streaming JSON today:
 
 **1. Buffer strings grow faster than GC can free them.**
-Every `buffer += chunk` allocates a new, longer string — the old one becomes garbage. As LLMs get faster and responses get longer, each discarded buffer is larger than the last, and new ones arrive before GC can collect the old. The new `using` keyword gives you deterministic cleanup of resources via `Symbol.dispose`, but it can't help here — the growing buffer strings are plain values with no dispose hook, they just pile up until GC catches up.
+Every `buffer += chunk` allocates a new, longer string — the old one becomes garbage. As LLMs get faster and responses get longer, each discarded buffer is larger than the last, and new ones arrive before GC can collect the old. The new `using` keyword can't help — it only works on objects with `Symbol.dispose`, not strings.
 
 **2. The agent bottleneck is data, not CPU — but you can't act on partial data.**
 When an LLM generates 100 tasks in a JSON array, you could start executing task 1 as soon as it arrives. But current parsers either fail on incomplete JSON or force you to materialize the entire tree. VectorJSON parses incomplete JSON into lazy proxies — access only what you need, and `isComplete()` tells you which elements are real vs autocompleted.
