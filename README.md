@@ -72,8 +72,8 @@ parser.destroy();
 const parser = vj.createEventParser();
 
 parser.on('tool', (e) => showToolUI(e.value));             // fires immediately
-parser.onDelta('code', (e) => editor.append(e.value));      // streams char-by-char
-parser.skip('explanation');                                  // never materialized
+parser.onDelta('code', (e) => editor.append(e.value));     // streams char-by-char
+parser.skip('explanation');                                // never materialized
 
 for await (const chunk of llmStream) {
   parser.feed(chunk);  // O(n) — only new bytes scanned
