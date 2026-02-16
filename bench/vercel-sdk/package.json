@@ -7,6 +7,7 @@
     "bench": "bun --expose-gc bench.mjs"
   },
   "dependencies": {
-    "ai": "6.0.86"
+    "ai": "6.0.86",
+    "partial-json": "^0.1.7"
   }
 }

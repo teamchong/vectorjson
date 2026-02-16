@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../dist/index.js";
+import { parse as partialParse } from "./vercel-sdk/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -103,6 +104,13 @@ async function run() {
     })
   );
   printResult(
+    "partial-json → .total",
+    bench(() => {
+      const r = partialParse(syntheticJson);
+      return r.total;
+    })
+  );
+  printResult(
     "VectorJSON.parse → .total",
     bench(() => {
       const r = vj.parse(syntheticJson);
@@ -128,6 +136,13 @@ async function run() {
     })
   );
   printResult(
+    "partial-json → .items[0].name",
+    bench(() => {
+      const r = partialParse(syntheticJson);
+      return r.items[0].name;
+    })
+  );
+  printResult(
     "VectorJSON.parse → .items[0].name",
     bench(() => {
       const r = vj.parse(syntheticJson);
@@ -149,6 +164,18 @@ async function run() {
     "JSON.parse → 10 items",
     bench(() => {
       const r = JSON.parse(syntheticJson);
+      let sum = 0;
+      for (let i = 0; i < 10; i++) {
+        sum += r.items[i].id;
+        void r.items[i].name;
+      }
+      return sum;
+    })
+  );
+  printResult(
+    "partial-json → 10 items",
+    bench(() => {
+      const r = partialParse(syntheticJson);
       let sum = 0;
       for (let i = 0; i < 10; i++) {
         sum += r.items[i].id;
@@ -184,6 +211,20 @@ async function run() {
     bench(
       () => {
         const r = JSON.parse(syntheticJson);
+        let sum = 0;
+        for (let i = 0; i < r.items.length; i++) {
+          sum += r.items[i].id;
+        }
+        return sum;
+      },
+      { durationMs: 1500 }
+    )
+  );
+  printResult(
+    "partial-json (full access)",
+    bench(
+      () => {
+        const r = partialParse(syntheticJson);
         let sum = 0;
         for (let i = 0; i < r.items.length; i++) {
           sum += r.items[i].id;
@@ -239,6 +280,13 @@ async function run() {
       `JSON.parse → .${firstKey}`,
       bench(() => {
         const r = JSON.parse(json);
+        return r[firstKey];
+      })
+    );
+    printResult(
+      `partial-json → .${firstKey}`,
+      bench(() => {
+        const r = partialParse(json);
         return r[firstKey];
       })
     );

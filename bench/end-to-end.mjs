@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../dist/index.js";
+import { parse as partialParse } from "./vercel-sdk/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -116,15 +117,25 @@ async function run() {
     });
     printResult("JSON.parse → JSON.stringify", jpResult);
 
+    // partial-json parse → JSON.stringify
+    const pjResult = bench(() => {
+      JSON.stringify(partialParse(json));
+    });
+    printResult("partial-json → JSON.stringify", pjResult);
+
     // vj.stringify(vj.parse(str).value) — one WASM call for stringify
     const vjResult = bench(() => {
       vj.stringify(vj.parse(json).value);
     });
     printResult("vj.parse → vj.stringify", vjResult);
 
+    const pjRatio = pjResult.opsPerSec / jpResult.opsPerSec;
     const ratio = vjResult.opsPerSec / jpResult.opsPerSec;
     console.log(
-      `  ${"→ ratio".padEnd(35)} ${ratio.toFixed(2)}x ${ratio >= 1 ? "faster" : "slower"}\n`
+      `  ${"→ partial-json vs JSON".padEnd(35)} ${pjRatio.toFixed(2)}x ${pjRatio >= 1 ? "faster" : "slower"}`
+    );
+    console.log(
+      `  ${"→ VectorJSON vs JSON".padEnd(35)} ${ratio.toFixed(2)}x ${ratio >= 1 ? "faster" : "slower"}\n`
     );
   }
 }

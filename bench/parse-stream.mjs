@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../dist/index.js";
+import { parse as partialParse } from "./vercel-sdk/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -124,13 +125,21 @@ async function run() {
     const jpResult = bench(() => JSON.parse(json));
     printResult("JSON.parse", jpResult);
 
+    // partial-json parse
+    const pjResult = bench(() => partialParse(json));
+    printResult("partial-json parse", pjResult);
+
     // VectorJSON.parse
     const vjResult = bench(() => vj.parse(json));
     printResult("VectorJSON.parse", vjResult);
 
-    const speedup = vjResult.opsPerSec / jpResult.opsPerSec;
+    const pjRatio = pjResult.opsPerSec / jpResult.opsPerSec;
+    const vjRatio = vjResult.opsPerSec / jpResult.opsPerSec;
     console.log(
-      `  ${"→ speedup".padEnd(30)} ${speedup.toFixed(2)}x ${speedup >= 1 ? "faster" : "slower"}\n`
+      `  ${"→ partial-json vs JSON.parse".padEnd(30)} ${pjRatio.toFixed(2)}x ${pjRatio >= 1 ? "faster" : "slower"}`
+    );
+    console.log(
+      `  ${"→ VectorJSON vs JSON.parse".padEnd(30)} ${vjRatio.toFixed(2)}x ${vjRatio >= 1 ? "faster" : "slower"}\n`
     );
   }
 
@@ -153,6 +162,27 @@ async function run() {
     // Baseline: JSON.parse (one-shot)
     const baseline = bench(() => JSON.parse(json), { durationMs: 1500 });
     printResult("JSON.parse (baseline)", baseline);
+
+    // partial-json (one-shot, no streaming API)
+    const pjOneShot = bench(() => partialParse(json), { durationMs: 1500 });
+    printResult("partial-json (one-shot)", pjOneShot);
+
+    // partial-json concat+reparse (simulates streaming — re-parses on every chunk)
+    for (const chunkSize of chunkSizes) {
+      const label = `partial-json reparse (${chunkSize}B)`;
+      const result = bench(
+        () => {
+          let buffer = "";
+          for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+            const end = Math.min(offset + chunkSize, bytes.byteLength);
+            buffer += new TextDecoder().decode(bytes.slice(offset, end));
+            partialParse(buffer);
+          }
+        },
+        { durationMs: 1500, warmup: 3 }
+      );
+      printResult(label, result);
+    }
 
     // VectorJSON one-shot
     const vjOneShot = bench(() => vj.parse(json), { durationMs: 1500 });
@@ -196,7 +226,7 @@ async function run() {
 
     console.log(`  ─── ${name}.json (${sizeKB} KB, ${numChunks} chunks of ${chunkSize}B) ───`);
 
-    // Approach 1: Concat + reparse on every chunk (Vercel AI SDK pattern)
+    // Approach 1: Concat + JSON.parse reparse on every chunk (Vercel AI SDK pattern)
     forceGC();
     {
       const heapBefore = heapMB();
@@ -219,9 +249,34 @@ async function run() {
       const elapsed = performance.now() - start;
       const heapAfter = heapMB();
       console.log(
-        `  ${"concat+reparse (O(n²))".padEnd(30)} ` +
+        `  ${"concat+JSON.parse (O(n²))".padEnd(30)} ` +
           `${elapsed.toFixed(2).padStart(8)} ms  ` +
           `reparses: ${reparseCount}  ` +
+          `heap Δ ${(heapAfter - heapBefore).toFixed(2).padStart(7)} MB`
+      );
+    }
+
+    // Approach 1b: Concat + partial-json reparse on every chunk
+    forceGC();
+    {
+      const heapBefore = heapMB();
+      const start = performance.now();
+      let buffer = "";
+      let parseCount = 0;
+
+      for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+        const end = Math.min(offset + chunkSize, bytes.byteLength);
+        const chunk = new TextDecoder().decode(bytes.slice(offset, end));
+        buffer += chunk;
+        partialParse(buffer);
+        parseCount++;
+      }
+      const elapsed = performance.now() - start;
+      const heapAfter = heapMB();
+      console.log(
+        `  ${"concat+partial-json (O(n²))".padEnd(30)} ` +
+          `${elapsed.toFixed(2).padStart(8)} ms  ` +
+          `parses: ${parseCount}  ` +
           `heap Δ ${(heapAfter - heapBefore).toFixed(2).padStart(7)} MB`
       );
     }

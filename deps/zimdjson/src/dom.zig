@@ -1,19 +1,8 @@
-//! With a Document Object Model (DOM) parser, unlike On-Demand, the entire document is
-//! parsed, validated, and stored in memory as a tree-like structure. Only after the
-//! process is complete can the programmer access and navigate the content.
+//! Document Object Model (DOM) parser.
 //!
-//! ## Variants
-//! Although the Document Object Model is an approach, `zimdjson` offers two distinct
-//! variants:
-//! * `FullParser`: The parser reads the entire document before parsing. This is what
-//! `simdjson` currently does.
-//! * `StreamParser`: The parser reads and parses the document progressively, handling it
-//! in chunks as data arrives.
-//!
-//! Regardless of the variant, the complete DOM tree is constructed in memory.
-//!
-//! If memory usage is a concern or the document is too large, consider using the
-//! `StreamParser`. Otherwise, the `FullParser` is recommended.
+//! The entire document is parsed, validated, and stored in memory as a tree-like
+//! structure. Only after the process is complete can the programmer access and
+//! navigate the content.
 //!
 //! ## Lifetimes
 //! During parsing, the input must remain unmodified. Once parsing finishes, the input
@@ -34,7 +23,7 @@ const Number = types.Number;
 const assert = std.debug.assert;
 const native_endian = builtin.cpu.arch.endian();
 
-/// The available options for parsing in full mode.
+/// The available options for parsing.
 pub const FullOptions = struct {
     pub const default: @This() = .{};
 
@@ -61,69 +50,32 @@ pub const FullOptions = struct {
     assume_padding: bool = false,
 };
 
-/// The available options for parsing in streaming mode.
-pub const StreamOptions = struct {
-    pub const default: @This() = .{};
-
-    /// This option sets the stream's chunk length, which determines the number of
-    /// bytes available for parsing at any time.
-    ///
-    /// Exceeding the chunk length results in an `error.StreamChunkOverflow`, which can occur in
-    /// two ways:
-    /// * A JSON literal (string or number) is larger than a chunk.
-    /// * Whitespace is larger than a chunk.
-    ///
-    /// By default, the chunk length is set to 64KiB.
-    chunk_length: u32 = tokens.ring_buffer.default_chunk_length,
-};
-
-const Options = union(enum) {
-    full: FullOptions,
-    stream: StreamOptions,
-};
-
 pub fn FullParser(comptime options: FullOptions) type {
-    return Parser(.json, .{ .full = options });
-}
-
-pub fn StreamParser(comptime options: StreamOptions) type {
-    return Parser(.json, .{ .stream = options });
+    return Parser(options);
 }
 
 pub const ReaderError = types.ReaderError;
 pub const ParseError = types.ParseError;
-pub const StreamError = tokens.stream.StreamError;
 pub const IndexerError = @import("indexer.zig").Error;
 
-pub fn Parser(comptime format: types.Format, comptime options: Options) type {
-    _ = format;
-    const want_stream = options == .stream;
-    const aligned = options == .full and options.full.aligned;
+pub fn Parser(comptime options: FullOptions) type {
+    const aligned = options.aligned;
 
     return struct {
         const Self = @This();
 
         const Aligned = types.Aligned(aligned);
-        const Tokens = if (want_stream)
-            tokens.stream.Stream(.{
-                .aligned = true,
-                .chunk_len = options.stream.chunk_length,
-                .slots = 2,
-            })
-        else
-            tokens.iterator.Iterator(.{
-                .aligned = aligned,
-                .assume_padding = options.full.assume_padding,
-            });
+        const Tokens = tokens.iterator.Iterator(.{
+            .aligned = aligned,
+            .assume_padding = options.assume_padding,
+        });
 
         pub const Error = Tokens.Error || ParseError || Allocator.Error;
 
-        /// The `FullParser` supports JSON documents up to **4GiB**, while
-        /// the `StreamParser` supports JSON documents up to **32GiB**.
-        /// If the document exceeds these limits, an `error.ExceededCapacity` is returned.
-        pub const max_capacity_bound = if (want_stream) std.math.maxInt(u32) * @sizeOf(Tape.Word) else std.math.maxInt(u32);
+        /// The parser supports JSON documents up to **4GiB**.
+        /// If the document exceeds this limit, an `error.ExceededCapacity` is returned.
+        pub const max_capacity_bound = std.math.maxInt(u32);
 
-        // only used in full mode
         document_buffer: std.ArrayListAlignedUnmanaged(u8, types.Aligned(true).mem_alignment),
         reader_error: ?std.meta.Int(.unsigned, @bitSizeOf(anyerror)),
 
@@ -159,13 +111,8 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
         /// This method should be used only when the parser returns [`error.AnyReader`](#zimdjson.types.ReaderError).
         /// Otherwise, it results in undefined behavior.
         pub fn recoverReaderError(self: Self, comptime Reader: type) Reader.Error {
-            if (want_stream) {
-                assert(self.tape.tokens.reader_error != null);
-                return @errorCast(@errorFromInt(self.tape.tokens.reader_error.?));
-            } else {
-                assert(self.reader_error != null);
-                return @errorCast(@errorFromInt(self.reader_error.?));
-            }
+            assert(self.reader_error != null);
+            return @errorCast(@errorFromInt(self.reader_error.?));
         }
 
         /// This method preallocates the necessary memory for a document based on its size.
@@ -189,12 +136,10 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
         fn ensureTotalCapacityForReader(self: *Self, allocator: Allocator, new_capacity: usize) Error!void {
             if (new_capacity > self.max_capacity) return error.ExceededCapacity;
 
-            if (!want_stream) {
-                try self.document_buffer.ensureTotalCapacity(allocator, new_capacity + types.Vector.bytes_len);
-                try self.tape.tokens.ensureTotalCapacity(allocator, new_capacity
-                    // root words
-                    + 2);
-            }
+            try self.document_buffer.ensureTotalCapacity(allocator, new_capacity + types.Vector.bytes_len);
+            try self.tape.tokens.ensureTotalCapacity(allocator, new_capacity
+                // root words
+                + 2);
 
             self.tape.string_buffer.allocator = allocator;
             try self.tape.string_buffer.ensureTotalCapacity(new_capacity);
@@ -202,7 +147,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
         /// Parse a JSON document from slice. Allocated resources are owned by the parser.
         pub fn parseFromSlice(self: *Self, allocator: Allocator, document: Aligned.slice) Error!Document {
-            if (want_stream) @compileError("Parsing from a slice is not supported in streaming mode");
             self.reader_error = null;
 
             self.tape.string_buffer.reset();
@@ -211,7 +155,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             try self.ensureTotalCapacityForSlice(allocator, document.len);
             try self.tape.buildFromSlice(allocator, document);
             // Update string_buffer length: strings_ptr tracks how far we wrote,
-            // but the list length isn't updated by advanceString in non-streaming mode.
+            // but the list length isn't updated by advanceString.
             self.tape.string_buffer.strings.list.items.len = @intFromPtr(self.tape.strings_ptr) - @intFromPtr(self.tape.string_buffer.strings.list.items.ptr);
             // string_meta length is tracked by string_meta_count (appended via appendAssumeCapacity)
             self.tape.string_meta.list.items.len = self.tape.string_meta_count;
@@ -228,28 +172,27 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             self.tape.string_buffer.reset();
             self.tape.string_buffer.allocator = allocator;
 
-            if (want_stream) {
-                try self.tape.buildFromReader(allocator, reader);
-            } else {
-                self.document_buffer.clearRetainingCapacity();
-                common.readAllRetainingCapacity(
-                    allocator,
-                    reader,
-                    types.Aligned(true).alignment,
-                    &self.document_buffer,
-                    self.max_capacity,
-                ) catch |err| switch (err) {
-                    Allocator.Error.OutOfMemory => |e| return e,
-                    else => |e| {
-                        self.reader_error = @intFromError(e);
-                        return error.AnyReader;
-                    },
-                };
-                const len = self.document_buffer.items.len;
-                try self.ensureTotalCapacityForReader(allocator, len);
-                self.document_buffer.appendNTimesAssumeCapacity(' ', types.Vector.bytes_len);
-                try self.tape.buildFromSlice(allocator, self.document_buffer.items[0..len]);
-            }
+            self.document_buffer.clearRetainingCapacity();
+            common.readAllRetainingCapacity(
+                allocator,
+                reader,
+                types.Aligned(true).alignment,
+                &self.document_buffer,
+                self.max_capacity,
+            ) catch |err| switch (err) {
+                Allocator.Error.OutOfMemory => |e| return e,
+                else => |e| {
+                    self.reader_error = @intFromError(e);
+                    return error.AnyReader;
+                },
+            };
+            const len = self.document_buffer.items.len;
+            try self.ensureTotalCapacityForReader(allocator, len);
+            self.document_buffer.appendNTimesAssumeCapacity(' ', types.Vector.bytes_len);
+            try self.tape.buildFromSlice(allocator, self.document_buffer.items[0..len]);
+            // Update string_buffer length
+            self.tape.string_buffer.strings.list.items.len = @intFromPtr(self.tape.strings_ptr) - @intFromPtr(self.tape.string_buffer.strings.list.items.ptr);
+            self.tape.string_meta.list.items.len = self.tape.string_meta_count;
             return .{
                 .tape = &self.tape,
                 .index = 1,
@@ -331,9 +274,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             }
 
             /// Cast the document to the specified type.
-            ///
-            /// **Note**: This method is limited to simple types. For more complex deserialization,
-            /// consider using the [`ondemand.Parser.schema`](#zimdjson.ondemand.Parser.schema) interface.
             pub fn as(self: Document, comptime T: type) Error!T {
                 return self.asValue().as(T);
             }
@@ -346,38 +286,12 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             /// Get the value associated with the given key.
             /// The key is matched against **unescaped** JSON.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "{ \"a\": { \"b\": 1 } }");
-            /// const value = try document.at("a").at("b").asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the key is not found, an `error.MissingField` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `at` method repeatedly.
             pub fn at(self: Document, key: []const u8) Value {
                 return self.asValue().at(key);
             }
 
             /// Get the value at the given index.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "[ [], [1] ]");
-            /// const value = try document.atIndex(1).atIndex(0).asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the value is not found, an `error.IndexOutOfBounds` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `atIndex` method repeatedly.
             pub fn atIndex(self: Document, index: usize) Value {
                 return self.asValue().atIndex(index);
             }
@@ -528,9 +442,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             }
 
             /// Cast the value to the specified type.
-            ///
-            /// **Note**: This method is limited to simple types. For more complex deserialization,
-            /// consider using the [`ondemand.Parser.schema`](#zimdjson.ondemand.Parser.schema) interface.
             pub fn as(self: Value, comptime T: type) Error!T {
                 const info = @typeInfo(T);
                 switch (info) {
@@ -582,19 +493,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             /// Get the value associated with the given key.
             /// The key is matched against **unescaped** JSON.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "{ \"a\": { \"b\": 1 } }");
-            /// const value = try document.at("a").at("b").asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the key is not found, an `error.MissingField` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `at` method repeatedly.
             pub fn at(self: Value, key: []const u8) Value {
                 if (self.err) |_| return self;
                 const obj = self.asObject() catch |err| return .{
@@ -607,19 +505,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
             /// Get the value at the given index.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "[ [], [1] ]");
-            /// const value = try document.atIndex(1).atIndex(0).asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the value is not found, an `error.IndexOutOfBounds` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `atIndex` method repeatedly.
             pub fn atIndex(self: Value, index: usize) Value {
                 if (self.err) |_| return self;
                 const arr = self.asArray() catch |err| return .{
@@ -679,19 +564,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
             /// Get the value at the given index.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "[ [], [1] ]");
-            /// const value = try document.atIndex(1).atIndex(0).asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the value is not found, an `error.IndexOutOfBounds` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `at` method repeatedly.
             pub fn at(self: Array, index: usize) Value {
                 var it = self.iterator();
                 var i: u32 = 0;
@@ -759,19 +631,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             /// Get the value associated with the given key.
             /// The key is matched against **unescaped** JSON.
             /// This method has linear-time complexity.
-            ///
-            /// Since this method is chainable, it can be called multiple times in a row.
-            /// For example:
-            ///
-            /// ```zig
-            /// const document = try parser.parseFromSlice(allocator, "{ \"a\": { \"b\": 1 } }");
-            /// const value = try document.at("a").at("b").asUnsigned();
-            /// std.debug.assert(value == 1);
-            /// ```
-            ///
-            /// If the key is not found, an `error.MissingField` will be returned when a cast method is used.
-            ///
-            /// **Note**: Avoid calling the `at` method repeatedly.
             pub fn at(self: Object, key: []const u8) Value {
                 var it = self.iterator();
                 while (it.next()) |field| if (std.mem.eql(u8, field.key, key)) return field.value;
@@ -915,8 +774,8 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
             string_meta_count: u32 = 0,
             input_base_addr: usize = 0,
 
-            words_ptr: if (want_stream) void else [*]u64 = undefined,
-            strings_ptr: if (want_stream) void else [*]u8 = undefined,
+            words_ptr: [*]u64 = undefined,
+            strings_ptr: [*]u8 = undefined,
 
             pub const init: Tape = .{
                 .tokens = .init,
@@ -958,78 +817,40 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 return self.dispatch(allocator);
             }
 
-            pub inline fn buildFromReader(self: *Tape, allocator: Allocator, reader: std.io.AnyReader) Error!void {
-                try self.tokens.build(allocator, reader);
-                try self.stack.ensureTotalCapacity(allocator, self.stack.max_depth);
-
-                self.words.list.clearRetainingCapacity();
-                self.stack.clearRetainingCapacity();
-
-                return self.dispatch(allocator);
-            }
-
             pub inline fn get(self: Tape, index: u32) Word {
                 return @bitCast(self.words.items().ptr[index]);
             }
 
             inline fn currentWord(self: Tape) u32 {
-                if (want_stream) {
-                    return @intCast(self.words.items().len);
-                } else {
-                    return @intCast((@intFromPtr(self.words_ptr) - @intFromPtr(self.words.items().ptr)) / @sizeOf(Word));
-                }
+                return @intCast((@intFromPtr(self.words_ptr) - @intFromPtr(self.words.items().ptr)) / @sizeOf(Word));
             }
 
-            inline fn advanceWord(self: *Tape, len: usize) void {
-                if (want_stream) {
-                    self.words.list.items.len += len;
-                } else {
-                    self.words_ptr += len;
-                }
+            inline fn advanceWord(self: *Tape, len_: usize) void {
+                self.words_ptr += len_;
             }
 
             inline fn appendWordAssumeCapacity(self: *Tape, word: Word) void {
-                if (want_stream) {
-                    self.words.appendAssumeCapacity(@bitCast(word));
-                } else {
-                    self.words_ptr[0] = @bitCast(word);
-                    self.advanceWord(1);
-                }
+                self.words_ptr[0] = @bitCast(word);
+                self.advanceWord(1);
             }
 
             inline fn appendTwoWordsAssumeCapacity(self: *Tape, words: [2]Word) void {
                 const vec: @Vector(2, u64) = @bitCast(words);
                 const slice: *const [2]u64 = &vec;
-                if (want_stream) {
-                    const arr = self.words.list.addManyAsArrayAssumeCapacity(2);
-                    @memcpy(arr, slice);
-                } else {
-                    @memcpy(self.words_ptr, slice);
-                    self.advanceWord(2);
-                }
+                @memcpy(self.words_ptr, slice);
+                self.advanceWord(2);
             }
 
             inline fn currentString(self: Tape) [*]u8 {
-                if (want_stream) {
-                    const strings = self.string_buffer.strings.items();
-                    return strings.ptr[strings.len..];
-                } else {
-                    return self.strings_ptr;
-                }
+                return self.strings_ptr;
             }
 
-            inline fn advanceString(self: *Tape, len: usize) void {
-                if (want_stream) {
-                    self.string_buffer.strings.list.items.len += len;
-                } else {
-                    self.strings_ptr += len;
-                }
+            inline fn advanceString(self: *Tape, len_: usize) void {
+                self.strings_ptr += len_;
             }
 
             fn dispatch(self: *Tape, allocator: Allocator) Error!void {
-                // const tracy = @import("tracy");
-                // var tracer = tracy.traceNamed(@src(), "dispatch");
-                // defer tracer.end();
+                _ = allocator;
 
                 try self.stack.push(.{
                     .tag = .root,
@@ -1038,7 +859,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                         .len = undefined,
                     },
                 });
-                if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
                 self.advanceWord(1);
 
                 state: switch (State.start) {
@@ -1048,13 +868,13 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                             '{', '[' => |container_begin| {
                                 if (self.tokens.peekChar() == container_begin + 2) {
                                     @branchHint(.unlikely);
-                                    try self.visitEmptyContainer(allocator, container_begin);
+                                    self.visitEmptyContainer(container_begin);
                                     continue :state .end;
                                 }
                                 continue :state @enumFromInt(container_begin);
                             },
                             else => {
-                                try self.visitPrimitive(allocator, t);
+                                try self.visitPrimitive(t);
                                 continue :state .end;
                             },
                         }
@@ -1068,7 +888,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                             },
                         });
 
-                        if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
                         self.advanceWord(1);
 
                         continue :state .object_field;
@@ -1077,7 +896,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                         {
                             const t = try self.tokens.next();
                             if (t[0] == '"') {
-                                try self.visitString(allocator, t);
+                                self.visitString(t);
                             } else {
                                 return error.ExpectedKey;
                             }
@@ -1087,13 +906,13 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                             switch (t[0]) {
                                 '{', '[' => |container_begin| {
                                     if (self.tokens.peekChar() == container_begin + 2) {
-                                        try self.visitEmptyContainer(allocator, container_begin);
+                                        self.visitEmptyContainer(container_begin);
                                         continue :state .object_continue;
                                     }
                                     continue :state @enumFromInt(container_begin);
                                 },
                                 else => {
-                                    try self.visitPrimitive(allocator, t);
+                                    try self.visitPrimitive(t);
                                     continue :state .object_continue;
                                 },
                             }
@@ -1120,7 +939,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                             },
                         });
 
-                        if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
                         self.advanceWord(1);
 
                         continue :state .array_value;
@@ -1130,13 +948,13 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                         switch (t[0]) {
                             '{', '[' => |container_begin| {
                                 if (self.tokens.peekChar() == container_begin + 2) {
-                                    try self.visitEmptyContainer(allocator, container_begin);
+                                    self.visitEmptyContainer(container_begin);
                                     continue :state .array_continue;
                                 }
                                 continue :state @enumFromInt(container_begin);
                             },
                             else => {
-                                try self.visitPrimitive(allocator, t);
+                                try self.visitPrimitive(t);
                                 continue :state .array_continue;
                             },
                         }
@@ -1153,7 +971,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                     },
                     .object_end, .array_end => |tag| {
                         const scope = self.stack.getScopeData();
-                        if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
                         self.appendWordAssumeCapacity(.{
                             .tag = @enumFromInt(@intFromEnum(tag)),
                             .data = .{
@@ -1183,7 +1000,6 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
 
                         assert(self.stack.getScopeType() == .root);
                         const root = self.stack.getScopeData();
-                        if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
                         self.appendWordAssumeCapacity(.{
                             .tag = .root,
                             .data = .{
@@ -1204,25 +1020,24 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 }
             }
 
-            inline fn visitPrimitive(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
+            inline fn visitPrimitive(self: *Tape, ptr: [*]const u8) Error!void {
                 const t = ptr[0];
                 switch (t) {
                     '"' => {
                         @branchHint(.likely);
-                        return self.visitString(allocator, ptr);
+                        return self.visitString(ptr);
                     },
-                    't' => return self.visitTrue(allocator, ptr),
-                    'f' => return self.visitFalse(allocator, ptr),
-                    'n' => return self.visitNull(allocator, ptr),
+                    't' => return self.visitTrue(ptr),
+                    'f' => return self.visitFalse(ptr),
+                    'n' => return self.visitNull(ptr),
                     else => {
                         @branchHint(.likely);
-                        return self.visitNumber(allocator, ptr);
+                        return self.visitNumber(ptr);
                     },
                 }
             }
 
-            inline fn visitEmptyContainer(self: *Tape, allocator: Allocator, tag: u8) Error!void {
-                if (want_stream) try self.words.ensureUnusedCapacity(allocator, 2);
+            inline fn visitEmptyContainer(self: *Tape, tag: u8) void {
                 const curr = self.currentWord();
                 self.appendTwoWordsAssumeCapacity(.{
                     .{
@@ -1240,27 +1055,18 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                         },
                     },
                 });
-                _ = try self.tokens.next();
+                _ = self.tokens.next() catch unreachable;
             }
 
-            inline fn visitString(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
-                if (want_stream) {
-                    try self.words.ensureUnusedCapacity(allocator, 1);
-                    try self.string_buffer.ensureUnusedCapacity(options.stream.chunk_length);
-                }
+            inline fn visitString(self: *Tape, ptr: [*]const u8) void {
                 const string_parser = @import("parsers/string.zig");
                 const curr_str = self.currentString();
                 const next_str = curr_str + @sizeOf(u32);
-                const result = try string_parser.writeString(ptr, next_str);
+                const result = string_parser.writeString(ptr, next_str) catch unreachable;
                 const next_len = result.dst_end - next_str;
 
                 // Store per-string metadata: (input_byte_offset, raw_len | has_escapes<<31)
-                // Ordinal = string_meta_count before increment — stored in tape word for O(1) lookup
                 const ordinal = self.string_meta_count;
-                // Use the token byte index (always relative to original document) instead of
-                // @intFromPtr(ptr) which may point into the padding buffer for tokens near the
-                // end of input (zimdjson copies tail bytes for SIMD safety).
-                // tokens.token was incremented by next(), so [-1] is the just-consumed token.
                 const input_offset: u32 = (self.tokens.token - 1)[0] + 1; // +1 to skip opening quote
                 const raw_len: u32 = @intCast(result.src_end - (ptr + 1));
                 const has_escapes: u32 = if (next_len != raw_len) @as(u32, 1) << 31 else 0;
@@ -1279,10 +1085,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 self.advanceString(next_len + @sizeOf(u32));
             }
 
-            inline fn visitNumber(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
-                if (want_stream) {
-                    try self.words.ensureUnusedCapacity(allocator, 2);
-                }
+            inline fn visitNumber(self: *Tape, ptr: [*]const u8) Error!void {
                 const number = try @import("parsers/number/parser.zig").parse(null, ptr);
                 switch (number) {
                     inline else => |n| {
@@ -1297,8 +1100,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 }
             }
 
-            inline fn visitTrue(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
-                if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
+            inline fn visitTrue(self: *Tape, ptr: [*]const u8) Error!void {
                 const check = @import("parsers/atoms.zig").checkTrue;
                 try check(ptr);
                 self.appendWordAssumeCapacity(.{
@@ -1307,8 +1109,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 });
             }
 
-            inline fn visitFalse(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
-                if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
+            inline fn visitFalse(self: *Tape, ptr: [*]const u8) Error!void {
                 const check = @import("parsers/atoms.zig").checkFalse;
                 try check(ptr);
                 self.appendWordAssumeCapacity(.{
@@ -1317,8 +1118,7 @@ pub fn Parser(comptime format: types.Format, comptime options: Options) type {
                 });
             }
 
-            inline fn visitNull(self: *Tape, allocator: Allocator, ptr: [*]const u8) Error!void {
-                if (want_stream) try self.words.ensureUnusedCapacity(allocator, 1);
+            inline fn visitNull(self: *Tape, ptr: [*]const u8) Error!void {
                 const check = @import("parsers/atoms.zig").checkNull;
                 try check(ptr);
                 self.appendWordAssumeCapacity(.{
