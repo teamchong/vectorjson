@@ -36,11 +36,8 @@ pub const StreamState = struct {
     status: FeedStatus = .incomplete,
     remaining_offset: u32 = 0,
 
-    // Root value tracking
-    root_value_started: bool = false,
-    root_value_completed: bool = false,
-    pending_scalar_root: bool = false,
-    root_is_string: bool = false,
+    // Root value tracking — state machine: none → container/string/scalar → completed
+    root_state: enum { none, container, string, scalar, completed } = .none,
 
     // --- Allocator ---
     allocator: std.mem.Allocator = undefined,
@@ -100,7 +97,7 @@ pub const StreamState = struct {
 
         while (i < self.buffer_len) {
             // Stop scanning once root is complete
-            if (self.root_value_completed) break;
+            if (self.root_state == .completed) break;
 
             // SIMD fast-skip for string content: scan 16 bytes at a time for '"' or '\'
             if (self.in_string and !self.escape_next) {
@@ -125,7 +122,7 @@ pub const StreamState = struct {
                     self.escape_next = true;
                 } else if (c == '"') {
                     self.in_string = false;
-                    if (self.depth == 0 and self.root_is_string) {
+                    if (self.depth == 0 and self.root_state == .string) {
                         self.markRootComplete(i + 1);
                     }
                 }
@@ -136,14 +133,13 @@ pub const StreamState = struct {
             switch (c) {
                 '"' => {
                     self.in_string = true;
-                    if (self.depth == 0 and !self.root_value_started) {
-                        self.root_value_started = true;
-                        self.root_is_string = true;
+                    if (self.depth == 0 and self.root_state == .none) {
+                        self.root_state = .string;
                     }
                 },
                 '{', '[' => {
-                    if (self.depth == 0 and !self.root_value_started) {
-                        self.root_value_started = true;
+                    if (self.depth == 0 and self.root_state == .none) {
+                        self.root_state = .container;
                     }
                     self.depth += 1;
                 },
@@ -159,13 +155,12 @@ pub const StreamState = struct {
                     }
                 },
                 't', 'f', 'n', '-', '0'...'9' => {
-                    if (self.depth == 0 and !self.root_value_started) {
-                        self.root_value_started = true;
-                        self.pending_scalar_root = true;
+                    if (self.depth == 0 and self.root_state == .none) {
+                        self.root_state = .scalar;
                     }
                 },
                 ' ', '\t', '\n', '\r' => {
-                    if (self.depth == 0 and self.pending_scalar_root) {
+                    if (self.depth == 0 and self.root_state == .scalar) {
                         self.markRootComplete(i);
                     }
                 },
@@ -177,14 +172,13 @@ pub const StreamState = struct {
         self.scan_offset = i;
 
         // End of buffer: if we have a pending scalar at root, mark complete
-        if (!self.root_value_completed and self.depth == 0 and !self.in_string and self.pending_scalar_root) {
+        if (self.root_state == .scalar and self.depth == 0 and !self.in_string) {
             self.markRootComplete(self.buffer_len);
         }
     }
 
     fn markRootComplete(self: *StreamState, end_offset: u32) void {
-        self.pending_scalar_root = false;
-        self.root_value_completed = true;
+        self.root_state = .completed;
 
         const buf = self.buffer orelse return;
         var remaining = end_offset;
