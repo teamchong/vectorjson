@@ -26,20 +26,20 @@ For a 100KB response in 12-char chunks, that's ~8,500 full parses — O(n²) CPU
 **VectorJSON:**
 
 ```js
+// O(n) streaming — each feed() processes only new bytes
 const parser = vj.createParser();
 for await (const chunk of stream) {
-  if (parser.feed(chunk) === "complete") break; // O(chunk_size) per call
+  if (parser.feed(chunk) === "complete") break;
 }
 const result = parser.getValue(); // lazy Proxy — zero-copy access
 parser.destroy();
 ```
 
 ```js
-// Act on partial data as it streams
-const result = vj.parse(incompleteJson);       // works on truncated JSON
-const tasks = result.value.tasks;               // lazy — no full materialization
-for (const task of tasks) {
-  if (result.isComplete(task)) execute(task);   // skip autocompleted elements
+// One-shot on incomplete JSON (e.g. AI SDK accumulated buffer)
+const result = vj.parse(incompleteJson);
+for (const task of result.value.tasks) {         // lazy — no full materialization
+  if (result.isComplete(task)) execute(task);    // skip autocompleted elements
 }
 ```
 
