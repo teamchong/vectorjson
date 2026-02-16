@@ -437,4 +437,4 @@ bun run bench:parse  # Parse + streaming benchmarks
 
 ## License
 
-MIT
+Apache-2.0

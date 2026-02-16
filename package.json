@@ -1,7 +1,7 @@
 {
   "name": "vectorjson",
   "version": "0.1.0",
-  "description": "SIMD-accelerated JSON parser — streaming partial JSON for AI SDKs, 800×+ faster than Vercel/Anthropic/TanStack",
+  "description": "O(n) WASM SIMD streaming JSON parser — 900-2000× faster partial JSON for AI SDKs vs Vercel/Anthropic/TanStack",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,7 +35,7 @@
   },
   "homepage": "https://github.com/teamchong/vectorjson#readme",
   "author": "Steven Chong",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "devDependencies": {
     "@types/node": "^25.2.3",
     "typescript": "^5.7.0",
