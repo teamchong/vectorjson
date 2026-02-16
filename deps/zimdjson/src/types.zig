@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const meta = std.meta;
 const simd = std.simd;
 const arch = builtin.cpu.arch;
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const signed = std.builtin.Signedness.signed;
@@ -30,10 +29,6 @@ pub fn Aligned(comptime aligned: bool) type {
     };
 }
 
-pub const Format = enum {
-    json,
-};
-
 pub const NumberType = enum(u8) {
     unsigned = 'u',
     signed = 'i',
@@ -49,33 +44,6 @@ pub const Number = union(NumberType) {
     /// The number is tagged as `.double` if it has a decimal point or an exponent.
     double: f64,
 
-    /// Cast a number to a different type. If the number doesn't fit in, or can't be
-    /// perfectly represented by, the new type, it will be converted to the closest
-    /// possible representation.
-    pub fn lossyCast(self: Number, comptime T: type) T {
-        return switch (self) {
-            inline else => |n| std.math.lossyCast(T, n),
-        };
-    }
-
-    /// Cast an integer to a different integer type. If the number doesn't fit, return
-    /// `null`.
-    pub fn cast(self: Number, comptime T: type) ?T {
-        assert(self != .double); // must pass an integer
-        return switch (self) {
-            .double => unreachable,
-            inline else => |n| std.math.cast(T, n),
-        };
-    }
-};
-
-pub const ValueType = enum {
-    null,
-    bool,
-    number,
-    string,
-    object,
-    array,
 };
 
 pub const ParseError = error{
@@ -103,14 +71,10 @@ pub const ParseError = error{
     IncompleteObject,
     /// The number does not fit in the target type.
     NumberOutOfRange,
-    /// The array index is too large.
-    IndexOutOfBounds,
     /// An unexpected trailing content in document.
     TrailingContent,
     /// The value has a different type than user expected.
     IncorrectType,
-    /// The field is not found in object.
-    MissingField,
 };
 
 pub const Vector = struct {
