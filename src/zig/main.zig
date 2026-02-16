@@ -450,7 +450,6 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     var root_is_string: bool = false;
     var pending_scalar: bool = false;
     var scalar_start: u32 = 0;
-    var value_end: u32 = 0;
 
     var i: u32 = 0;
     while (i < len) {
@@ -469,7 +468,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 in_string = false;
                 if (depth_val == 0 and root_is_string and !root_completed) {
                     root_completed = true;
-                    value_end = i + 1;
+                    classify_value_end = i + 1;
                 }
             }
             i += 1;
@@ -481,7 +480,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
         if (depth_val == 0 and pending_scalar and !root_completed) {
             switch (c) {
                 'a'...'z', '0'...'9', '-', '.', '+', 'E' => {},
-                else => { root_completed = true; value_end = i; },
+                else => { root_completed = true; classify_value_end = i; },
             }
         }
 
@@ -500,7 +499,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 if (depth_val < 0) return 3; // invalid: unmatched closing bracket
                 if (depth_val == 0 and !root_completed) {
                     root_completed = true;
-                    value_end = i + 1;
+                    classify_value_end = i + 1;
                 }
             },
             't', 'f', 'n', '-', '0'...'9' => {
@@ -531,7 +530,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
             }
         }
         root_completed = true;
-        value_end = len;
+        classify_value_end = len;
     }
 
     if (!root_completed) {
@@ -540,12 +539,11 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     }
 
     // Root value is complete. Check for trailing content.
-    var j = value_end;
+    var j = classify_value_end;
     while (j < len) : (j += 1) {
         const c = ptr[j];
         if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
             // Non-whitespace after complete value → complete_early
-            classify_value_end = value_end;
             return 2;
         }
     }
