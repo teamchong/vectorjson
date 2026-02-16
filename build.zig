@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("deps/zimdjson/src/zimdjson.zig"),
         .target = wasm_target,
         .optimize = optimize,
+        .strip = true,
+        .unwind_tables = .none,
     });
 
     // zimdjson needs build_options with enable_tracy and is_dev_mode
@@ -29,6 +31,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/zig/main.zig"),
             .target = wasm_target,
             .optimize = optimize,
+            .strip = true,
+            .unwind_tables = .none,
         }),
     });
 
