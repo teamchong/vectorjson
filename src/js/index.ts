@@ -293,6 +293,13 @@ export async function init(options?: {
     },
   );
 
+  /** Copy `count` u32 indices from the WASM batch buffer into a JS Uint32Array. */
+  function copyBatchIndices(count: number): Uint32Array {
+    const copy = new Uint32Array(count);
+    copy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
+    return copy;
+  }
+
   // --- Read a doc string at a tape index into a JS string ---
   function docReadString(docId: number, index: number): string {
     const len = engine.doc_read_string_raw(docId, index);
@@ -319,22 +326,18 @@ export async function init(options?: {
       case TAG_STRING:
         return docReadString(docId, index);
       case TAG_ARRAY: {
-        const count = engine.doc_array_elements(docId, index);
-        const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
+        const indices = copyBatchIndices(engine.doc_array_elements(docId, index));
         const arr: unknown[] = [];
-        for (let i = 0; i < count; i++) {
-          arr.push(deepMaterializeDoc(docId, idxCopy[i]));
+        for (let i = 0; i < indices.length; i++) {
+          arr.push(deepMaterializeDoc(docId, indices[i]));
         }
         return arr;
       }
       case TAG_OBJECT: {
-        const count = engine.doc_object_keys(docId, index);
-        const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
+        const indices = copyBatchIndices(engine.doc_object_keys(docId, index));
         const obj: Record<string, unknown> = {};
-        for (let i = 0; i < count; i++) {
-          obj[docReadString(docId, idxCopy[i])] = deepMaterializeDoc(docId, idxCopy[i] + 1);
+        for (let i = 0; i < indices.length; i++) {
+          obj[docReadString(docId, indices[i])] = deepMaterializeDoc(docId, indices[i] + 1);
         }
         return obj;
       }
@@ -346,11 +349,8 @@ export async function init(options?: {
   /** Batch-read all element tape indices for an array. ONE WASM call → O(1) per access. */
   function batchElemIndices(target: any): Uint32Array {
     if (target._e) return target._e;
-    const count = engine.doc_array_elements(target._d, target._i);
-    const indices = new Uint32Array(count);
-    indices.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
-    target._e = indices;
-    return indices;
+    target._e = copyBatchIndices(engine.doc_array_elements(target._d, target._i));
+    return target._e;
   }
 
   /** Resolve a tape value: primitives return directly.
@@ -379,15 +379,11 @@ export async function init(options?: {
     }
 
     // Arrays → lazy Proxy (materialize elements on access, cached)
-    const t: any = [];
-    t._d = docId;
-    t._i = index;
-    t._k = keepAlive;
-    t._g = generation;
-    t._f = freeFn;
-    t._l = engine.doc_get_count(docId, index);
-    t._p = proxyObjects; // propagate to child resolution
-    return new Proxy(t, docArrHandler);
+    return new Proxy(
+      Object.assign([], { _d: docId, _i: index, _k: keepAlive, _g: generation, _f: freeFn,
+        _l: engine.doc_get_count(docId, index), _p: proxyObjects }),
+      docArrHandler,
+    );
   }
 
   // --- Shared Proxy handler for doc-backed array cursors ---
@@ -483,13 +479,8 @@ export async function init(options?: {
     },
     ownKeys(target) {
       if (!target._keys) {
-        target._keys = [];
-        const count = engine.doc_object_keys(target._d, target._i);
-        const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
-        for (let i = 0; i < count; i++) {
-          target._keys.push(docReadString(target._d, idxCopy[i]));
-        }
+        const indices = copyBatchIndices(engine.doc_object_keys(target._d, target._i));
+        target._keys = Array.from(indices, (idx) => docReadString(target._d, idx));
       }
       return target._keys;
     },
