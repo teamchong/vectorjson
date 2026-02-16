@@ -289,7 +289,9 @@ export async function init(options?: {
   // --- Read a doc string at a tape index into a JS string ---
   function docReadString(docId: number, index: number): string {
     const len = engine.doc_read_string_raw(docId, index);
-    if (len === 0) return "";
+    // WASM returns u32 but JS sees i32 — guard against corrupted lengths
+    // (can happen when SIMD parsing reads past truncated unicode escapes)
+    if (len <= 0 || len > 0x7FFFFFFF) return "";
     const batchPtr = engine.doc_batch_ptr();
     const ptr = new Uint32Array(engine.memory.buffer, batchPtr as unknown as number, 2)[0];
     return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
@@ -530,7 +532,8 @@ export async function init(options?: {
     },
   };
 
-  // --- Wrap a document tape value in a lazy cursor Proxy ---
+  // --- Wrap a document root in a lazy cursor Proxy ---
+  // Called only for containers (object/array) — buildDocRoot handles primitives.
   function wrapDoc(
     docId: number,
     index: number,
@@ -539,13 +542,6 @@ export async function init(options?: {
     proxyObjects = false,
   ): unknown {
     const tag = engine.doc_get_tag(docId, index);
-
-    // Primitives — return directly, no Proxy needed
-    if (tag === TAG_NULL) return null;
-    if (tag === TAG_TRUE) return true;
-    if (tag === TAG_FALSE) return false;
-    if (tag === TAG_NUMBER) return engine.doc_get_number(docId, index);
-    if (tag === TAG_STRING) return docReadString(docId, index);
 
     // Create freeFn once for the root — shared by all child cursors via target._f
     const freeFn = () => {
@@ -575,19 +571,17 @@ export async function init(options?: {
   // --- Build a value from a doc slot root (shared by parse + createParser) ---
   function buildDocRoot(docId: number, proxyObjects = false): unknown {
     const rootTag = engine.doc_get_tag(docId, 1);
+    // Primitives: extract value and free doc immediately (no Proxy needed)
     if (rootTag <= TAG_STRING) {
-      let value: unknown;
-      switch (rootTag) {
-        case TAG_NULL: value = null; break;
-        case TAG_TRUE: value = true; break;
-        case TAG_FALSE: value = false; break;
-        case TAG_NUMBER: value = engine.doc_get_number(docId, 1); break;
-        case TAG_STRING: value = docReadString(docId, 1); break;
-        default: value = null;
-      }
+      const value = rootTag === TAG_NULL ? null
+        : rootTag === TAG_TRUE ? true
+        : rootTag === TAG_FALSE ? false
+        : rootTag === TAG_NUMBER ? engine.doc_get_number(docId, 1)
+        : docReadString(docId, 1);
       engine.doc_free(docId);
       return value;
     }
+    // Containers: register for GC and wrap in Proxy
     const generation = (docGenerations.get(docId) ?? 0) + 1;
     docGenerations.set(docId, generation);
     const keepAlive = { docId };
@@ -743,28 +737,12 @@ export async function init(options?: {
     },
 
     materialize(value: unknown): unknown {
-      if (isLazyProxy(value)) {
-        const handle = (value as Record<symbol, unknown>)[LAZY_PROXY] as
-          | { docId: number; index: number };
-        if ("docId" in handle) {
-          return deepMaterializeDoc(handle.docId, handle.index);
-        }
-      }
-      // Already a plain JS value — return as-is
-      return value;
+      if (!isLazyProxy(value)) return value;
+      const { docId, index } = (value as any)[LAZY_PROXY];
+      return deepMaterializeDoc(docId, index);
     },
 
     stringify(value: unknown): string {
-      // Doc-backed proxy → materialize then use native JSON.stringify
-      if (isLazyProxy(value)) {
-        const handle = (value as Record<symbol, unknown>)[LAZY_PROXY] as {
-          docId?: number;
-          index?: number;
-        };
-        if (typeof handle.docId === "number" && typeof handle.index === "number") {
-          return JSON.stringify(deepMaterializeDoc(handle.docId, handle.index));
-        }
-      }
       return JSON.stringify(value);
     },
 
@@ -801,6 +779,7 @@ export async function init(options?: {
       let destroyed = false;
       let cachedValue: unknown = undefined;
       let valueResolved = false;
+      let cachedRemaining: Uint8Array | null | undefined; // undefined = not yet cached
 
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
@@ -839,6 +818,19 @@ export async function init(options?: {
           const bufPtr = engine.stream_get_buffer_ptr(streamId);
           const valueLen = engine.stream_get_value_len(streamId);
 
+          // Save remaining bytes BEFORE SIMD padding (padding starts at bufPtr + valueLen,
+          // which is exactly where remaining bytes live in the end_early case)
+          if (cachedRemaining === undefined) {
+            const rPtr = engine.stream_get_remaining_ptr(streamId);
+            const rLen = engine.stream_get_remaining_len(streamId);
+            if (rLen > 0) {
+              cachedRemaining = new Uint8Array(rLen);
+              cachedRemaining.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
+            } else {
+              cachedRemaining = null;
+            }
+          }
+
           // Pad for SIMD safety (zimdjson needs 64 bytes of padding)
           new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
 
@@ -856,13 +848,14 @@ export async function init(options?: {
 
         getRemaining(): Uint8Array | null {
           if (destroyed) return null;
+          // Return cached copy if getValue() already saved it (padding may have overwritten original)
+          if (cachedRemaining !== undefined) return cachedRemaining;
           const rPtr = engine.stream_get_remaining_ptr(streamId);
           const rLen = engine.stream_get_remaining_len(streamId);
-          if (rLen === 0) return null;
-          // Copy remaining bytes out of engine memory
-          const out = new Uint8Array(rLen);
-          out.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
-          return out;
+          if (rLen === 0) { cachedRemaining = null; return null; }
+          cachedRemaining = new Uint8Array(rLen);
+          cachedRemaining.set(new Uint8Array(engine.memory.buffer, rPtr, rLen));
+          return cachedRemaining;
         },
 
         getStatus(): FeedStatus {

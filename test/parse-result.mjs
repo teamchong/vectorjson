@@ -497,13 +497,12 @@ test("incomplete: string with escape at end", () => {
   assert(r.value !== undefined, "produces a value");
 });
 
-test("incomplete: string with unicode escape mid-sequence → invalid", () => {
-  // Partial unicode escape \u00 can't be completed by structural autocomplete
-  // (autocomplete closes the string but \u00" is an invalid escape sequence)
+test("incomplete: string with unicode escape mid-sequence → incomplete", () => {
+  // Partial unicode escape \u00 — autocomplete strips the incomplete escape
+  // and closes the string, producing an empty string value
   const r = vj.parse('"\\u00');
-  // classify says "incomplete" (mid-string), autocomplete appends '"',
-  // but doc_parse rejects the partial \u00 escape → "invalid"
-  assertEqual(r.status, "invalid");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), "");
 });
 
 test("incomplete: nested arrays 3 deep", () => {

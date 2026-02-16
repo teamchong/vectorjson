@@ -297,6 +297,24 @@ test("unclosed string via parsePartialJson", () => {
   assertEqual(r.value, { name: "hel" });
 });
 
+test("partial unicode escape \\u → strips escape", () => {
+  const r = vj.parsePartialJson('{"v": "hello\\u00');
+  assertEqual(r.state, "repaired-parse");
+  assertEqual(r.value, { v: "hello" });
+});
+
+test("partial unicode escape \\u0 → strips escape", () => {
+  const r = vj.parsePartialJson('{"v": "ab\\u0');
+  assertEqual(r.state, "repaired-parse");
+  assertEqual(r.value, { v: "ab" });
+});
+
+test("complete unicode escape preserved", () => {
+  const r = vj.parsePartialJson('{"v": "\\u0041"}');
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, { v: "A" });
+});
+
 test("nested incomplete via parsePartialJson", () => {
   const r = vj.parsePartialJson('{"a": [1, 2], "b": {"c": ');
   assertEqual(r.state, "repaired-parse");
@@ -371,11 +389,10 @@ test("streaming: Uint8Array input", () => {
   parser.destroy();
 });
 
-test("streaming: NDJSON (end_early)", () => {
+test("streaming: NDJSON (end_early) — getRemaining before getValue", () => {
   const parser = vj.createParser();
   const status = parser.feed('{"a":1}\n{"b":2}');
   assertEqual(status, "end_early");
-  // Get remaining BEFORE getValue (getValue pads SIMD bytes into the buffer)
   const remaining = parser.getRemaining();
   if (!remaining) throw new Error("Expected remaining bytes");
   const remainStr = new TextDecoder().decode(remaining);
@@ -383,6 +400,21 @@ test("streaming: NDJSON (end_early)", () => {
     throw new Error(`Remaining should contain second object, got: ${remainStr}`);
   }
   assertEqual(vj.materialize(parser.getValue()), { a: 1 });
+  parser.destroy();
+});
+
+test("streaming: NDJSON (end_early) — getValue before getRemaining", () => {
+  const parser = vj.createParser();
+  const status = parser.feed('{"x":1}\n{"y":2}');
+  assertEqual(status, "end_early");
+  // getValue() first — SIMD padding used to overwrite remaining bytes
+  assertEqual(vj.materialize(parser.getValue()), { x: 1 });
+  const remaining = parser.getRemaining();
+  if (!remaining) throw new Error("Expected remaining bytes after getValue");
+  const remainStr = new TextDecoder().decode(remaining);
+  if (!remainStr.includes('{"y":2}')) {
+    throw new Error(`Remaining should contain second object, got: ${remainStr}`);
+  }
   parser.destroy();
 });
 

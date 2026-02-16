@@ -810,7 +810,32 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
     const w = Writer{ .buf = ptr, .pos = &write_pos, .cap = buf_cap };
 
     if (in_string or escape_next) {
-        if (escape_next) w.append("n"); // complete dangling escape
+        if (escape_next) {
+            w.append("n"); // complete dangling escape as \n
+        } else {
+            // Check for incomplete unicode escape at end of string: \uXX or \uXXX
+            // Strip it so doc_parse doesn't choke on partial hex sequences
+            var strip_to = write_pos;
+            if (write_pos >= 2) {
+                // Scan backwards for a trailing \uXXXX sequence
+                var j: u32 = write_pos;
+                while (j > 0) {
+                    const ch = ptr[j - 1];
+                    if ((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F')) {
+                        j -= 1;
+                    } else break;
+                }
+                // j now points past the backslash-u prefix (if any)
+                if (j >= 2 and ptr[j - 1] == 'u' and ptr[j - 2] == '\\') {
+                    const hex_count = write_pos - j;
+                    if (hex_count < 4) {
+                        // Incomplete \uXXXX — strip the entire escape
+                        strip_to = j - 2;
+                    }
+                }
+            }
+            write_pos = strip_to;
+        }
         w.append("\"");
     } else if (after_colon) {
         w.append("null");
