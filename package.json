@@ -25,7 +25,8 @@
   "scripts": {
     "build:zig": "zig build -Doptimize=ReleaseSmall",
     "build:opt": "npx wasm-opt -Oz --strip-producers dist/engine.wasm -o dist/engine.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals",
-    "build:js": "bun x tsc",
+    "build:types": "bun x tsc --emitDeclarationOnly",
+    "build:js": "bun build src/js/index.ts --outdir dist --target node --format esm --minify --sourcemap=external && bun run build:types",
     "build": "bun run build:zig && bun run build:opt && bun run build:js",
     "test": "bun test/phase1.mjs && bun test/phase2.mjs && bun test/parse-result.mjs && bun test/is-complete.mjs && bun test/partial-json.mjs && bun test/zerocopy.mjs && bun test/standards.mjs && bun test/event-parser.mjs && bun test/live-doc.mjs",
     "bench": "bun --expose-gc bench/parse-stream.mjs",

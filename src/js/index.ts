@@ -265,12 +265,9 @@ export async function init(options?: {
 }): Promise<VectorJSON> {
   if (_instance) return _instance;
 
-  // Resolve WASM file paths
-  const distDir =
-    typeof __dirname !== "undefined"
-      ? __dirname
-      : dirname(fileURLToPath(import.meta.url));
-
+  // Resolve WASM file path — always use import.meta.url at runtime
+  // (avoids __dirname being baked in at bundle time by Bun/esbuild)
+  const distDir = dirname(fileURLToPath(import.meta.url));
   const enginePath = join(distDir, "engine.wasm");
 
   // Load WASM bytes
