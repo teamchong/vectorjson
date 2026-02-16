@@ -226,7 +226,7 @@ const vj = await init();
 const { value, state } = vj.parsePartialJson(buffer);
 ```
 
-> **Note:** AI SDKs (Vercel, Anthropic, TanStack) parse JSON internally inside `streamObject()`, `MessageStream`, etc. — you don't get access to the raw chunks. To use VectorJSON today, either work with the raw LLM stream directly or wait for SDKs to adopt VectorJSON upstream. We're working on PRs to the major SDKs.
+> **Note:** AI SDKs (Vercel, Anthropic, TanStack) parse JSON internally inside `streamObject()`, `MessageStream`, etc. — you don't get access to the raw chunks. To use VectorJSON today, work with the raw LLM stream directly (raw fetch, WebSocket, SSE).
 
 ### Event-driven: React to fields as they stream in
 
