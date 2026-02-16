@@ -447,8 +447,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     var in_string: bool = false;
     var escape_next: bool = false;
     var root_completed: bool = false;
-    var root_is_string: bool = false;
-    var pending_scalar: bool = false;
+    var root_type: enum { none, string, scalar } = .none;
     var scalar_start: u32 = 0;
 
     var i: u32 = 0;
@@ -466,7 +465,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 escape_next = true;
             } else if (c == '"') {
                 in_string = false;
-                if (depth_val == 0 and root_is_string and !root_completed) {
+                if (depth_val == 0 and root_type == .string and !root_completed) {
                     root_completed = true;
                     classify_value_end = i + 1;
                 }
@@ -477,7 +476,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
 
         // Any non-scalar-body char at depth 0 terminates a pending scalar
         // Scalar body: digits, signs, decimal, exponent, plus keyword letters (true/false/null)
-        if (depth_val == 0 and pending_scalar and !root_completed) {
+        if (depth_val == 0 and root_type == .scalar and !root_completed) {
             switch (c) {
                 'a'...'z', '0'...'9', '-', '.', '+', 'E' => {},
                 else => { root_completed = true; classify_value_end = i; },
@@ -486,8 +485,8 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
 
         switch (c) {
             '"' => {
-                if (depth_val == 0 and !root_completed and !root_is_string and !pending_scalar) {
-                    root_is_string = true;
+                if (depth_val == 0 and !root_completed and root_type == .none) {
+                    root_type = .string;
                 }
                 in_string = true;
             },
@@ -503,8 +502,8 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 }
             },
             't', 'f', 'n', '-', '0'...'9' => {
-                if (depth_val == 0 and !root_completed and !pending_scalar) {
-                    pending_scalar = true;
+                if (depth_val == 0 and !root_completed and root_type != .scalar) {
+                    root_type = .scalar;
                     scalar_start = i;
                 }
             },
@@ -516,7 +515,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     // Handle pending scalar at EOF (e.g. "42" with no trailing whitespace)
     // Must validate that the scalar is actually complete — partial keywords
     // like "tr", "fal", "nul" should be treated as incomplete, not complete.
-    if (!root_completed and depth_val == 0 and !in_string and pending_scalar) {
+    if (!root_completed and depth_val == 0 and !in_string and root_type == .scalar) {
         const scalar = ptr[scalar_start..len];
         // Partial keyword prefix → incomplete (e.g. "tr", "fal", "nul")
         for ([_][]const u8{ "true", "false", "null" }) |kw| {

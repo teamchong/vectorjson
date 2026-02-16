@@ -63,30 +63,6 @@ export interface VectorJSON {
    * Objects and arrays return Proxy objects — values materialize only when accessed.
    * Call .free() on the result to release resources immediately, or let
    * FinalizationRegistry handle it automatically when the Proxy is GC'd.
-   *
-   * **Cursor pattern**: When iterating arrays of objects, VectorJSON returns a
-   * shared cursor object that repositions on each access. This enables columnar
-   * reads (one WASM call per field instead of per row) but means array elements
-   * should **not be stored by reference** — use destructuring to capture values:
-   *
-   * ```js
-   * // ✅ Destructure — captures plain values, safe to store (recommended)
-   * for (const item of data) {
-   *   const { id, name, score } = item;
-   * }
-   *
-   * // ✅ Sequential property access — cursor is at correct position
-   * for (const item of data) { use(item.id, item.name); }
-   *
-   * // ✅ JSON.stringify — processes elements sequentially
-   * JSON.stringify(result);
-   *
-   * // ✅ Materialize — converts entire tree to plain JS objects
-   * const plain = vj.materialize(result);
-   *
-   * // ❌ Storing cursor references — all point to the same object
-   * const a = data[0]; const b = data[1]; // a === b (same cursor)
-   * ```
    */
   parse(input: string | Uint8Array): ParseResult;
   /**
