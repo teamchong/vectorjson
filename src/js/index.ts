@@ -422,7 +422,7 @@ export async function init(options?: {
           if (target._c[idx] !== undefined) return target._c[idx];
           const indices = batchElemIndices(target);
           const val = resolveValue(target._d, indices[idx], target._k, target._g, target._f, target._p);
-          target._c[idx] = val === undefined ? null : val;
+          target._c[idx] = val;
           return val;
         }
         if (prop in Array.prototype) {
@@ -626,12 +626,6 @@ export async function init(options?: {
         };
       };
 
-      // Helper: capture the parsed bytes as a string for toJSON()
-      const captureToJSONStr = (parseLen: number): string => {
-        if (typeof input === "string" && parseLen === len) return input;
-        return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
-      };
-
       // Helper: build an invalid ParseResult from the last engine error code
       const invalidResult = (msg?: string): ParseResult => {
         if (!msg) {
@@ -644,7 +638,9 @@ export async function init(options?: {
       // ── Happy path: try doc_parse directly (no classify overhead) ──
       let docId = tryDocParse(ptr, len);
       if (docId >= 0) {
-        const toJSONStr = captureToJSONStr(len);
+        // For string input at full length, reuse the original string (avoids decode)
+        const toJSONStr = typeof input === "string" ? input
+          : utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
         return makeResult("complete", buildDocRoot(docId), Infinity, toJSONStr);
       }
 
@@ -657,13 +653,12 @@ export async function init(options?: {
 
       if (classification === CLASSIFY_COMPLETE_EARLY) {
         const parseLen = engine.get_value_end();
-        const mem = new Uint8Array(engine.memory.buffer);
         const remainLen = len - parseLen;
         const remainingCopy = new Uint8Array(remainLen);
-        remainingCopy.set(mem.subarray(ptr + parseLen, ptr + len));
-        mem.fill(0x20, ptr + parseLen, ptr + parseLen + 64);
+        remainingCopy.set(new Uint8Array(engine.memory.buffer, ptr + parseLen, remainLen));
+        new Uint8Array(engine.memory.buffer, ptr + parseLen, 64).fill(0x20);
 
-        const toJSONStr = captureToJSONStr(parseLen);
+        const toJSONStr = utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
         docId = tryDocParse(ptr, parseLen);
         if (docId >= 0) {
           return makeResult("complete_early", buildDocRoot(docId), Infinity, toJSONStr, remainingCopy);
@@ -677,11 +672,9 @@ export async function init(options?: {
           if (len === 0) return makeResult("incomplete", undefined, len, undefined);
           return invalidResult("Invalid JSON structure");
         }
-        // Capture autocompleted bytes for toJSON before they're overwritten
         const toJSONStr = utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
         docId = tryDocParse(ptr, parseLen);
         if (docId >= 0) {
-          // proxyObjects=true: objects stay as Proxy so isComplete() can access tape index
           return makeResult("incomplete", buildDocRoot(docId, true), len, toJSONStr);
         }
         return invalidResult();
