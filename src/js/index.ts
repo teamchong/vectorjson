@@ -301,22 +301,13 @@ export async function init(options?: {
         return engine.doc_get_number(docId, index);
       case TAG_STRING:
         return docReadString(docId, index);
-      case TAG_ARRAY: {
-        const indices = copyBatchIndices(engine.doc_array_elements(docId, index));
-        const arr: unknown[] = [];
-        for (let i = 0; i < indices.length; i++) {
-          arr.push(deepMaterializeDoc(docId, indices[i]));
-        }
-        return arr;
-      }
-      case TAG_OBJECT: {
-        const indices = copyBatchIndices(engine.doc_object_keys(docId, index));
-        const obj: Record<string, unknown> = {};
-        for (let i = 0; i < indices.length; i++) {
-          obj[docReadString(docId, indices[i])] = deepMaterializeDoc(docId, indices[i] + 1);
-        }
-        return obj;
-      }
+      case TAG_ARRAY:
+        return Array.from(copyBatchIndices(engine.doc_array_elements(docId, index)),
+          (idx) => deepMaterializeDoc(docId, idx));
+      case TAG_OBJECT:
+        return Object.fromEntries(Array.from(
+          copyBatchIndices(engine.doc_object_keys(docId, index)),
+          (idx) => [docReadString(docId, idx), deepMaterializeDoc(docId, idx + 1)]));
       default:
         return null;
     }

@@ -651,21 +651,17 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
             }
             if (atom_start < atom_end) {
                 const atom = ptr[atom_start..atom_end];
-                var atom_handled = false;
                 // Complete partial keywords: "tr" → "ue", "fal" → "se", "nu" → "ll", etc.
-                const keywords = [_][]const u8{ "true", "false", "null" };
-                for (keywords) |kw| {
-                    if (atom.len <= kw.len and std.mem.eql(u8, atom, kw[0..atom.len])) {
-                        w.append(kw[atom.len..]);
-                        atom_handled = true;
-                        break;
-                    }
-                }
-                // Strip trailing incomplete number chars iteratively:
-                // "1.23e-" → strip "-" → "1.23e" → strip "e" → "1.23"
-                // "1." → strip "." → "1"
-                // "-" → strip all → atom_start (no valid prefix → leaves invalid)
-                if (!atom_handled and atom.len > 0) {
+                if (for ([_][]const u8{ "true", "false", "null" }) |kw| {
+                    if (atom.len <= kw.len and std.mem.eql(u8, atom, kw[0..atom.len]))
+                        break kw[atom.len..];
+                } else @as(?[]const u8, null)) |suffix| {
+                    w.append(suffix);
+                } else if (atom.len > 0) {
+                    // Strip trailing incomplete number chars iteratively:
+                    // "1.23e-" → strip "-" → "1.23e" → strip "e" → "1.23"
+                    // "1." → strip "." → "1"
+                    // "-" → strip all → atom_start (no valid prefix → leaves invalid)
                     var strip_pos = atom_start + atom.len;
                     while (strip_pos > atom_start) {
                         const ch = ptr[strip_pos - 1];
