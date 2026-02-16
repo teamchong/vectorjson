@@ -169,6 +169,29 @@ await test("streaming pattern: multiple complete elements", () => {
   assert(r.isComplete(r.value[3]) === false);
 });
 
+await test("streaming pattern: index-based without .length", () => {
+  // Simulates the README pattern: track index, check isComplete per element
+  const r = vj.parse('[{"id":1},{"id":2},{"id":3},{"id":');
+  assert(r.status === "incomplete");
+
+  const executed = [];
+  let next = 0;
+  while (r.value[next] !== undefined && r.isComplete(r.value[next])) {
+    executed.push(r.value[next].id);
+    next++;
+  }
+  assertEqual(executed, [1, 2, 3], "should execute 3 complete elements");
+  assert(next === 3, `next should be 3, got ${next}`);
+});
+
+await test("streaming pattern: isComplete(undefined) is true — needs guard", () => {
+  // Without a guard, looping past the end would hit undefined → isComplete returns true
+  const r = vj.parse('[{"id":1}');
+  assert(r.isComplete(undefined) === true, "isComplete(undefined) should be true");
+  assert(r.value[999] === undefined, "out-of-bounds should be undefined");
+  // This is why the while loop needs: tasks[next] !== undefined && ...
+});
+
 // ═══════════════════════════════════════════════════
 // isComplete — complete_early
 // ═══════════════════════════════════════════════════

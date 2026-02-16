@@ -29,21 +29,26 @@ For a 100KB response in 12-char chunks, that's ~8,500 full parses — O(n²) CPU
 // O(n) streaming — each feed() processes only new bytes
 const parser = vj.createParser();
 for await (const chunk of stream) {
-  if (parser.feed(chunk) === "complete") break;
+  const s = parser.feed(chunk);
+  if (s === "complete" || s === "end_early") break;
 }
 const result = parser.getValue(); // lazy Proxy — zero-copy access
 parser.destroy();
 ```
 
 ```js
-// Act on elements as they become complete
+// Act on elements as they arrive — don't wait for the full array
 let next = 0;
 for await (const chunk of stream) {
   buffer += chunk;
   const result = vj.parse(buffer);
   const tasks = result.value.tasks;
-  while (next < tasks.length && result.isComplete(tasks[next])) {
-    execute(tasks[next++]);                      // act immediately, don't wait for full array
+  if (result.status === "complete" || result.status === "complete_early") {
+    for (; next < tasks.length; next++) execute(tasks[next]);
+    break;
+  }
+  while (tasks[next] !== undefined && result.isComplete(tasks[next])) {
+    execute(tasks[next++]);
   }
 }
 ```
