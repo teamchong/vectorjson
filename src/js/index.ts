@@ -216,8 +216,7 @@ export async function init(options?: {
         );
 
   // --- Instantiate Zig engine ---
-  const engineModule = await WebAssembly.compile(engineBytes);
-  const engineInstance = await WebAssembly.instantiate(engineModule, {});
+  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes, {});
   const engine = engineInstance.exports as unknown as EngineExports;
 
   const encoder = new TextEncoder();
@@ -499,13 +498,9 @@ export async function init(options?: {
 
   // --- Check if a value is a lazy proxy ---
   function isLazyProxy(value: unknown): boolean {
-    if (value === null || value === undefined) return false;
-    if (typeof value !== "object") return false;
-    try {
-      return LAZY_PROXY in (value as Record<symbol, unknown>);
-    } catch {
-      return false;
-    }
+    if (value === null || typeof value !== "object") return false;
+    try { return LAZY_PROXY in (value as Record<symbol, unknown>); }
+    catch { return false; }
   }
 
   // --- Build a value from a doc slot root (shared by parse + createParser) ---

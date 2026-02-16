@@ -698,6 +698,22 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
     // Now append closing suffix
     var write_pos: u32 = len;
 
+    // Helper: append a slice to the output buffer with bounds checking
+    const Writer = struct {
+        buf: [*]u8,
+        pos: *u32,
+        cap: u32,
+        fn append(self: @This(), s: []const u8) void {
+            for (s) |ch| {
+                if (self.pos.* < self.cap) {
+                    self.buf[self.pos.*] = ch;
+                    self.pos.* += 1;
+                }
+            }
+        }
+    };
+    const w = Writer{ .buf = ptr, .pos = &write_pos, .cap = buf_cap };
+
     // ── Partial atom completion ──
     // Detect and complete partial atoms (booleans, null, numbers with trailing dot)
     // at the tail of the input. These occur when an LLM streams mid-token.
@@ -719,8 +735,6 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                     atom_start -= 1;
                 } else break;
             }
-            // Only attempt completion if the atom is at value position
-            // (i.e., after ':', '[', or at root level)
             if (atom_start < atom_end) {
                 const atom = ptr[atom_start..atom_end];
                 var atom_handled = false;
@@ -728,12 +742,7 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                 const keywords = [_][]const u8{ "true", "false", "null" };
                 for (keywords) |kw| {
                     if (atom.len <= kw.len and std.mem.eql(u8, atom, kw[0..atom.len])) {
-                        for (kw[atom.len..]) |ch| {
-                            if (write_pos < buf_cap) {
-                                ptr[write_pos] = ch;
-                                write_pos += 1;
-                            }
-                        }
+                        w.append(kw[atom.len..]);
                         atom_handled = true;
                         break;
                     }
@@ -757,22 +766,6 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
             }
         }
     }
-
-    // Helper: append a slice to the output buffer
-    const Writer = struct {
-        buf: [*]u8,
-        pos: *u32,
-        cap: u32,
-        fn append(self: @This(), s: []const u8) void {
-            for (s) |ch| {
-                if (self.pos.* < self.cap) {
-                    self.buf[self.pos.*] = ch;
-                    self.pos.* += 1;
-                }
-            }
-        }
-    };
-    const w = Writer{ .buf = ptr, .pos = &write_pos, .cap = buf_cap };
 
     if (in_string or escape_next) {
         if (escape_next) {
