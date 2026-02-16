@@ -27,16 +27,25 @@ export type PartialJsonState =
   | "repaired-parse"
   | "failed-parse";
 
-export interface PartialJsonResult {
-  value: unknown;
-  state: PartialJsonState;
-}
+/** Discriminated union — narrows `value` type when you check `state`. */
+export type PartialJsonResult<T = unknown> =
+  | { value: T; state: "successful-parse" }
+  | { value: T | undefined; state: "repaired-parse" }
+  | { value: undefined; state: "failed-parse" };
 
-export interface StreamingParser {
+/** Recursively make all properties optional — matches Vercel AI SDK's DeepPartial. */
+export type DeepPartial<T> =
+  T extends object
+    ? T extends Array<infer U>
+      ? Array<DeepPartial<U>>
+      : { [K in keyof T]?: DeepPartial<T[K]> }
+    : T;
+
+export interface StreamingParser<T = unknown> {
   /** Feed a chunk of bytes to the parser. Only NEW bytes are scanned (O(chunk_size)). */
   feed(chunk: Uint8Array | string): FeedStatus;
   /** Get the parsed value. Returns `undefined` while JSON is incomplete; throws on parse errors. */
-  getValue(): unknown | undefined;
+  getValue(): T | undefined;
   /** Get remaining bytes after end_early status (for NDJSON). */
   getRemaining(): Uint8Array | null;
   /** Get the current status without feeding data. */
@@ -129,6 +138,18 @@ export interface VectorJSON {
    */
   createParser(): StreamingParser;
   /**
+   * Create a streaming parser with schema validation.
+   * `getValue()` returns `undefined` when the schema rejects the value (same as incomplete).
+   * T is auto-inferred from the schema — no manual `<T>` needed.
+   *
+   * ```ts
+   * const parser = vj.createParser(z.object({ name: z.string() }));
+   * parser.feed('{"name":"Alice"}');
+   * parser.getValue(); // { name: string } | undefined
+   * ```
+   */
+  createParser<T>(schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): StreamingParser<T>;
+  /**
    * Eagerly materialize a lazy proxy into plain JS objects.
    * If the value is already a plain JS value, returns it as-is.
    */
@@ -147,6 +168,23 @@ export interface VectorJSON {
    * ```
    */
   parsePartialJson(input: string): PartialJsonResult;
+  /**
+   * Parse partial JSON with schema-inferred types.
+   * T is auto-inferred from the schema — no manual `<T>` needed.
+   *
+   * Returns `DeepPartial<T>` because incomplete JSON will have missing fields.
+   * When `safeParse` succeeds, returns the validated `data`.
+   * When `safeParse` fails on a repaired-parse, returns the raw parsed value
+   * (typed as `DeepPartial<T>`) — the object is partial, that's expected.
+   *
+   * ```ts
+   * const User = z.object({ name: z.string(), age: z.number() });
+   * const { value, state } = vj.parsePartialJson('{"name":"Al', User);
+   * // value: { name?: string; age?: number } | undefined
+   * // state: "repaired-parse"
+   * ```
+   */
+  parsePartialJson<T>(input: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): PartialJsonResult<DeepPartial<T>>;
   /**
    * Create an event-driven streaming parser with path subscriptions,
    * string delta emission, multi-root support, and JSON boundary detection.
@@ -752,17 +790,32 @@ export async function init(options?: {
       return deepMaterializeDoc(docId, index);
     },
 
-    parsePartialJson(input: string): PartialJsonResult {
-      if (!input) return { value: undefined, state: "failed-parse" };
+    parsePartialJson(input: string, schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } }): PartialJsonResult {
+      if (!input) return { value: undefined, state: "failed-parse" as const };
       const result = _instance!.parse(input);
       switch (result.status) {
         case "complete":
-        case "complete_early":
-          return { value: result.toJSON(), state: "successful-parse" };
-        case "incomplete":
-          return { value: result.toJSON(), state: "repaired-parse" };
+        case "complete_early": {
+          const value = result.toJSON();
+          if (schema) {
+            const validated = schema.safeParse(value);
+            if (validated.success) return { value: validated.data, state: "successful-parse" as const };
+            return { value: undefined, state: "successful-parse" as const };
+          }
+          return { value, state: "successful-parse" as const };
+        }
+        case "incomplete": {
+          const value = result.toJSON();
+          if (schema) {
+            const validated = schema.safeParse(value);
+            if (validated.success) return { value: validated.data, state: "repaired-parse" as const };
+            // Partial JSON: safeParse fails (missing fields expected) → keep raw value
+            return { value, state: "repaired-parse" as const };
+          }
+          return { value, state: "repaired-parse" as const };
+        }
         default:
-          return { value: undefined, state: "failed-parse" };
+          return { value: undefined, state: "failed-parse" as const };
       }
     },
 
@@ -1374,7 +1427,7 @@ export async function init(options?: {
       return self;
     },
 
-    createParser(): StreamingParser {
+    createParser(schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } }): StreamingParser {
       const streamId = engine.stream_create();
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
@@ -1433,7 +1486,15 @@ export async function init(options?: {
             const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
             throw new SyntaxError(`VectorJSON: ${msg}`);
           }
-          return (cachedValue = buildDocRoot(docId));
+          let value = buildDocRoot(docId);
+          if (schema) {
+            // Materialize for safeParse (it expects plain JS objects, not Proxy)
+            if (isLazyProxy(value)) value = deepMaterializeDoc((value as any)[LAZY_PROXY].docId, (value as any)[LAZY_PROXY].index);
+            const result = schema.safeParse(value);
+            if (!result.success) return (cachedValue = undefined) as undefined;
+            value = result.data;
+          }
+          return (cachedValue = value);
         },
 
         getRemaining(): Uint8Array | null {
@@ -1481,7 +1542,10 @@ export async function parse(input: string | Uint8Array): Promise<ParseResult> {
  * const { value, state } = await parsePartialJson('{"a": 1, "b": ');
  * ```
  */
-export async function parsePartialJson(input: string): Promise<PartialJsonResult> {
+export async function parsePartialJson(input: string): Promise<PartialJsonResult>;
+export async function parsePartialJson<T>(input: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): Promise<PartialJsonResult<DeepPartial<T>>>;
+export async function parsePartialJson(input: string, schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } }): Promise<PartialJsonResult> {
   const vj = await init();
+  if (schema) return vj.parsePartialJson(input, schema);
   return vj.parsePartialJson(input);
 }

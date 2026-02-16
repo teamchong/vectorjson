@@ -480,6 +480,85 @@ test("streaming: multiple concurrent parsers", () => {
   p2.destroy();
 });
 
+// ── parsePartialJson with schema validation ──
+
+console.log("\n--- parsePartialJson: schema validation ---");
+
+// Mock schema that accepts objects with { name: string, age: number }
+const userSchema = {
+  safeParse(v) {
+    if (v && typeof v === 'object' && typeof v.name === 'string' && typeof v.age === 'number') {
+      return { success: true, data: v };
+    }
+    return { success: false };
+  }
+};
+
+// Transforming schema — uppercases name
+const transformSchema = {
+  safeParse(v) {
+    if (v && typeof v === 'object' && typeof v.name === 'string') {
+      return { success: true, data: { ...v, name: v.name.toUpperCase() } };
+    }
+    return { success: false };
+  }
+};
+
+test("schema: complete valid JSON passes validation", () => {
+  const r = vj.parsePartialJson('{"name":"Alice","age":30}', userSchema);
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, { name: "Alice", age: 30 });
+});
+
+test("schema: complete JSON fails validation → value undefined, state preserved", () => {
+  const r = vj.parsePartialJson('{"name":"Alice"}', userSchema); // missing age
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, undefined);
+});
+
+test("schema: incomplete JSON passes validation", () => {
+  const r = vj.parsePartialJson('{"name":"Alice","age":30, "extra":', userSchema);
+  assertEqual(r.state, "repaired-parse");
+  assertEqual(r.value, { name: "Alice", age: 30, extra: null });
+});
+
+test("schema: incomplete JSON fails validation → keeps raw value (DeepPartial)", () => {
+  const r = vj.parsePartialJson('{"name":"Alice","extra":', userSchema); // missing age
+  assertEqual(r.state, "repaired-parse");
+  // Partial JSON: safeParse fails (missing age), but raw value is kept — it's partial, that's expected
+  assertEqual(r.value, { name: "Alice", extra: null });
+});
+
+test("schema: failed parse stays failed regardless of schema", () => {
+  const r = vj.parsePartialJson("}}}", userSchema);
+  assertEqual(r.state, "failed-parse");
+  assertEqual(r.value, undefined);
+});
+
+test("schema: empty string stays failed regardless of schema", () => {
+  const r = vj.parsePartialJson("", userSchema);
+  assertEqual(r.state, "failed-parse");
+  assertEqual(r.value, undefined);
+});
+
+test("schema: transformation applied (data differs from raw parse)", () => {
+  const r = vj.parsePartialJson('{"name":"alice"}', transformSchema);
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, { name: "ALICE" });
+});
+
+test("schema: complete_early JSON fails validation → value undefined", () => {
+  const r = vj.parsePartialJson('{"name":"Alice"}{"b":2}', userSchema); // complete_early, missing age
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, undefined);
+});
+
+test("schema: no schema → backward compatible (unknown)", () => {
+  const r = vj.parsePartialJson('{"a":1}');
+  assertEqual(r.state, "successful-parse");
+  assertEqual(r.value, { a: 1 });
+});
+
 // ── Summary ──
 
 console.log(`\n\u2728 parsePartialJson Tests: ${passed} passed, ${failed} failed\n`);

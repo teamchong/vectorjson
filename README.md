@@ -202,11 +202,35 @@ parser.feed(llmOutput);
 
 ### Schema validation
 
-Filter events with Zod, Valibot, ArkType, or any lib with `.safeParse()`:
+Validate and auto-infer types with Zod, Valibot, ArkType, or any lib with `.safeParse()`. Works on all three APIs:
+
+**Streaming parser** — `getValue()` returns `undefined` until the value passes the schema:
+
+```ts
+import { z } from 'zod';
+const User = z.object({ name: z.string(), age: z.number() });
+
+const parser = vj.createParser(User);       // T inferred from schema
+for await (const chunk of stream) {
+  const s = parser.feed(chunk);
+  if (s === "complete") break;
+}
+const user = parser.getValue();              // { name: string; age: number } | undefined ✅
+parser.destroy();
+```
+
+**Partial JSON** — returns `DeepPartial<T>` because incomplete JSON has missing fields:
+
+```ts
+const { value, state } = vj.parsePartialJson('{"name":"Al', User);
+// value: { name: "Al" }     — partial object, typed as DeepPartial<{ name: string; age: number }>
+// state: "repaired-parse"
+// TypeScript type: { name?: string; age?: number } | undefined
+```
+
+**Event parser** — filter events by schema:
 
 ```js
-import { z } from 'zod';
-
 const ToolCall = z.object({ name: z.string(), args: z.record(z.unknown()) });
 
 parser.on('tool_calls[*]', ToolCall, (event) => {
@@ -214,6 +238,8 @@ parser.on('tool_calls[*]', ToolCall, (event) => {
   // Only fires when value passes schema validation
 });
 ```
+
+Schema-agnostic: any object with `{ safeParse(v) → { success: boolean; data?: T } }` works.
 
 ### One-shot parse
 
@@ -249,14 +275,14 @@ interface ParseResult {
 - **`incomplete`** — truncated JSON; value is autocompleted, `isComplete()` tells you what's real
 - **`invalid`** — broken JSON
 
-### `vj.createParser(): StreamingParser`
+### `vj.createParser(schema?): StreamingParser<T>`
 
-Each `feed()` processes only new bytes — O(n) total.
+Each `feed()` processes only new bytes — O(n) total. Pass an optional schema to auto-validate and infer the return type.
 
 ```ts
-interface StreamingParser {
+interface StreamingParser<T = unknown> {
   feed(chunk: Uint8Array | string): FeedStatus;
-  getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
+  getValue(): T | undefined;  // undefined while incomplete or schema rejects
   getRemaining(): Uint8Array | null;
   getStatus(): FeedStatus;
   destroy(): void;
@@ -264,15 +290,35 @@ interface StreamingParser {
 type FeedStatus = "incomplete" | "complete" | "error" | "end_early";
 ```
 
-### `vj.parsePartialJson(input: string): PartialJsonResult`
-
-Compatible with Vercel AI SDK's `parsePartialJson` signature. Returns a plain JS object (not a Proxy).
+With a schema, `getValue()` returns `undefined` when validation fails (same as incomplete — the stream hasn't produced valid data yet):
 
 ```ts
-interface PartialJsonResult {
-  value: unknown;
+import { z } from 'zod';
+const User = z.object({ name: z.string(), age: z.number() });
+
+const parser = vj.createParser(User);
+parser.feed('{"name":"Alice","age":30}');
+const val = parser.getValue(); // { name: string; age: number } | undefined ✅
+```
+
+Works with Zod, Valibot, ArkType — any library with `{ safeParse(v) → { success, data? } }`.
+
+### `vj.parsePartialJson(input, schema?): PartialJsonResult<DeepPartial<T>>`
+
+Compatible with Vercel AI SDK's `parsePartialJson` signature. Returns a plain JS object (not a Proxy). Pass an optional schema for type-safe validation.
+
+With a schema, returns `DeepPartial<T>` — all properties are optional because incomplete JSON will have missing fields. When `safeParse` succeeds, returns validated `data`. When `safeParse` fails on a repaired-parse (partial JSON), the raw parsed value is kept — the object is partial, that's expected.
+
+```ts
+interface PartialJsonResult<T = unknown> {
+  value: T | undefined;
   state: "successful-parse" | "repaired-parse" | "failed-parse";
 }
+
+type DeepPartial<T> = T extends object
+  ? T extends Array<infer U> ? Array<DeepPartial<U>>
+  : { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
 ```
 
 ### `vj.createEventParser(options?): EventParser`

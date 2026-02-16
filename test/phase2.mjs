@@ -196,5 +196,102 @@ await test("stream: string with escapes split across chunks", () => {
   p.destroy();
 });
 
+// --- createParser with schema validation ---
+
+// Mock schema: accepts { name: string, age: number }
+const userSchema = {
+  safeParse(v) {
+    if (v && typeof v === 'object' && typeof v.name === 'string' && typeof v.age === 'number') {
+      return { success: true, data: v };
+    }
+    return { success: false };
+  }
+};
+
+// Transforming schema: uppercases name
+const transformSchema = {
+  safeParse(v) {
+    if (v && typeof v === 'object' && typeof v.name === 'string') {
+      return { success: true, data: { ...v, name: v.name.toUpperCase() } };
+    }
+    return { success: false };
+  }
+};
+
+// Schema that rejects everything
+const rejectSchema = {
+  safeParse(_v) {
+    return { success: false };
+  }
+};
+
+await test("schema: createParser(schema).getValue() returns validated value", () => {
+  const p = vj.createParser(userSchema);
+  p.feed('{"name":"Alice","age":30}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice", age: 30 });
+  p.destroy();
+});
+
+await test("schema: createParser(schema).getValue() returns undefined when validation fails", () => {
+  const p = vj.createParser(userSchema);
+  p.feed('{"name":"Alice"}'); // missing age
+  const val = p.getValue();
+  assertEqual(val, undefined);
+  p.destroy();
+});
+
+await test("schema: createParser(schema) with transformation", () => {
+  const p = vj.createParser(transformSchema);
+  p.feed('{"name":"alice"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "ALICE" });
+  p.destroy();
+});
+
+await test("schema: createParser(schema) rejects all → undefined", () => {
+  const p = vj.createParser(rejectSchema);
+  p.feed('{"a":1}');
+  const val = p.getValue();
+  assertEqual(val, undefined);
+  p.destroy();
+});
+
+await test("schema: createParser(schema) on incomplete returns undefined (not validated)", () => {
+  const p = vj.createParser(userSchema);
+  p.feed('{"name":"Ali');
+  // Stream is incomplete — getValue returns undefined before schema even runs
+  const val = p.getValue();
+  assertEqual(val, undefined);
+  p.destroy();
+});
+
+await test("schema: createParser() without schema → backward compatible", () => {
+  const p = vj.createParser();
+  p.feed('{"a":1}');
+  const val = p.getValue();
+  assertEqual(val, { a: 1 });
+  p.destroy();
+});
+
+await test("schema: createParser(schema) caches validated result", () => {
+  const p = vj.createParser(userSchema);
+  p.feed('{"name":"Bob","age":25}');
+  const v1 = p.getValue();
+  const v2 = p.getValue();
+  assertEqual(v1 === v2, true, "Should return same cached reference");
+  p.destroy();
+});
+
+await test("schema: createParser(schema) feeds in chunks then validates", () => {
+  const p = vj.createParser(userSchema);
+  p.feed('{"name":');
+  p.feed('"Charlie",');
+  p.feed('"age":40}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Charlie", age: 40 });
+  p.destroy();
+});
+
 console.log(`\n✨ Phase 2 Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exitCode = 1;
