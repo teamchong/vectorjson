@@ -41,7 +41,6 @@ pub const StreamState = struct {
     // Root value tracking
     root_value_started: bool = false,
     root_value_completed: bool = false,
-    root_value_start: u32 = 0,
     pending_scalar_root: bool = false,
     root_is_string: bool = false,
 
@@ -142,13 +141,11 @@ pub const StreamState = struct {
                     if (self.depth == 0 and !self.root_value_started) {
                         self.root_value_started = true;
                         self.root_is_string = true;
-                        self.root_value_start = i;
                     }
                 },
                 '{', '[' => {
                     if (self.depth == 0 and !self.root_value_started) {
                         self.root_value_started = true;
-                        self.root_value_start = i;
                     }
                     self.depth += 1;
                 },
@@ -167,7 +164,6 @@ pub const StreamState = struct {
                 't', 'f', 'n', '-', '0'...'9' => {
                     if (self.depth == 0 and !self.root_value_started) {
                         self.root_value_started = true;
-                        self.root_value_start = i;
                         self.pending_scalar_root = true;
                     }
                 },

@@ -30,16 +30,6 @@ pub fn anyMatch(comptime targets: []const u8, chunk: @Vector(16, u8)) bool {
     return vecAnySet(m);
 }
 
-/// Does any byte match `targets` OR fall below `threshold`?
-/// Useful for JSON escape scanning: match '"', '\\' or any byte < 0x20.
-pub fn anyMatchOrBelow(comptime targets: []const u8, comptime threshold: u8, chunk: @Vector(16, u8)) bool {
-    var m: @Vector(16, bool) = chunk < @as(@Vector(16, u8), @splat(threshold));
-    inline for (targets) |t| {
-        m |= chunk == @as(@Vector(16, u8), @splat(t));
-    }
-    return vecAnySet(m);
-}
-
 /// Do ALL bytes match one of the comptime-known `targets`?
 /// Useful for checking if a 16-byte block is entirely whitespace.
 pub fn allMatch(comptime targets: []const u8, chunk: @Vector(16, u8)) bool {
