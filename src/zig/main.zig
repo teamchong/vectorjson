@@ -105,7 +105,7 @@ export fn stream_get_remaining_len(id: i32) u32 {
 //
 // Instead of building a WasmGC tree upfront, we parse into a tape and
 // return a document handle (i32 slot ID). JS navigates the tape on
-// demand via doc_get_tag, doc_find_field, doc_array_at, etc.
+// demand via doc_get_tag, doc_find_field, doc_array_elements, etc.
 //
 // Each slot owns a separate DomParser instance so multiple documents
 // can coexist. When a slot is freed, the parser's internal buffers are
@@ -461,6 +461,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     var root_completed: bool = false;
     var root_is_string: bool = false;
     var pending_scalar: bool = false;
+    var scalar_start: u32 = 0;
     var value_end: u32 = 0;
 
     var i: u32 = 0;
@@ -520,6 +521,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 if (depth_val == 0 and !root_started) {
                     root_started = true;
                     pending_scalar = true;
+                    scalar_start = i;
                 }
             },
             else => {},
@@ -531,36 +533,16 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     // Must validate that the scalar is actually complete — partial keywords
     // like "tr", "fal", "nul" should be treated as incomplete, not complete.
     if (!root_completed and depth_val == 0 and !in_string and pending_scalar) {
-        // Find the start of the scalar
-        var sc_start: u32 = 0;
-        while (sc_start < len) {
-            const ch = ptr[sc_start];
-            if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') break;
-            sc_start += 1;
+        const scalar = ptr[scalar_start..len];
+        // Partial keyword prefix → incomplete (e.g. "tr", "fal", "nul")
+        for ([_][]const u8{ "true", "false", "null" }) |kw| {
+            if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) return 0;
         }
-        const scalar = ptr[sc_start..len];
-        // Check if it's a valid complete scalar
-        const valid_keywords = [_][]const u8{ "true", "false", "null" };
-        var is_keyword_prefix = false;
-        var is_complete_keyword = false;
-        for (valid_keywords) |kw| {
-            if (scalar.len <= kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) {
-                is_keyword_prefix = true;
-                if (scalar.len == kw.len) {
-                    is_complete_keyword = true;
-                }
-                break;
-            }
-        }
-        if (is_keyword_prefix and !is_complete_keyword) {
-            // Partial keyword at root level → incomplete
-            return 0;
-        }
-        // Check for partial numbers: trailing '.', '-', '+', 'e', 'E'
+        // Trailing incomplete number char → incomplete (e.g. "1.", "1e", "1e-")
         if (scalar.len > 0) {
             const last_ch = scalar[scalar.len - 1];
             if (last_ch == '.' or last_ch == '-' or last_ch == '+' or last_ch == 'e' or last_ch == 'E') {
-                return 0; // incomplete number
+                return 0;
             }
         }
         root_completed = true;
