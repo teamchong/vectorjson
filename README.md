@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/vectorjson)](https://www.npmjs.com/package/vectorjson)
-[![bundle size](https://img.shields.io/bundlephobia/minzip/vectorjson)](https://bundlephobia.com/package/vectorjson)
+[![gzip size](https://img.shields.io/badge/gzip-37kB-blue)](https://www.npmjs.com/package/vectorjson)
 [![license](https://img.shields.io/npm/l/vectorjson)](https://github.com/teamchong/vectorjson/blob/main/LICENSE)
 
 O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and offload parsing to Workers with transferable ArrayBuffers.
