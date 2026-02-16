@@ -422,7 +422,7 @@ const wasmBytes = await fetch('/engine.wasm').then(r => r.arrayBuffer());
 const vj = await init({ engineWasm: wasmBytes });
 ```
 
-Bundle size: ~103 KB WASM + ~20 KB JS (~56 KB gzipped total). No runtime dependencies.
+Bundle size: ~92 KB WASM + ~20 KB JS (~51 KB gzipped total). No runtime dependencies.
 
 ## Building from Source
 

@@ -123,7 +123,7 @@ export fn stream_reset_for_next(id: i32) u32 {
 // can coexist. When a slot is freed, the parser's internal buffers are
 // retained for reuse by the next parse in that slot.
 
-const MAX_DOC_SLOTS = 256;
+const MAX_DOC_SLOTS = 128;
 var doc_parsers: [MAX_DOC_SLOTS]DomParser = .{DomParser.init} ** MAX_DOC_SLOTS;
 var doc_active: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 
@@ -219,7 +219,7 @@ fn getDocParser(doc_id: i32) ?*DomParser {
 }
 
 /// Parse JSON bytes and store the result in a document slot.
-/// Returns slot ID (0..255) on success, or -1 on error.
+/// Returns slot ID (0..127) on success, or -1 on error.
 /// The error code is available via get_error_code().
 export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     last_error_code = 0;
