@@ -96,6 +96,16 @@ export fn stream_get_remaining_len(id: i32) u32 {
     return s.getRemaining().len;
 }
 
+export fn stream_get_buffer_len(id: i32) u32 {
+    const s = getStream(id) orelse return 0;
+    return s.buffer_len;
+}
+
+export fn stream_reset_for_next(id: i32) u32 {
+    const s = getStream(id) orelse return 0;
+    return s.resetForNext();
+}
+
 // ============================================================
 // Document Slot System — "True Lazy" tape-direct navigation
 // ============================================================
@@ -203,21 +213,6 @@ fn getDocParser(doc_id: i32) ?*DomParser {
     return &doc_parsers[uid];
 }
 
-/// Read a string value from a parser's tape at the given index.
-/// Returns the raw byte slice pointing into the parser's string buffer.
-/// String buffer layout per string: [u32 length][string_bytes]
-/// Tape word data.len stores the string ordinal (index into string_meta).
-const STR_HEADER_SIZE: u32 = @sizeOf(u32); // 4
-
-fn readTapeString(p: *DomParser, index: u32) []const u8 {
-    const native_endian = @import("builtin").cpu.arch.endian();
-    const word = p.tape.get(index);
-    const str_offset = word.data.ptr;
-    const strings = p.tape.string_buffer.strings.items();
-    const str_len = std.mem.readInt(u32, strings.ptr[str_offset..][0..@sizeOf(u32)], native_endian);
-    return strings.ptr[str_offset + STR_HEADER_SIZE ..][0..str_len];
-}
-
 /// Parse JSON bytes and store the result in a document slot.
 /// Returns slot ID (0..255) on success, or -1 on error.
 /// The error code is available via get_error_code().
@@ -285,15 +280,27 @@ export fn doc_get_number(doc_id: i32, index: u32) f64 {
     };
 }
 
-/// Read a doc string as raw UTF-8 — ONE WASM call.
-/// Writes ptr to batch_buffer[0], len to batch_buffer[1].
-/// Returns len (0 = empty string). JS reads raw bytes via ptr.
+/// Read a doc string's source offset, raw length, and escape flag — ONE WASM call.
+/// Writes source_offset to batch_buffer[0], raw_len to batch_buffer[1],
+/// has_escapes (0 or 1) to batch_buffer[2].
+/// Returns raw_len (0 = empty string). JS reads raw bytes from input at offset.
 export fn doc_read_string_raw(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
-    const str = readTapeString(p, index);
-    batch_buffer[0] = @intFromPtr(str.ptr);
-    batch_buffer[1] = @intCast(str.len);
-    return @intCast(str.len);
+    const word = p.tape.get(index);
+    const raw_len_with_flag: u24 = word.data.len;
+    const raw_len: u32 = raw_len_with_flag & 0x7FFFFF;
+    const has_escapes: u32 = if ((raw_len_with_flag & (1 << 23)) != 0) 1 else 0;
+    batch_buffer[0] = word.data.ptr; // source byte offset after opening quote
+    batch_buffer[1] = raw_len; // raw byte count between quotes
+    batch_buffer[2] = has_escapes; // 1 if string contains backslash escapes
+    return raw_len;
+}
+
+/// Get the base address of the input document for a doc slot.
+/// JS uses this + source offset to read string bytes from WASM memory.
+export fn doc_get_input_ptr(doc_id: i32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    return @intCast(p.tape.input_base_addr);
 }
 
 /// Get the child count of a container (object or array) at the given tape index.
@@ -347,6 +354,8 @@ inline fn nextTapeEntry(tape: anytype, val_idx: u32) u32 {
 
 /// Find a field in an object by key. Returns the tape index of the VALUE,
 /// or 0 if not found (0 is the root word, never a valid value position).
+/// Compares raw source bytes against the key. For keys with escape sequences
+/// (e.g. \n, \uXXXX), raw comparison may fail — JS falls back to ownKeys iteration.
 export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_len: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const word = p.tape.get(obj_index);
@@ -357,9 +366,10 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
         const w = p.tape.get(curr);
         if (w.tag == .object_closing) return 0; // not found
 
-        // curr points to a key (string)
-        const key_str = readTapeString(p, curr);
-        if (key_str.len == key_len and simd.eql(key_str.ptr, key_ptr, key_len)) {
+        // Compare raw source bytes against the search key
+        const src_ptr: [*]const u8 = @ptrFromInt(p.tape.input_base_addr + w.data.ptr);
+        const raw_len = w.data.len;
+        if (raw_len == key_len and simd.eql(src_ptr, key_ptr, key_len)) {
             return curr + 1; // value is immediately after the key
         }
 
@@ -372,23 +382,27 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
 // These walk a container ONCE and return all child tape indices,
 // turning O(N²) sequential access into O(N).
 
-/// Static batch buffer: 64KB = 16384 u32 indices.
-/// Covers arrays/objects up to 16K elements in one batch call.
-var batch_buffer: [16384]u32 = undefined;
+/// Static batch buffer: 16384 u32 indices + 1 continuation token.
+/// When a container has more than 16384 elements, batch_buffer[count] holds
+/// the tape index to resume from on the next call.
+var batch_buffer: [16385]u32 = undefined;
 
 /// Get a pointer to the batch buffer (for JS to read results).
 export fn doc_batch_ptr() [*]u32 {
     return &batch_buffer;
 }
 
-/// Walk an array once, writing element tape indices into batch_buffer.
+/// Walk an array, writing element tape indices into batch_buffer.
 /// Returns the number of elements written (capped at 16384).
-export fn doc_array_elements(doc_id: i32, arr_index: u32) u32 {
+/// `resume_at`: tape index to resume from (0 = start from beginning).
+/// When buffer is full and more elements remain, batch_buffer[16384] holds
+/// the next tape index for resumption.
+export fn doc_array_elements(doc_id: i32, arr_index: u32, resume_at: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const word = p.tape.get(arr_index);
     if (word.tag != .array_opening) return 0;
 
-    var curr: u32 = arr_index + 1;
+    var curr: u32 = if (resume_at != 0) resume_at else arr_index + 1;
     var count: u32 = 0;
     while (count < 16384) {
         const w = p.tape.get(curr);
@@ -397,18 +411,25 @@ export fn doc_array_elements(doc_id: i32, arr_index: u32) u32 {
         count += 1;
         curr = nextTapeEntry(p.tape, curr);
     }
+    // Write continuation token if there are more elements
+    if (count == 16384) {
+        batch_buffer[16384] = curr;
+    }
     return count;
 }
 
-/// Walk an object once, writing key tape indices into batch_buffer.
+/// Walk an object, writing key tape indices into batch_buffer.
 /// Value index = key_index + 1.
 /// Returns the number of entries written (capped at 16384).
-export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
+/// `resume_at`: tape index to resume from (0 = start from beginning).
+/// When buffer is full and more elements remain, batch_buffer[16384] holds
+/// the next tape index for resumption.
+export fn doc_object_keys(doc_id: i32, obj_index: u32, resume_at: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const word = p.tape.get(obj_index);
     if (word.tag != .object_opening) return 0;
 
-    var curr: u32 = obj_index + 1;
+    var curr: u32 = if (resume_at != 0) resume_at else obj_index + 1;
     var count: u32 = 0;
     while (count < 16384) {
         const w = p.tape.get(curr);
@@ -416,6 +437,10 @@ export fn doc_object_keys(doc_id: i32, obj_index: u32) u32 {
         batch_buffer[count] = curr; // key index
         count += 1;
         curr = nextTapeEntry(p.tape, curr + 1);
+    }
+    // Write continuation token if there are more elements
+    if (count == 16384) {
+        batch_buffer[16384] = curr;
     }
     return count;
 }

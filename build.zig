@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         "doc_get_src_pos",
         "doc_get_close_index",
         "doc_find_field",
+        "doc_get_input_ptr",
         "doc_batch_ptr",
         "doc_array_elements",
         "doc_object_keys",
@@ -62,6 +63,8 @@ pub fn build(b: *std.Build) void {
         "stream_get_value_len",
         "stream_get_remaining_ptr",
         "stream_get_remaining_len",
+        "stream_get_buffer_len",
+        "stream_reset_for_next",
         // Input classification & autocomplete
         "classify_input",
         "autocomplete_input",

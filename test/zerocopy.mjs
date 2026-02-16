@@ -184,6 +184,76 @@ assertEq(unicode.emoji, "❤", "unicode escape (heart)");
 assertEq(unicode.jp, "こんにちは", "unicode escape (Japanese)");
 
 // ============================================================
+// Large containers (batch buffer pagination >16K)
+// ============================================================
+console.log("\n--- Large Containers (>16K elements) ---");
+
+{
+  // Build array with 17000 elements (exceeds 16384 batch buffer)
+  const N = 17000;
+  const arr = Array.from({ length: N }, (_, i) => i);
+  const json = JSON.stringify(arr);
+  const result = vj.parse(json);
+  assert(result.status === "complete", "large array parses successfully");
+  assert(result.value.length === N, `large array has ${N} elements`);
+  // Verify first, middle, and last elements
+  assertEq(result.value[0], 0, "large array first element");
+  assertEq(result.value[8192], 8192, "large array middle element");
+  assertEq(result.value[16383], 16383, "large array element at batch boundary");
+  assertEq(result.value[16384], 16384, "large array first element past batch boundary");
+  assertEq(result.value[N - 1], N - 1, "large array last element");
+  // Verify iteration
+  let sum = 0;
+  for (const v of result.value) sum += v;
+  assertEq(sum, (N * (N - 1)) / 2, "large array iteration sum correct");
+}
+
+{
+  // Build object with 17000 keys
+  const N = 17000;
+  const obj = {};
+  for (let i = 0; i < N; i++) obj[`k${i}`] = i;
+  const json = JSON.stringify(obj);
+  const result = vj.parse(json);
+  assert(result.status === "complete", "large object parses successfully");
+  const keys = Object.keys(result.value);
+  assertEq(keys.length, N, `large object has ${N} keys`);
+  assertEq(result.value.k0, 0, "large object first key");
+  assertEq(result.value.k16383, 16383, "large object key at batch boundary");
+  assertEq(result.value.k16384, 16384, "large object first key past batch boundary");
+  assertEq(result.value[`k${N - 1}`], N - 1, "large object last key");
+}
+
+// ============================================================
+// Escape flag (has_escapes from SIMD skipString)
+// ============================================================
+console.log("\n--- Escape Flag Detection ---");
+
+{
+  // String without escapes — fast path
+  const r1 = vj.parse('{"a":"hello world"}');
+  assertEq(r1.value.a, "hello world", "no-escape string reads correctly");
+}
+
+{
+  // String with escapes — slow path via JSON.parse
+  const r2 = vj.parse('{"a":"hello\\nworld"}');
+  assertEq(r2.value.a, "hello\nworld", "escaped string decodes correctly");
+}
+
+{
+  // String with unicode escape
+  const r3 = vj.parse('{"a":"\\u0048\\u0065\\u006c\\u006c\\u006f"}');
+  assertEq(r3.value.a, "Hello", "unicode escaped string decodes correctly");
+}
+
+{
+  // Surrogate pair
+  const r4 = vj.parse('{"a":"\\uD83D\\uDE00"}');
+  assertEq(r4.value.a, "😀", "surrogate pair decodes correctly");
+}
+
+// ============================================================
 // Results
 // ============================================================
 console.log(`\n✨ Zero-Copy Results: ${passed} passed, ${failed} failed\n`);

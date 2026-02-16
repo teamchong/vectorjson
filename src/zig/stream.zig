@@ -204,6 +204,37 @@ pub const StreamState = struct {
         self.remaining_offset = end_offset;
     }
 
+    /// Reset parser state for the next root value (multi-root / NDJSON).
+    /// Shifts remaining bytes (after the completed value) to buffer start,
+    /// resets structural tracking, and re-scans the leftover bytes.
+    /// Returns the number of remaining bytes (0 if nothing left).
+    pub fn resetForNext(self: *StreamState) u32 {
+        if (self.status != .complete and self.status != .end_early) return 0;
+        const buf = self.buffer orelse return 0;
+
+        // Determine where the completed value ends
+        const value_end = if (self.status == .end_early) self.remaining_offset else self.buffer_len;
+        const remain_len = self.buffer_len - value_end;
+        if (remain_len > 0) {
+            std.mem.copyForwards(u8, buf[0..remain_len], buf[value_end..self.buffer_len]);
+        }
+
+        // Reset parser state for next root value
+        self.buffer_len = remain_len;
+        self.depth = 0;
+        self.in_string = false;
+        self.escape_next = false;
+        self.scan_offset = 0;
+        self.status = .incomplete;
+        self.remaining_offset = 0;
+        self.root_state = .none;
+
+        // Immediately scan remaining bytes (they may contain a complete value)
+        if (remain_len > 0) self.scanStructure();
+
+        return remain_len;
+    }
+
     pub fn getBufferPtr(self: *StreamState) [*]const u8 {
         return self.buffer orelse @ptrFromInt(1);
     }
