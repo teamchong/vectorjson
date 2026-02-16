@@ -491,13 +491,17 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
             continue;
         }
 
+        // Any non-scalar-body char at depth 0 terminates a pending scalar
+        // Scalar body: digits, signs, decimal, exponent, plus keyword letters (true/false/null)
+        if (depth_val == 0 and pending_scalar and !root_completed) {
+            switch (c) {
+                'a'...'z', '0'...'9', '-', '.', '+', 'E' => {},
+                else => { root_completed = true; value_end = i; },
+            }
+        }
+
         switch (c) {
             '"' => {
-                // A quote at depth 0 after a pending scalar terminates the scalar
-                if (depth_val == 0 and pending_scalar and !root_completed) {
-                    root_completed = true;
-                    value_end = i;
-                }
                 if (depth_val == 0 and !root_started) {
                     root_started = true;
                     root_is_string = true;
@@ -505,22 +509,10 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 in_string = true;
             },
             '{', '[' => {
-                // Opening bracket at depth 0 after a pending scalar terminates it
-                if (depth_val == 0 and pending_scalar and !root_completed) {
-                    root_completed = true;
-                    value_end = i;
-                }
-                if (depth_val == 0 and !root_started) {
-                    root_started = true;
-                }
+                if (depth_val == 0 and !root_started) root_started = true;
                 depth_val += 1;
             },
             '}', ']' => {
-                // Closing bracket at depth 0 after a pending scalar terminates it
-                if (depth_val == 0 and pending_scalar and !root_completed) {
-                    root_completed = true;
-                    value_end = i;
-                }
                 depth_val -= 1;
                 if (depth_val < 0) return 3; // invalid: unmatched closing bracket
                 if (depth_val == 0 and !root_completed) {
@@ -532,20 +524,6 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
                 if (depth_val == 0 and !root_started) {
                     root_started = true;
                     pending_scalar = true;
-                }
-            },
-            ' ', '\t', '\n', '\r' => {
-                if (depth_val == 0 and pending_scalar and !root_completed) {
-                    root_completed = true;
-                    value_end = i;
-                }
-            },
-            ',' => {
-                // Comma (or any structural char) at depth 0 after a pending scalar
-                // terminates the scalar. E.g. "false,true" → "false" ends at comma.
-                if (depth_val == 0 and pending_scalar and !root_completed) {
-                    root_completed = true;
-                    value_end = i;
                 }
             },
             else => {},
@@ -636,7 +614,6 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
     var after_colon: bool = false; // true when we just saw ':' and no value yet
     var after_comma_in_obj: bool = false; // true when last significant token was ',' inside object
     var after_comma_in_arr: bool = false; // true when last significant token was ',' inside array
-    var in_key_position: bool = false; // true when next string should be an object key
 
     var i: u32 = 0;
     while (i < len) {
@@ -653,11 +630,7 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                 escape_next = true;
             } else if (c == '"') {
                 in_string = false;
-                // After a string in object key position, we expect ':'
-                // After a string as value, we're done with after_colon
-                if (after_colon) {
-                    after_colon = false;
-                }
+                after_colon = false;
                 after_comma_in_obj = false;
                 after_comma_in_arr = false;
             }
@@ -665,7 +638,18 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
             continue;
         }
 
+        // Most tokens clear the "pending value" flags
         switch (c) {
+            ' ', '\t', '\n', '\r' => {}, // whitespace preserves state
+            ':' => {
+                after_colon = true;
+                after_comma_in_obj = false;
+            },
+            ',' => {
+                after_colon = false;
+                after_comma_in_obj = stack_depth > 0 and container_stack[stack_depth - 1] == '{';
+                after_comma_in_arr = !after_comma_in_obj;
+            },
             '"' => {
                 in_string = true;
                 after_colon = false;
@@ -680,7 +664,6 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                 after_colon = false;
                 after_comma_in_obj = false;
                 after_comma_in_arr = false;
-                in_key_position = true; // first thing in object is a key
             },
             '[' => {
                 if (stack_depth < container_stack.len) {
@@ -690,48 +673,18 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                 after_colon = false;
                 after_comma_in_obj = false;
                 after_comma_in_arr = false;
-                in_key_position = false;
             },
-            '}' => {
+            '}', ']' => {
                 if (stack_depth > 0) stack_depth -= 1;
                 after_colon = false;
                 after_comma_in_obj = false;
                 after_comma_in_arr = false;
-                in_key_position = false;
-            },
-            ']' => {
-                if (stack_depth > 0) stack_depth -= 1;
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
-                in_key_position = false;
-            },
-            ':' => {
-                after_colon = true;
-                after_comma_in_obj = false;
-                in_key_position = false;
-            },
-            ',' => {
-                after_colon = false;
-                if (stack_depth > 0 and container_stack[stack_depth - 1] == '{') {
-                    after_comma_in_obj = true;
-                    after_comma_in_arr = false;
-                    in_key_position = true; // after comma in object, next is key
-                } else {
-                    after_comma_in_arr = true;
-                    after_comma_in_obj = false;
-                    in_key_position = false;
-                }
-            },
-            ' ', '\t', '\n', '\r' => {
-                // whitespace doesn't change state
             },
             else => {
                 // value character (number, true, false, null)
-                if (after_colon) after_colon = false;
+                after_colon = false;
                 after_comma_in_obj = false;
                 after_comma_in_arr = false;
-                in_key_position = false;
             },
         }
         i += 1;

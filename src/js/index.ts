@@ -240,21 +240,24 @@ export async function init(options?: {
     return ptr;
   }
 
-  // --- Helper: copy a JS string into engine memory ---
-  function writeStringToMemory(str: string): { ptr: number; len: number; allocLen: number } {
-    if (str.length === 0) {
-      return { ptr: 1, len: 0, allocLen: 0 };
-    }
-    // Worst case: 3 bytes per UTF-16 code unit
+  // --- Reusable key buffer — avoids alloc/dealloc per property access ---
+  let keyBufPtr = 0;
+  let keyBufCap = 0;
+
+  function writeKeyToMemory(str: string): { ptr: number; len: number } {
+    if (str.length === 0) return { ptr: 1, len: 0 };
     const maxBytes = str.length * 3;
-    const ptr = engine.alloc(maxBytes);
-    if (ptr === 0) {
-      throw new Error("VectorJSON: Failed to allocate memory for string");
+    if (maxBytes > keyBufCap) {
+      if (keyBufPtr !== 0) engine.dealloc(keyBufPtr, keyBufCap);
+      let cap = keyBufCap === 0 ? 256 : keyBufCap;
+      while (cap < maxBytes) cap *= 2;
+      keyBufPtr = engine.alloc(cap);
+      if (keyBufPtr === 0) throw new Error("VectorJSON: Failed to allocate key buffer");
+      keyBufCap = cap;
     }
-    const target = new Uint8Array(engine.memory.buffer, ptr, maxBytes);
+    const target = new Uint8Array(engine.memory.buffer, keyBufPtr, maxBytes);
     const result = encoder.encodeInto(str, target);
-    const len = result.written!;
-    return { ptr, len, allocLen: maxBytes };
+    return { ptr: keyBufPtr, len: result.written! };
   }
 
   // --- Tag constants ---
@@ -474,33 +477,21 @@ export async function init(options?: {
       if (prop === LAZY_PROXY) return { docId: target._d, index: target._i };
       if (prop === Symbol.toPrimitive) return undefined;
       if (prop === Symbol.toStringTag) return "Object";
-      if (typeof prop === 'string') {
-        // Value cache
-        if (!target._c) target._c = Object.create(null);
-        if (prop in target._c) return target._c[prop];
-        const { ptr, len, allocLen } = writeStringToMemory(prop);
-        try {
-          const valIdx = engine.doc_find_field(target._d, target._i, ptr, len);
-          if (valIdx === 0) return undefined;
-          const val = resolveValue(target._d, valIdx, target._k, target._g, target._f, true);
-          target._c[prop] = val;
-          return val;
-        } finally {
-          if (allocLen > 0) engine.dealloc(ptr, allocLen);
-        }
-      }
-      return undefined;
+      if (typeof prop !== 'string') return undefined;
+      if (!target._c) target._c = Object.create(null);
+      if (prop in target._c) return target._c[prop];
+      const { ptr, len } = writeKeyToMemory(prop);
+      const valIdx = engine.doc_find_field(target._d, target._i, ptr, len);
+      if (valIdx === 0) return undefined;
+      const val = resolveValue(target._d, valIdx, target._k, target._g, target._f, true);
+      target._c[prop] = val;
+      return val;
     },
     has(target, prop) {
-      if (prop === LAZY_PROXY) return true;
-      if (prop === 'free' || prop === Symbol.dispose) return true;
+      if (prop === LAZY_PROXY || prop === 'free' || prop === Symbol.dispose) return true;
       if (typeof prop !== 'string') return false;
-      const { ptr, len, allocLen } = writeStringToMemory(prop);
-      try {
-        return engine.doc_find_field(target._d, target._i, ptr, len) !== 0;
-      } finally {
-        if (allocLen > 0) engine.dealloc(ptr, allocLen);
-      }
+      const { ptr, len } = writeKeyToMemory(prop);
+      return engine.doc_find_field(target._d, target._i, ptr, len) !== 0;
     },
     ownKeys(target) {
       if (!target._keys) {
@@ -517,18 +508,14 @@ export async function init(options?: {
     },
     getOwnPropertyDescriptor(target, prop) {
       if (typeof prop !== 'string') return undefined;
-      const { ptr, len, allocLen } = writeStringToMemory(prop);
-      try {
-        const valIdx = engine.doc_find_field(target._d, target._i, ptr, len);
-        if (valIdx === 0) return undefined;
-        if (!target._c) target._c = Object.create(null);
-        if (!(prop in target._c)) {
-          target._c[prop] = resolveValue(target._d, valIdx, target._k, target._g, target._f, true);
-        }
-        return { value: target._c[prop], writable: false, enumerable: true, configurable: true };
-      } finally {
-        if (allocLen > 0) engine.dealloc(ptr, allocLen);
+      // Trigger get() to populate cache, then return descriptor from cache
+      const val = this.get!(target, prop, target);
+      if (val === undefined) {
+        // Check if field actually exists (val could be legitimately undefined)
+        const { ptr, len } = writeKeyToMemory(prop);
+        if (engine.doc_find_field(target._d, target._i, ptr, len) === 0) return undefined;
       }
+      return { value: val, writable: false, enumerable: true, configurable: true };
     },
   };
 
@@ -678,6 +665,15 @@ export async function init(options?: {
         return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
       };
 
+      // Helper: build an invalid ParseResult from the last engine error code
+      const invalidResult = (msg?: string): ParseResult => {
+        if (!msg) {
+          const code = engine.get_error_code();
+          msg = `VectorJSON: ${ERROR_MESSAGES[code] || `Parse error (code ${code})`}`;
+        }
+        return makeResult("invalid", undefined, Infinity, undefined, undefined, msg);
+      };
+
       // ── Happy path: try doc_parse directly (no classify overhead) ──
       let docId = tryDocParse(ptr, len);
       if (docId >= 0) {
@@ -689,7 +685,7 @@ export async function init(options?: {
       const classification = engine.classify_input(ptr, len);
 
       if (classification === CLASSIFY_INVALID) {
-        return makeResult("invalid", undefined, Infinity, undefined, undefined, "Invalid JSON structure");
+        return invalidResult("Invalid JSON structure");
       }
 
       if (classification === CLASSIFY_COMPLETE_EARLY) {
@@ -705,17 +701,14 @@ export async function init(options?: {
         if (docId >= 0) {
           return makeResult("complete_early", buildDocRoot(docId), Infinity, toJSONStr, remainingCopy);
         }
-        // doc_parse still failed on the truncated input
-        const errorCode = engine.get_error_code();
-        const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-        return makeResult("invalid", undefined, Infinity, undefined, undefined, `VectorJSON: ${msg}`);
+        return invalidResult();
       }
 
       if (classification === CLASSIFY_INCOMPLETE) {
         const parseLen = engine.autocomplete_input(ptr, len, inputBufLen);
         if (parseLen === 0) {
           if (len === 0) return makeResult("incomplete", undefined, len, undefined);
-          return makeResult("invalid", undefined, Infinity, undefined, undefined, "Invalid JSON structure");
+          return invalidResult("Invalid JSON structure");
         }
         // Capture autocompleted bytes for toJSON before they're overwritten
         const toJSONStr = utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, parseLen));
@@ -724,16 +717,10 @@ export async function init(options?: {
           // proxyObjects=true: objects stay as Proxy so isComplete() can access tape index
           return makeResult("incomplete", buildDocRoot(docId, true), len, toJSONStr);
         }
-        // doc_parse failed on autocompleted input
-        const errorCode = engine.get_error_code();
-        const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-        return makeResult("invalid", undefined, Infinity, undefined, undefined, `VectorJSON: ${msg}`);
+        return invalidResult();
       }
 
-      // classify returned "complete" but doc_parse failed → grammatically invalid
-      const errorCode = engine.get_error_code();
-      const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-      return makeResult("invalid", undefined, Infinity, undefined, undefined, `VectorJSON: ${msg}`);
+      return invalidResult();
     },
 
     materialize(value: unknown): unknown {
