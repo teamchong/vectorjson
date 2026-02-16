@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
 
-O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Feed chunks as they arrive from the model, read partial values without re-parsing.
+O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents start acting on partial data immediately, detect wrong outputs early to abort and save tokens, and never block the main thread.
 
 ## The Problem
 
@@ -79,6 +79,25 @@ for await (const chunk of llmStream) {
   parser.feed(chunk);  // O(n) — only new bytes scanned
 }
 parser.destroy();
+```
+
+**Early abort** — detect wrong output at chunk 7, cancel the remaining 8,000+ chunks:
+
+```js
+const abort = new AbortController();
+const parser = vj.createEventParser();
+
+parser.on('name', (e) => {
+  if (e.value !== 'str_replace_editor') {
+    parser.destroy();
+    abort.abort();  // stop the LLM stream, stop paying for tokens
+  }
+});
+
+for await (const chunk of llmStream({ signal: abort.signal })) {
+  const status = parser.feed(chunk);
+  if (status === 'error') break;  // malformed JSON — bail out
+}
 ```
 
 ## Benchmarks
