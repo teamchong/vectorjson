@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
 
-O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and never block the main thread — Worker + transferable ArrayBuffer = O(1) transfer.
+O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and offload parsing to Workers with transferable ArrayBuffers.
 
 ## The Problem
 
@@ -100,9 +100,9 @@ for await (const chunk of llmStream({ signal: abort.signal })) {
 }
 ```
 
-**Worker transfer** — never block the main thread, even for large payloads:
+**Worker offload** — parse 2-3× faster in a Worker, transfer results in O(1):
 
-Moving `JSON.parse` to a Worker doesn't eliminate O(n) cost — `postMessage(obj)` uses the structured clone algorithm, which walks every property. VectorJSON's `getRawBuffer()` returns flat bytes that transfer in O(1):
+VectorJSON's `getRawBuffer()` returns flat bytes — `postMessage(buf, [buf])` transfers the backing store pointer in O(1) instead of structured-cloning a full object graph. The main thread lazily accesses only the fields it needs:
 
 ```js
 // In Worker:
@@ -115,7 +115,7 @@ const result = vj.parse(new Uint8Array(buf)); // lazy Proxy
 result.value.name; // only materializes what you touch
 ```
 
-Even non-streaming `vj.parse()` benefits from this pattern — parse in a Worker, transfer raw bytes, access lazily on the main thread.
+Worker-side parsing is 2-3× faster than `JSON.parse` at 50 KB+. The transferable ArrayBuffer avoids structured clone overhead, and the lazy Proxy on the main thread means you only pay for the fields you access.
 
 ## Benchmarks
 
@@ -157,11 +157,11 @@ Both approaches detect the tool name (`.name`) at the same chunk — the LLM has
 
 For even more control, use `createEventParser()` for field-level subscriptions or only call `getValue()` once when `feed()` returns `"complete"`.
 
-### Worker Transfer: O(1) vs O(n) structured clone
+### Worker Transfer: parse faster, transfer in O(1)
 
 `bun run bench:worker` (requires Playwright + Chromium)
 
-Measures Worker→Main thread transfer pipeline in a real browser. VectorJSON's `getRawBuffer()` produces a transferable ArrayBuffer — `postMessage(buf, [buf])` moves the backing store pointer in O(1), while `JSON.parse` results require O(n) structured clone.
+Measures the full Worker→Main thread pipeline in a real browser. VectorJSON parses 2-3× faster in the Worker at 50 KB+, and `getRawBuffer()` produces a transferable ArrayBuffer — `postMessage(buf, [buf])` moves the backing store pointer in O(1) instead of structured-cloning the parsed object.
 
 <details>
 <summary>Which products use which parser</summary>
