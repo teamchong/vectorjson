@@ -286,8 +286,8 @@ export async function init(options?: {
     // WASM returns u32 but JS sees i32 — guard against corrupted lengths
     // (can happen when SIMD parsing reads past truncated unicode escapes)
     if (len <= 0 || len > 0x7FFFFFFF) return "";
-    const batchPtr = batchAddr;
-    const ptr = new Uint32Array(engine.memory.buffer, batchPtr, 2)[0];
+
+    const ptr = new Uint32Array(engine.memory.buffer, batchAddr, 2)[0];
     return utf8Decoder.decode(new Uint8Array(engine.memory.buffer, ptr, len));
   }
 
@@ -307,9 +307,8 @@ export async function init(options?: {
         return docReadString(docId, index);
       case TAG_ARRAY: {
         const count = engine.doc_array_elements(docId, index);
-        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
         const arr: unknown[] = [];
         for (let i = 0; i < count; i++) {
           arr.push(deepMaterializeDoc(docId, idxCopy[i]));
@@ -318,9 +317,8 @@ export async function init(options?: {
       }
       case TAG_OBJECT: {
         const count = engine.doc_object_keys(docId, index);
-        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
         const obj: Record<string, unknown> = {};
         for (let i = 0; i < count; i++) {
           obj[docReadString(docId, idxCopy[i])] = deepMaterializeDoc(docId, idxCopy[i] + 1);
@@ -336,9 +334,8 @@ export async function init(options?: {
   function batchElemIndices(target: any): Uint32Array {
     if (target._e) return target._e;
     const count = engine.doc_array_elements(target._d, target._i);
-    const batchPtr = batchAddr;
     const indices = new Uint32Array(count);
-    indices.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
+    indices.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
     target._e = indices;
     return indices;
   }
@@ -478,9 +475,8 @@ export async function init(options?: {
       if (!target._keys) {
         target._keys = [];
         const count = engine.doc_object_keys(target._d, target._i);
-        const batchPtr = batchAddr;
         const idxCopy = new Uint32Array(count);
-        idxCopy.set(new Uint32Array(engine.memory.buffer, batchPtr, count));
+        idxCopy.set(new Uint32Array(engine.memory.buffer, batchAddr, count));
         for (let i = 0; i < count; i++) {
           target._keys.push(docReadString(target._d, idxCopy[i]));
         }

@@ -608,62 +608,41 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                 escape_next = true;
             } else if (c == '"') {
                 in_string = false;
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
+                // Flags already false — cleared when '"' opened the string
             }
             i += 1;
             continue;
         }
 
-        // Most tokens clear the "pending value" flags
+        // Non-whitespace tokens always clear pending-value flags
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+            after_colon = false;
+            after_comma_in_obj = false;
+            after_comma_in_arr = false;
+        }
         switch (c) {
-            ' ', '\t', '\n', '\r' => {}, // whitespace preserves state
-            ':' => {
-                after_colon = true;
-                after_comma_in_obj = false;
-            },
+            ':' => after_colon = true,
             ',' => {
-                after_colon = false;
                 after_comma_in_obj = stack_depth > 0 and container_stack[stack_depth - 1] == '{';
                 after_comma_in_arr = !after_comma_in_obj;
             },
-            '"' => {
-                in_string = true;
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
-            },
+            '"' => in_string = true,
             '{' => {
                 if (stack_depth < container_stack.len) {
                     container_stack[stack_depth] = '{';
                     stack_depth += 1;
                 }
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
             },
             '[' => {
                 if (stack_depth < container_stack.len) {
                     container_stack[stack_depth] = '[';
                     stack_depth += 1;
                 }
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
             },
             '}', ']' => {
                 if (stack_depth > 0) stack_depth -= 1;
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
             },
-            else => {
-                // value character (number, true, false, null)
-                after_colon = false;
-                after_comma_in_obj = false;
-                after_comma_in_arr = false;
-            },
+            else => {},
         }
         i += 1;
     }
