@@ -372,7 +372,6 @@ export async function init(options?: {
           };
         };
       }
-      if (prop === Symbol.toPrimitive) return undefined;
       if (prop === Symbol.toStringTag) return "Array";
       if (typeof prop === 'string') {
         const idx = Number(prop);
@@ -392,14 +391,10 @@ export async function init(options?: {
       return undefined;
     },
     has(target, prop) {
-      if (prop === LAZY_PROXY) return true;
-      if (prop === 'free' || prop === Symbol.dispose) return true;
-      if (prop === 'length') return true;
-      if (typeof prop === 'string') {
-        const idx = Number(prop);
-        if (Number.isInteger(idx) && idx >= 0 && idx < target._l) return true;
-      }
-      return false;
+      if (prop === LAZY_PROXY || prop === 'free' || prop === Symbol.dispose || prop === 'length') return true;
+      if (typeof prop !== 'string') return false;
+      const idx = Number(prop);
+      return Number.isInteger(idx) && idx >= 0 && idx < target._l;
     },
     ownKeys(target) {
       const keys: string[] = [];
@@ -426,9 +421,7 @@ export async function init(options?: {
     get(target, prop, _receiver) {
       if (prop === 'free' || prop === Symbol.dispose) return target._f;
       if (prop === LAZY_PROXY) return { docId: target._d, index: target._i };
-      if (prop === Symbol.toPrimitive) return undefined;
-      if (prop === Symbol.toStringTag) return "Object";
-      if (typeof prop !== 'string') return undefined;
+      if (typeof prop !== 'string') return prop === Symbol.toStringTag ? "Object" : undefined;
       if (!target._c) target._c = Object.create(null);
       if (prop in target._c) return target._c[prop];
       const { ptr, len } = writeKeyToMemory(prop);
