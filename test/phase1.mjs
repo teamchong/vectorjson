@@ -135,6 +135,13 @@ await test("trailing garbage returns complete_early", () => {
   assertEqual(result.value, 42);
 });
 
+// --- Binary input ---
+await test("Uint8Array input", () => {
+  const bytes = new TextEncoder().encode('{"binary": true}');
+  const result = vj.parse(bytes).value;
+  assertEqual(result, { binary: true });
+});
+
 // --- Large-ish JSON ---
 await test("100-element array", () => {
   const arr = Array.from({length: 100}, (_, i) => i);

@@ -275,8 +275,9 @@ export async function init(options?: {
   const CLASSIFY_COMPLETE_EARLY = 2;
   const CLASSIFY_INVALID = 3;
 
-  // --- Sentinel to mark lazy proxy objects ---
+  // --- Sentinels ---
   const LAZY_PROXY = Symbol("vectorjson.lazy");
+  const UNCACHED = Symbol();
 
   // --- Explicit document disposal ---
   // Track generation per docId to prevent stale FinalizationRegistry callbacks
@@ -567,8 +568,7 @@ export async function init(options?: {
         remaining?: Uint8Array,
         error?: string,
       ): ParseResult => {
-        let _toJSONCached = false;
-        let _toJSONCache: unknown;
+        let _toJSONCache: unknown = UNCACHED;
         return {
           status,
           value,
@@ -592,10 +592,8 @@ export async function init(options?: {
             }
           },
           toJSON(): unknown {
-            if (_toJSONCached) return _toJSONCache;
-            _toJSONCache = toJSONStr !== undefined ? JSON.parse(toJSONStr) : value;
-            _toJSONCached = true;
-            return _toJSONCache;
+            if (_toJSONCache !== UNCACHED) return _toJSONCache;
+            return (_toJSONCache = toJSONStr !== undefined ? JSON.parse(toJSONStr) : value);
           },
         };
       };

@@ -13,7 +13,7 @@
     "build:opt": "npx wasm-opt -O3 dist/engine.wasm -o dist/engine.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals",
     "build:js": "bun x tsc",
     "build": "bun run build:zig && bun run build:opt && bun run build:js",
-    "test": "bun test/basic.mjs && bun test/parse-result.mjs && bun test/is-complete.mjs && bun test/partial-json.mjs",
+    "test": "bun test/phase1.mjs && bun test/phase2.mjs && bun test/parse-result.mjs && bun test/is-complete.mjs && bun test/partial-json.mjs",
     "bench": "bun --expose-gc bench/parse-stream.mjs",
     "bench:parse": "bun --expose-gc bench/parse-stream.mjs",
     "bench:e2e": "bun --expose-gc bench/end-to-end.mjs",
