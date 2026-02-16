@@ -36,10 +36,15 @@ parser.destroy();
 ```
 
 ```js
-// One-shot on incomplete JSON (e.g. AI SDK accumulated buffer)
-const result = vj.parse(incompleteJson);
-for (const task of result.value.tasks) {         // lazy — no full materialization
-  if (result.isComplete(task)) execute(task);    // skip autocompleted elements
+// Act on elements as they become complete
+let next = 0;
+for await (const chunk of stream) {
+  buffer += chunk;
+  const result = vj.parse(buffer);
+  const tasks = result.value.tasks;
+  while (next < tasks.length && result.isComplete(tasks[next])) {
+    execute(tasks[next++]);                      // act immediately, don't wait for full array
+  }
 }
 ```
 
