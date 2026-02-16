@@ -55,8 +55,11 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Install bench dependencies
+        run: cd bench/ai-parsers && bun install
+
       - name: Benchmark — Parse & Stream
         run: bun --expose-gc bench/parse-stream.mjs
 
       - name: Benchmark — AI SDK Comparison
-        run: cd bench/ai-parsers && bun install && bun --expose-gc bench.mjs
+        run: cd bench/ai-parsers && bun --expose-gc bench.mjs
