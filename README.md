@@ -526,7 +526,7 @@ Each `feed()` processes only new bytes — O(n) total. Three overloads:
 
 ```ts
 createParser();                    // no validation
-createParser(schema);              // schema validation + auto-pick + dirty input handling
+createParser(schema);              // only parse schema fields, validate, skip dirty input
 createParser({ schema, source });  // options object
 ```
 
@@ -534,15 +534,15 @@ createParser({ schema, source });  // options object
 
 ```ts
 interface CreateParserOptions<T = unknown> {
-  schema?: ZodLike<T>;   // validate on complete, auto-pick from shape, skip dirty input
+  schema?: ZodLike<T>;   // only parse schema fields, validate on complete, skip dirty input
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
-  pick?: string[];       // advanced: explicit field paths (overrides schema auto-pick)
+  pick?: string[];       // advanced: explicit field paths (overrides schema)
 }
 ```
 
 When a `schema` is provided:
-- Fields are auto-picked from the schema's `.shape` — only matching fields are parsed
-- Arrays are transparent — `{ users: z.array(z.object({ name })) }` picks `users.name` through arrays
+- Only fields defined in the schema are parsed — everything else is skipped at the byte level
+- Arrays are transparent — `z.array(z.object({ name }))` parses `name` inside each array element
 - Dirty input (think tags, code fences, leading prose) is stripped before parsing
 - On complete, `safeParse()` validates the final value
 
@@ -693,7 +693,7 @@ interface RootEvent {
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
 | **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
 | **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
-| **Schema → only parse matching fields** | Yes — reads `.shape` from Zod/Valibot, skips everything else | No — use `skip()` and `on()` to filter manually |
+| **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | No — use `skip()` and `on()` to filter manually |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
 | **`for await` with source** | Yes | Yes |
 | **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |
