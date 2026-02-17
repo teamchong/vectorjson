@@ -25,7 +25,7 @@
 import { streamObject as stockStreamObject } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import { z } from "zod";
-import { init as vjInit } from "../../dist/index.js";
+import { createParser } from "../../dist/index.js";
 
 // Parser imports
 import { parsePartialJson as vercelParse } from "ai";
@@ -202,11 +202,11 @@ async function benchStockLoop(parseFn, fullJson, chunkSize, { warmup = 1, runs =
  * No string concatenation. feed() appends bytes in WASM. getValue() parses
  * the accumulated buffer with SIMD — same work as stock, just faster.
  */
-function benchVjLoop(vj, fullJson, chunkSize, { warmup = 2, runs = 3 } = {}) {
+function benchVjLoop(fullJson, chunkSize, { warmup = 2, runs = 3 } = {}) {
   const chunks = buildChunks(fullJson, chunkSize);
 
   const runOnce = () => {
-    const parser = vj.createParser();
+    const parser = createParser();
     for (const c of chunks) {
       const s = parser.feed(c);
       parser.getValue();  // materialized partial object on every chunk
@@ -326,7 +326,6 @@ function runTanstackPipeline(jsonStr, chunkSize) {
 // ═══════════════════════════════════════════════════════════
 
 async function main() {
-  const vj = await vjInit();
   const CHUNK_SIZE = 12;
 
   // Detect patches
@@ -424,7 +423,7 @@ async function main() {
     console.log(`  ${"─".repeat(80)}`);
 
     // Compute VJ time once (same for all products at this payload size)
-    const vjTime = benchVjLoop(vj, jsonStr, CHUNK_SIZE);
+    const vjTime = benchVjLoop(jsonStr, CHUNK_SIZE);
 
     for (const p of products) {
       const result = await benchStockLoop(p.fn, jsonStr, CHUNK_SIZE, { isAsync: p.isAsync });

@@ -14,7 +14,7 @@
     },
     "./engine.wasm": "./dist/engine.wasm"
   },
-  "sideEffects": false,
+  "sideEffects": ["./dist/index.js"],
   "files": [
     "dist/",
     "LICENSE"
@@ -26,9 +26,10 @@
     "build:zig": "zig build -Doptimize=ReleaseSmall",
     "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/engine.wasm -o dist/engine.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals",
     "build:types": "bun x tsc --emitDeclarationOnly",
+    "build:embed": "node scripts/embed-wasm.mjs",
     "build:js": "bun build src/js/index.ts --outdir dist --target node --format esm --minify --sourcemap=external && bun run build:types",
-    "build": "bun run build:zig && bun run build:opt && bun run build:js",
-    "test": "bun test/phase1.mjs && bun test/phase2.mjs && bun test/parse-result.mjs && bun test/is-complete.mjs && bun test/partial-json.mjs && bun test/zerocopy.mjs && bun test/standards.mjs && bun test/event-parser.mjs && bun test/live-doc.mjs && bun test/large-json.mjs && bun test/deep-compare.mjs",
+    "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
+    "test": "bun test/phase1.mjs && bun test/phase2.mjs && bun test/parse-result.mjs && bun test/is-complete.mjs && bun test/partial-json.mjs && bun test/zerocopy.mjs && bun test/standards.mjs && bun test/event-parser.mjs && bun test/live-doc.mjs && bun test/large-json.mjs && bun test/deep-compare.mjs && bun test/sync-api.mjs",
     "bench": "bun --expose-gc bench/parse-stream.mjs",
     "bench:parse": "bun --expose-gc bench/parse-stream.mjs",
     "bench:e2e": "bun --expose-gc bench/end-to-end.mjs",

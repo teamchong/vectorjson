@@ -2,7 +2,7 @@
  * Phase 2: Streaming parser tests.
  * Tests incremental feeding of JSON chunks, status detection, and NDJSON.
  */
-import { init } from "../dist/index.js";
+import { createParser } from "../dist/index.js";
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -17,11 +17,10 @@ function assertEqual(actual, expected, msg) {
 }
 
 console.log("\n🧪 VectorJSON Phase 2 — Streaming Parser Tests\n");
-const vj = await init();
 
 // --- Basic streaming ---
 await test("stream: feed complete JSON in one chunk", () => {
-  const p = vj.createParser();
+  const p = createParser();
   const status = p.feed('{"hello":"world"}');
   assertEqual(status, "complete");
   assertEqual(p.getValue(), { hello: "world" });
@@ -29,7 +28,7 @@ await test("stream: feed complete JSON in one chunk", () => {
 });
 
 await test("stream: feed JSON in multiple chunks", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed('{"hel'), "incomplete");
   assertEqual(p.feed('lo":"w'), "incomplete");
   assertEqual(p.feed('orld"}'), "complete");
@@ -38,7 +37,7 @@ await test("stream: feed JSON in multiple chunks", () => {
 });
 
 await test("stream: feed array in chunks", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed("[1,"), "incomplete");
   assertEqual(p.feed("2,"), "incomplete");
   assertEqual(p.feed("3]"), "complete");
@@ -48,7 +47,7 @@ await test("stream: feed array in chunks", () => {
 
 await test("stream: deeply nested in tiny chunks", () => {
   const json = '{"a":{"b":{"c":[1,2,3]}}}';
-  const p = vj.createParser();
+  const p = createParser();
   for (let i = 0; i < json.length - 1; i++) {
     const status = p.feed(json[i]);
     if (status !== "incomplete") throw new Error(`Unexpected status at char ${i}: ${status}`);
@@ -59,14 +58,14 @@ await test("stream: deeply nested in tiny chunks", () => {
 });
 
 await test("stream: scalar value", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed("42"), "complete");
   assertEqual(p.getValue(), 42);
   p.destroy();
 });
 
 await test("stream: string value", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed('"he'), "incomplete");
   assertEqual(p.feed('llo"'), "complete");
   assertEqual(p.getValue(), "hello");
@@ -74,19 +73,19 @@ await test("stream: string value", () => {
 });
 
 await test("stream: boolean values", () => {
-  const p1 = vj.createParser();
+  const p1 = createParser();
   assertEqual(p1.feed("true"), "complete");
   assertEqual(p1.getValue(), true);
   p1.destroy();
 
-  const p2 = vj.createParser();
+  const p2 = createParser();
   assertEqual(p2.feed("false"), "complete");
   assertEqual(p2.getValue(), false);
   p2.destroy();
 });
 
 await test("stream: null value", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed("null"), "complete");
   assertEqual(p.getValue(), null);
   p.destroy();
@@ -94,7 +93,7 @@ await test("stream: null value", () => {
 
 // --- NDJSON / end_early ---
 await test("stream: end_early with trailing data", () => {
-  const p = vj.createParser();
+  const p = createParser();
   const status = p.feed('{"a":1}\n{"b":2}');
   assertEqual(status, "end_early");
   assertEqual(p.getValue(), { a: 1 });
@@ -106,7 +105,7 @@ await test("stream: end_early with trailing data", () => {
 });
 
 await test("stream: end_early with two JSON objects", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.feed('[1,2][3,4]'), "end_early");
   assertEqual(p.getValue(), [1, 2]);
   const remaining = p.getRemaining();
@@ -116,7 +115,7 @@ await test("stream: end_early with two JSON objects", () => {
 
 // --- Status checks ---
 await test("stream: getStatus reflects current state", () => {
-  const p = vj.createParser();
+  const p = createParser();
   assertEqual(p.getStatus(), "incomplete");
   p.feed('{"x": ');
   assertEqual(p.getStatus(), "incomplete");
@@ -126,7 +125,7 @@ await test("stream: getStatus reflects current state", () => {
 });
 
 await test("stream: getValue caches result", () => {
-  const p = vj.createParser();
+  const p = createParser();
   p.feed('{"a":1}');
   const v1 = p.getValue();
   const v2 = p.getValue();
@@ -135,7 +134,7 @@ await test("stream: getValue caches result", () => {
 });
 
 await test("stream: getValue on incomplete returns autocompleted partial value", () => {
-  const p = vj.createParser();
+  const p = createParser();
   p.feed('{"name":"Ali');
   const val = p.getValue();
   // Autocompleted partial: {"name":"Ali"} — string gets closed, object gets closed
@@ -145,7 +144,7 @@ await test("stream: getValue on incomplete returns autocompleted partial value",
 });
 
 await test("stream: getValue on empty incomplete returns undefined", () => {
-  const p = vj.createParser();
+  const p = createParser();
   p.feed("");
   const val = p.getValue();
   if (val !== undefined) throw new Error("Expected undefined for empty feed");
@@ -154,8 +153,8 @@ await test("stream: getValue on empty incomplete returns undefined", () => {
 
 // --- Multiple concurrent streams ---
 await test("stream: multiple concurrent parsers", () => {
-  const p1 = vj.createParser();
-  const p2 = vj.createParser();
+  const p1 = createParser();
+  const p2 = createParser();
   p1.feed('{"a":');
   p2.feed("[");
   p1.feed("1}");
@@ -168,7 +167,7 @@ await test("stream: multiple concurrent parsers", () => {
 
 // --- Byte input ---
 await test("stream: feed Uint8Array chunks", () => {
-  const p = vj.createParser();
+  const p = createParser();
   const encoder = new TextEncoder();
   p.feed(encoder.encode('{"key":'));
   p.feed(encoder.encode('"value"}'));
@@ -180,7 +179,7 @@ await test("stream: feed Uint8Array chunks", () => {
 await test("stream: 1KB chunks of large JSON", () => {
   const arr = Array.from({ length: 200 }, (_, i) => ({ id: i, name: `item_${i}` }));
   const json = JSON.stringify(arr);
-  const p = vj.createParser();
+  const p = createParser();
   const chunkSize = 1024;
   for (let i = 0; i < json.length; i += chunkSize) {
     const chunk = json.slice(i, i + chunkSize);
@@ -196,7 +195,7 @@ await test("stream: 1KB chunks of large JSON", () => {
 
 // --- String with escapes in stream ---
 await test("stream: string with escapes split across chunks", () => {
-  const p = vj.createParser();
+  const p = createParser();
   p.feed('{"msg": "hello\\');
   assertEqual(p.getStatus(), "incomplete");
   p.feed('nworld"}');
@@ -236,7 +235,7 @@ const rejectSchema = {
 };
 
 await test("schema: createParser(schema).getValue() returns validated value", () => {
-  const p = vj.createParser(userSchema);
+  const p = createParser(userSchema);
   p.feed('{"name":"Alice","age":30}');
   const val = p.getValue();
   assertEqual(val, { name: "Alice", age: 30 });
@@ -244,7 +243,7 @@ await test("schema: createParser(schema).getValue() returns validated value", ()
 });
 
 await test("schema: createParser(schema).getValue() returns undefined when validation fails", () => {
-  const p = vj.createParser(userSchema);
+  const p = createParser(userSchema);
   p.feed('{"name":"Alice"}'); // missing age
   const val = p.getValue();
   assertEqual(val, undefined);
@@ -252,7 +251,7 @@ await test("schema: createParser(schema).getValue() returns undefined when valid
 });
 
 await test("schema: createParser(schema) with transformation", () => {
-  const p = vj.createParser(transformSchema);
+  const p = createParser(transformSchema);
   p.feed('{"name":"alice"}');
   const val = p.getValue();
   assertEqual(val, { name: "ALICE" });
@@ -260,7 +259,7 @@ await test("schema: createParser(schema) with transformation", () => {
 });
 
 await test("schema: createParser(schema) rejects all → undefined", () => {
-  const p = vj.createParser(rejectSchema);
+  const p = createParser(rejectSchema);
   p.feed('{"a":1}');
   const val = p.getValue();
   assertEqual(val, undefined);
@@ -268,7 +267,7 @@ await test("schema: createParser(schema) rejects all → undefined", () => {
 });
 
 await test("schema: createParser(schema) on incomplete returns partial value without schema gating", () => {
-  const p = vj.createParser(userSchema);
+  const p = createParser(userSchema);
   p.feed('{"name":"Ali');
   // Incomplete → returns partial value as-is (user checks getStatus() for completeness)
   const val = p.getValue();
@@ -278,7 +277,7 @@ await test("schema: createParser(schema) on incomplete returns partial value wit
 });
 
 await test("schema: createParser() without schema → backward compatible", () => {
-  const p = vj.createParser();
+  const p = createParser();
   p.feed('{"a":1}');
   const val = p.getValue();
   assertEqual(val, { a: 1 });
@@ -286,7 +285,7 @@ await test("schema: createParser() without schema → backward compatible", () =
 });
 
 await test("schema: createParser(schema) caches validated result", () => {
-  const p = vj.createParser(userSchema);
+  const p = createParser(userSchema);
   p.feed('{"name":"Bob","age":25}');
   const v1 = p.getValue();
   const v2 = p.getValue();
@@ -295,7 +294,7 @@ await test("schema: createParser(schema) caches validated result", () => {
 });
 
 await test("schema: createParser(schema) feeds in chunks then validates", () => {
-  const p = vj.createParser(userSchema);
+  const p = createParser(userSchema);
   p.feed('{"name":');
   p.feed('"Charlie",');
   p.feed('"age":40}');

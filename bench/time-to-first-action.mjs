@@ -10,10 +10,8 @@
  * Usage:
  *   bun --expose-gc bench/time-to-first-action.mjs
  */
-import { init } from "../dist/index.js";
+import { createParser, createEventParser } from "../dist/index.js";
 import { parse as partialParse } from "./ai-parsers/node_modules/partial-json/dist/index.js";
-
-const vj = await init();
 
 function formatTime(ms) {
   if (ms < 0.001) return (ms * 1e6).toFixed(0) + " ns";
@@ -157,7 +155,7 @@ for (const sizeKB of sizes) {
 
   // --- VectorJSON createParser ---
   {
-    const parser = vj.createParser();
+    const parser = createParser();
     let firstNameChunk = -1;
     let firstNameTime = 0;
     let totalTime = 0;
@@ -181,7 +179,7 @@ for (const sizeKB of sizes) {
 
   // --- VectorJSON EventParser ---
   {
-    const parser = vj.createEventParser();
+    const parser = createEventParser();
     let firstNameChunk = -1;
     let firstNameTime = 0;
     let firstCommandChunk = -1;

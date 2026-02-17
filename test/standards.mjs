@@ -3,7 +3,7 @@
  * Covers RFC 8259 (JSON), ECMA-404, and common JSON Schema draft-07/2020-12 patterns.
  * Tests edge cases, Unicode, number precision, escaping, and structural correctness.
  */
-import { init } from "../dist/index.js";
+import { parse, createParser } from "../dist/index.js";
 
 let pass = 0;
 let fail = 0;
@@ -33,118 +33,116 @@ function assert(cond, msg) {
 }
 
 async function run() {
-  const vj = await init();
-
   console.log("\n=== Standards Compliance Tests ===\n");
 
   // =============================================
   // RFC 8259 / ECMA-404: JSON Parsing
   // =============================================
   console.log("RFC 8259 — Structural characters:");
-  assertEqual(vj.parse("{}").value, {}, "empty object");
-  assertEqual(vj.parse("[]").value, [], "empty array");
-  assertEqual(vj.parse('{"a":1}').value, { a: 1 }, "object with one pair");
-  assertEqual(vj.parse("[1]").value, [1], "array with one element");
+  assertEqual(parse("{}").value, {}, "empty object");
+  assertEqual(parse("[]").value, [], "empty array");
+  assertEqual(parse('{"a":1}').value, { a: 1 }, "object with one pair");
+  assertEqual(parse("[1]").value, [1], "array with one element");
 
   console.log("\nRFC 8259 — Whitespace:");
-  assertEqual(vj.parse(" { } ").value, {}, "spaces around object");
-  assertEqual(vj.parse("\t[\t]\t").value, [], "tabs around array");
-  assertEqual(vj.parse("\n{\n}\n").value, {}, "newlines around object");
-  assertEqual(vj.parse("\r\n{\r\n}\r\n").value, {}, "CRLF around object");
+  assertEqual(parse(" { } ").value, {}, "spaces around object");
+  assertEqual(parse("\t[\t]\t").value, [], "tabs around array");
+  assertEqual(parse("\n{\n}\n").value, {}, "newlines around object");
+  assertEqual(parse("\r\n{\r\n}\r\n").value, {}, "CRLF around object");
   assertEqual(
-    vj.parse('  {  "a"  :  1  ,  "b"  :  2  }  ').value,
+    parse('  {  "a"  :  1  ,  "b"  :  2  }  ').value,
     { a: 1, b: 2 },
     "whitespace everywhere"
   );
 
   console.log("\nRFC 8259 — Strings:");
-  assertEqual(vj.parse('""').value, "", "empty string");
-  assertEqual(vj.parse('"hello"').value, "hello", "simple string");
-  assertEqual(vj.parse('"\\""').value, '"', "escaped quote");
-  assertEqual(vj.parse('"\\\\"').value, "\\", "escaped backslash");
-  assertEqual(vj.parse('"\\/"').value, "/", "escaped forward slash");
-  assertEqual(vj.parse('"\\b"').value, "\b", "escaped backspace");
-  assertEqual(vj.parse('"\\f"').value, "\f", "escaped form feed");
-  assertEqual(vj.parse('"\\n"').value, "\n", "escaped newline");
-  assertEqual(vj.parse('"\\r"').value, "\r", "escaped carriage return");
-  assertEqual(vj.parse('"\\t"').value, "\t", "escaped tab");
-  assertEqual(vj.parse('"\\u0041"').value, "A", "unicode escape (A)");
-  assertEqual(vj.parse('"\\u00e9"').value, "é", "unicode escape (é)");
-  assertEqual(vj.parse('"\\u4e16\\u754c"').value, "世界", "unicode escape CJK");
+  assertEqual(parse('""').value, "", "empty string");
+  assertEqual(parse('"hello"').value, "hello", "simple string");
+  assertEqual(parse('"\\""').value, '"', "escaped quote");
+  assertEqual(parse('"\\\\"').value, "\\", "escaped backslash");
+  assertEqual(parse('"\\/"').value, "/", "escaped forward slash");
+  assertEqual(parse('"\\b"').value, "\b", "escaped backspace");
+  assertEqual(parse('"\\f"').value, "\f", "escaped form feed");
+  assertEqual(parse('"\\n"').value, "\n", "escaped newline");
+  assertEqual(parse('"\\r"').value, "\r", "escaped carriage return");
+  assertEqual(parse('"\\t"').value, "\t", "escaped tab");
+  assertEqual(parse('"\\u0041"').value, "A", "unicode escape (A)");
+  assertEqual(parse('"\\u00e9"').value, "é", "unicode escape (é)");
+  assertEqual(parse('"\\u4e16\\u754c"').value, "世界", "unicode escape CJK");
 
   // Surrogate pairs
   assertEqual(
-    vj.parse('"\\uD83C\\uDF89"').value,
+    parse('"\\uD83C\\uDF89"').value,
     "🎉",
     "surrogate pair emoji (🎉)"
   );
 
   // String with all escape types
   assertEqual(
-    vj.parse('"a\\"b\\\\c\\/d\\be\\ff\\ng\\rh\\ti"').value,
+    parse('"a\\"b\\\\c\\/d\\be\\ff\\ng\\rh\\ti"').value,
     'a"b\\c/d\be\ff\ng\rh\ti',
     "all escape types combined"
   );
 
   console.log("\nRFC 8259 — Numbers:");
-  assertEqual(vj.parse("0").value, 0, "zero");
-  assertEqual(vj.parse("-0").value, -0, "negative zero");
-  assertEqual(vj.parse("1").value, 1, "positive integer");
-  assertEqual(vj.parse("-1").value, -1, "negative integer");
-  assertEqual(vj.parse("123456789").value, 123456789, "large integer");
-  assertEqual(vj.parse("0.5").value, 0.5, "decimal");
-  assertEqual(vj.parse("-0.5").value, -0.5, "negative decimal");
-  assertEqual(vj.parse("1e2").value, 100, "exponent lowercase");
-  assertEqual(vj.parse("1E2").value, 100, "exponent uppercase");
-  assertEqual(vj.parse("1e+2").value, 100, "exponent with plus");
-  assertEqual(vj.parse("1e-2").value, 0.01, "exponent with minus");
-  assertEqual(vj.parse("1.5e3").value, 1500, "decimal with exponent");
+  assertEqual(parse("0").value, 0, "zero");
+  assertEqual(parse("-0").value, -0, "negative zero");
+  assertEqual(parse("1").value, 1, "positive integer");
+  assertEqual(parse("-1").value, -1, "negative integer");
+  assertEqual(parse("123456789").value, 123456789, "large integer");
+  assertEqual(parse("0.5").value, 0.5, "decimal");
+  assertEqual(parse("-0.5").value, -0.5, "negative decimal");
+  assertEqual(parse("1e2").value, 100, "exponent lowercase");
+  assertEqual(parse("1E2").value, 100, "exponent uppercase");
+  assertEqual(parse("1e+2").value, 100, "exponent with plus");
+  assertEqual(parse("1e-2").value, 0.01, "exponent with minus");
+  assertEqual(parse("1.5e3").value, 1500, "decimal with exponent");
   assertEqual(
-    vj.parse("9007199254740992").value,
+    parse("9007199254740992").value,
     9007199254740992,
     "MAX_SAFE_INTEGER + 1"
   );
   assertEqual(
-    vj.parse("-9007199254740992").value,
+    parse("-9007199254740992").value,
     -9007199254740992,
     "-(MAX_SAFE_INTEGER + 1)"
   );
 
   console.log("\nRFC 8259 — Literals:");
-  assertEqual(vj.parse("true").value, true, "true literal");
-  assertEqual(vj.parse("false").value, false, "false literal");
-  assertEqual(vj.parse("null").value, null, "null literal");
+  assertEqual(parse("true").value, true, "true literal");
+  assertEqual(parse("false").value, false, "false literal");
+  assertEqual(parse("null").value, null, "null literal");
 
   console.log("\nRFC 8259 — Nesting:");
   assertEqual(
-    vj.parse('{"a":{"b":{"c":{"d":1}}}}').value,
+    parse('{"a":{"b":{"c":{"d":1}}}}').value,
     { a: { b: { c: { d: 1 } } } },
     "4 levels of nesting"
   );
   assertEqual(
-    vj.parse("[[[[1]]]]").value,
+    parse("[[[[1]]]]").value,
     [[[[1]]]],
     "4 levels of array nesting"
   );
   assertEqual(
-    vj.parse('[{"a":[1,{"b":2}]}]').value,
+    parse('[{"a":[1,{"b":2}]}]').value,
     [{ a: [1, { b: 2 }] }],
     "mixed nesting"
   );
 
   console.log("\nRFC 8259 — Invalid JSON (should return non-complete status):");
-  assert(vj.parse("").status !== "complete", "empty input");
-  assert(vj.parse("{").status !== "complete", "unclosed object");
-  assert(vj.parse("[").status !== "complete", "unclosed array");
-  assert(vj.parse('{"a":}').status !== "complete", "missing value");
-  assert(vj.parse("[,]").status !== "complete", "leading comma in array");
-  assert(vj.parse("{,}").status !== "complete", "leading comma in object");
-  assert(vj.parse("[1,]").status !== "complete", "trailing comma in array");
-  assert(vj.parse('{"a":1,}').status !== "complete", "trailing comma in object");
-  assert(vj.parse("undefined").status !== "complete", "undefined literal");
-  assert(vj.parse("NaN").status !== "complete", "NaN literal");
-  assert(vj.parse("Infinity").status !== "complete", "Infinity literal");
-  assert(vj.parse("'hello'").status !== "complete", "single-quoted string");
+  assert(parse("").status !== "complete", "empty input");
+  assert(parse("{").status !== "complete", "unclosed object");
+  assert(parse("[").status !== "complete", "unclosed array");
+  assert(parse('{"a":}').status !== "complete", "missing value");
+  assert(parse("[,]").status !== "complete", "leading comma in array");
+  assert(parse("{,}").status !== "complete", "leading comma in object");
+  assert(parse("[1,]").status !== "complete", "trailing comma in array");
+  assert(parse('{"a":1,}').status !== "complete", "trailing comma in object");
+  assert(parse("undefined").status !== "complete", "undefined literal");
+  assert(parse("NaN").status !== "complete", "NaN literal");
+  assert(parse("Infinity").status !== "complete", "Infinity literal");
+  assert(parse("'hello'").status !== "complete", "single-quoted string");
 
   // =============================================
   // Parse → stringify round-trip
@@ -168,7 +166,7 @@ async function run() {
     '{"slash":"back\\\\slash"}',
   ];
   for (const json of roundTripCases) {
-    const parsed = vj.parse(json).value;
+    const parsed = parse(json).value;
     const restr = JSON.stringify(parsed);
     assertEqual(restr, json, `roundtrip: ${json.slice(0, 40)}`);
   }
@@ -181,7 +179,7 @@ async function run() {
   // Byte-by-byte feeding
   {
     const json = '{"hello":"world","num":42}';
-    const parser = vj.createParser();
+    const parser = createParser();
     let status;
     for (let i = 0; i < json.length; i++) {
       status = parser.feed(json[i]);
@@ -195,7 +193,7 @@ async function run() {
   // NDJSON (newline-delimited)
   {
     const ndjson = '{"a":1}\n{"b":2}\n';
-    const parser = vj.createParser();
+    const parser = createParser();
     const status = parser.feed(ndjson);
     assert(
       status === "end_early",

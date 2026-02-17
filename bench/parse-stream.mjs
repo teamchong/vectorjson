@@ -10,7 +10,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init } from "../dist/index.js";
+import { parse, createParser } from "../dist/index.js";
 import { parse as partialParse } from "./ai-parsers/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -91,8 +91,6 @@ function printResult(label, stats) {
 // --- Main ---
 
 async function run() {
-  const vj = await init();
-
   const fixtures = ["tiny", "small", "medium", "large", "xlarge"];
   const data = {};
 
@@ -130,7 +128,7 @@ async function run() {
     printResult("partial-json parse", pjResult);
 
     // VectorJSON.parse
-    const vjResult = bench(() => vj.parse(json));
+    const vjResult = bench(() => parse(json));
     printResult("VectorJSON.parse", vjResult);
 
     const pjRatio = pjResult.opsPerSec / jpResult.opsPerSec;
@@ -185,7 +183,7 @@ async function run() {
     }
 
     // VectorJSON one-shot
-    const vjOneShot = bench(() => vj.parse(json), { durationMs: 1500 });
+    const vjOneShot = bench(() => parse(json), { durationMs: 1500 });
     printResult("VectorJSON.parse (one-shot)", vjOneShot);
 
     // VectorJSON streaming with different chunk sizes
@@ -193,7 +191,7 @@ async function run() {
       const label = `VectorJSON stream (${chunkSize}B chunks)`;
       const result = bench(
         () => {
-          const parser = vj.createParser();
+          const parser = createParser();
           for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
             const end = Math.min(offset + chunkSize, bytes.byteLength);
             const chunk = bytes.slice(offset, end);
@@ -286,7 +284,7 @@ async function run() {
     {
       const heapBefore = heapMB();
       const start = performance.now();
-      const parser = vj.createParser();
+      const parser = createParser();
       let status;
 
       for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {

@@ -9,7 +9,7 @@
  * nested objects, arrays, escape sequences, chunk boundaries, and more.
  */
 
-import { init } from "../dist/index.js";
+import { createParser, createEventParser } from "../dist/index.js";
 
 let passed = 0, failed = 0;
 const parsersToClean = [];
@@ -29,21 +29,20 @@ function assertEqual(actual, expected, msg) {
 }
 
 console.log("\n\ud83e\uddea VectorJSON Live Document Builder Tests\n");
-const vj = await init();
 
 // ── Helper: test both createParser and createEventParser ──
 // Wraps create() so parsers are auto-destroyed on test failure (prevents slot leaks)
 function testBoth(name, fn) {
   test(`createParser: ${name}`, () => {
     fn((...args) => {
-      const p = vj.createParser(...args);
+      const p = createParser(...args);
       parsersToClean.push(p);
       return p;
     });
   });
   test(`createEventParser: ${name}`, () => {
     fn((...args) => {
-      const p = vj.createEventParser(...args);
+      const p = createEventParser(...args);
       parsersToClean.push(p);
       return p;
     });
@@ -207,7 +206,7 @@ testBoth("partial 'nu' in object", (create) => {
 // Root-level scalars only work with createParser (EventParser's seeker
 // doesn't recognize bare scalars as JSON — it expects { [ or " as start)
 test("createParser: root-level true", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('true');
   assertEqual(p.getValue(), true);
@@ -215,7 +214,7 @@ test("createParser: root-level true", () => {
 });
 
 test("createParser: root-level false", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('false');
   assertEqual(p.getValue(), false);
@@ -223,7 +222,7 @@ test("createParser: root-level false", () => {
 });
 
 test("createParser: root-level null", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('null');
   assertEqual(p.getValue(), null);
@@ -231,7 +230,7 @@ test("createParser: root-level null", () => {
 });
 
 test("createParser: root-level partial 'tr' autocompletes", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('tr');
   assertEqual(p.getValue(), true);
@@ -239,7 +238,7 @@ test("createParser: root-level partial 'tr' autocompletes", () => {
 });
 
 test("createParser: root-level partial 'fals' autocompletes", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('fals');
   assertEqual(p.getValue(), false);
@@ -247,7 +246,7 @@ test("createParser: root-level partial 'fals' autocompletes", () => {
 });
 
 test("createParser: root-level number", () => {
-  const p = vj.createParser();
+  const p = createParser();
   parsersToClean.push(p);
   p.feed('42');
   assertEqual(p.getValue(), 42);

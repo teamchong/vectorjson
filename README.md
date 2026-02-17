@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/vectorjson/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/vectorjson)](https://www.npmjs.com/package/vectorjson)
-[![gzip size](https://img.shields.io/badge/gzip-37kB-blue)](https://www.npmjs.com/package/vectorjson)
+[![gzip size](https://img.shields.io/badge/gzip-~47kB-blue)](https://www.npmjs.com/package/vectorjson)
 [![license](https://img.shields.io/npm/l/vectorjson)](https://github.com/teamchong/vectorjson/blob/main/LICENSE)
 
 O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and offload parsing to Workers with transferable ArrayBuffers.
@@ -34,13 +34,22 @@ A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n
 
 ## Quick Start
 
-O(n) streaming JSON parser — feed chunks, get a live object:
+Zero-config — just import and use. No `init()`, no WASM setup:
 
 ```js
-import { init } from "vectorjson";
-const vj = await init();
+import { parse, createParser, createEventParser } from "vectorjson";
 
-const parser = vj.createParser();
+// One-shot parse
+const result = parse('{"tool":"file_edit","path":"app.ts"}');
+result.value.tool;  // "file_edit" — lazy Proxy over WASM tape
+```
+
+**Streaming** — O(n) incremental parsing, feed chunks, get a live object:
+
+```js
+import { createParser } from "vectorjson";
+
+const parser = createParser();
 for await (const chunk of stream) {
   parser.feed(chunk);
   result = parser.getValue();        // O(1) — returns live object
@@ -53,7 +62,7 @@ parser.destroy();
 **Or skip intermediate access entirely** — if you only need the final value:
 
 ```js
-const parser = vj.createParser();
+const parser = createParser();
 for await (const chunk of stream) {
   const s = parser.feed(chunk);      // O(1) — appends bytes to WASM buffer
   if (s === "complete") break;
@@ -65,7 +74,9 @@ parser.destroy();
 **Event-driven** — react to fields as they arrive, O(n) total, no re-parsing:
 
 ```js
-const parser = vj.createEventParser();
+import { createEventParser } from "vectorjson";
+
+const parser = createEventParser();
 
 parser.on('tool', (e) => showToolUI(e.value));             // fires immediately
 parser.onDelta('code', (e) => editor.append(e.value));     // streams char-by-char
@@ -81,7 +92,7 @@ parser.destroy();
 
 ```js
 const abort = new AbortController();
-const parser = vj.createEventParser();
+const parser = createEventParser();
 
 parser.on('name', (e) => {
   if (e.value !== 'str_replace_editor') {
@@ -382,18 +393,28 @@ bun --expose-gc bench/partial-access.mjs
 For non-streaming use cases:
 
 ```js
-const result = vj.parse('{"users": [{"name": "Alice"}]}');
+import { parse } from "vectorjson";
+
+const result = parse('{"users": [{"name": "Alice"}]}');
 result.status;       // "complete" | "complete_early" | "incomplete" | "invalid"
 result.value.users;  // lazy Proxy — materializes on access
 ```
 
 ## API Reference
 
+### Direct exports (recommended)
+
+All functions are available as direct imports — no `init()` needed:
+
+```js
+import { parse, parsePartialJson, deepCompare, createParser, createEventParser, materialize } from "vectorjson";
+```
+
 ### `init(options?): Promise<VectorJSON>`
 
-Loads WASM once, returns cached singleton. `{ engineWasm?: string | URL | BufferSource }` for custom WASM location.
+Returns cached singleton. Useful for passing custom WASM via `{ engineWasm?: string | URL | BufferSource }`. Called automatically on import.
 
-### `vj.parse(input: string | Uint8Array): ParseResult`
+### `parse(input: string | Uint8Array): ParseResult`
 
 ```ts
 interface ParseResult {
@@ -540,26 +561,22 @@ Convert a lazy Proxy into a plain JS object tree. No-op on plain values.
 
 | Runtime | Status | Notes |
 |---------|--------|-------|
-| Node.js 20+ | ✅ | WASM loaded from disk automatically |
-| Bun | ✅ | WASM loaded from disk automatically |
-| Browsers | ✅ | Pass `engineWasm` as `ArrayBuffer` or `URL` to `init()` |
-| Deno | ✅ | Pass `engineWasm` as `URL` to `init()` |
-| Cloudflare Workers | ✅ | Import WASM as module, pass as `ArrayBuffer` to `init()` |
+| Node.js 20+ | ✅ | WASM embedded in bundle — zero config |
+| Bun | ✅ | WASM embedded in bundle — zero config |
+| Browsers | ✅ | WASM embedded in bundle — zero config |
+| Deno | ✅ | WASM embedded in bundle — zero config |
+| Cloudflare Workers | ✅ | WASM embedded in bundle — zero config |
 
-For environments without filesystem access, provide the WASM binary explicitly:
+WASM is embedded as base64 in the JS bundle and auto-initialized via top-level `await`. No setup required — just `import { parse } from "vectorjson"`.
+
+For advanced use cases, you can still provide a custom WASM binary via `init()`:
 
 ```js
 import { init } from "vectorjson";
-
-// Option 1: URL (browsers, Deno)
-const vj = await init({ engineWasm: new URL('./engine.wasm', import.meta.url) });
-
-// Option 2: ArrayBuffer (Workers, custom loaders)
-const wasmBytes = await fetch('/engine.wasm').then(r => r.arrayBuffer());
-const vj = await init({ engineWasm: wasmBytes });
+const vj = await init({ engineWasm: customWasmBytes });
 ```
 
-Bundle size: ~92 KB WASM + ~20 KB JS (~37 KB gzipped total). No runtime dependencies.
+Bundle size: ~148 KB JS with embedded WASM (~47 KB gzipped). No runtime dependencies.
 
 ## Runnable Examples
 

@@ -2,7 +2,7 @@
  * EventParser tests — path subscriptions, multi-root, deltas, skip paths,
  * JSON boundary detection, schema filtering, wildcard context, byte offsets.
  */
-import { init } from "../dist/index.js";
+import { createEventParser } from "../dist/index.js";
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -21,12 +21,11 @@ function assert(condition, msg) {
 }
 
 console.log("\n🧪 VectorJSON EventParser Tests\n");
-const vj = await init();
 
 /** Helper: creates parser, runs fn, always destroys */
 function withParser(opts, fn) {
   if (typeof opts === 'function') { fn = opts; opts = undefined; }
-  const parser = vj.createEventParser(opts);
+  const parser = createEventParser(opts);
   try { fn(parser); } finally { parser.destroy(); }
 }
 
@@ -463,7 +462,7 @@ await test("unicode in string values", () => {
 });
 
 await test("destroy prevents further use", () => {
-  const parser = vj.createEventParser();
+  const parser = createEventParser();
   parser.destroy();
   let threw = false;
   try { parser.feed('{}'); } catch { threw = true; }
@@ -812,8 +811,8 @@ await test("seeker: 4-backtick code fence", () => {
 // =============================================================
 
 await test("concurrent: multiple EventParsers work independently", () => {
-  const p1 = vj.createEventParser();
-  const p2 = vj.createEventParser();
+  const p1 = createEventParser();
+  const p2 = createEventParser();
   try {
     const e1 = [], e2 = [];
     p1.on("a", (e) => e1.push(e.value));

@@ -3,7 +3,7 @@
  *
  * Compares:
  *   JSON.stringify(JSON.parse(str))
- *   JSON.stringify(vj.parse(str).value)
+ *   JSON.stringify(parse(str).value)
  *
  * Usage:
  *   bun --expose-gc bench/end-to-end.mjs
@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init } from "../dist/index.js";
+import { parse } from "../dist/index.js";
 import { parse as partialParse } from "./ai-parsers/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -82,8 +82,6 @@ function printResult(label, stats) {
 }
 
 async function run() {
-  const vj = await init();
-
   const fixtures = ["tiny", "small", "medium", "large", "xlarge"];
   const data = {};
 
@@ -123,11 +121,11 @@ async function run() {
     });
     printResult("partial-json → JSON.stringify", pjResult);
 
-    // vj.stringify(vj.parse(str).value) — one WASM call for stringify
+    // VectorJSON: parse → toJSON → JSON.stringify
     const vjResult = bench(() => {
-      vj.stringify(vj.parse(json).value);
+      JSON.stringify(parse(json).toJSON());
     });
-    printResult("vj.parse → vj.stringify", vjResult);
+    printResult("vj.parse → toJSON → stringify", vjResult);
 
     const pjRatio = pjResult.opsPerSec / jpResult.opsPerSec;
     const ratio = vjResult.opsPerSec / jpResult.opsPerSec;

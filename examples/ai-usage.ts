@@ -10,7 +10,7 @@
  *   6. Embeddings batch responses (JSONL)
  */
 
-import { init, type VectorJSON, type ParseResult } from "../dist/index.js";
+import { parse, type ParseResult } from "../dist/index.js";
 
 // ─────────────────────────────────────────────────────────
 // 1. MCP STDIO Transport — newline-delimited JSON-RPC
@@ -19,7 +19,7 @@ import { init, type VectorJSON, type ParseResult } from "../dist/index.js";
 // MCP stdio: each line on stdin/stdout is a complete JSON-RPC message.
 // This is literally JSONL. VectorJSON's `complete_early` handles it.
 
-async function mcpStdioExample(vj: VectorJSON) {
+async function mcpStdioExample() {
   // Simulates reading from a child process stdout
   const stdoutData = [
     '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}}}}\n',
@@ -32,7 +32,7 @@ async function mcpStdioExample(vj: VectorJSON) {
   let remaining: string | Uint8Array = stdoutData;
 
   while (remaining.length > 0) {
-    const r = vj.parse(remaining);
+    const r = parse(remaining);
 
     if (r.status === "complete" || r.status === "complete_early") {
       messages.push(r.toJSON()); // fast: JSON.parse internally
@@ -72,7 +72,7 @@ async function mcpStdioExample(vj: VectorJSON) {
 //   data: {"jsonrpc":"2.0","id":1,"result":{...}}\n
 //   \n
 
-async function mcpStreamableHttpExample(vj: VectorJSON) {
+async function mcpStreamableHttpExample() {
   // Step 1: Send JSON-RPC request
   const request = {
     jsonrpc: "2.0",
@@ -96,7 +96,7 @@ async function mcpStreamableHttpExample(vj: VectorJSON) {
   // Step 2a: Single JSON response — just parse it
   if (contentType.includes("application/json")) {
     const body = new Uint8Array(await response.arrayBuffer());
-    const r = vj.parse(body);
+    const r = parse(body);
     if (r.status === "complete") {
       handleJsonRpcMessage(r.toJSON());
     }
@@ -106,7 +106,7 @@ async function mcpStreamableHttpExample(vj: VectorJSON) {
   // Step 2b: SSE stream — parse each frame
   if (contentType.includes("text/event-stream")) {
     // Read SSE frames from the response body
-    for await (const message of readSSE(response.body!, vj)) {
+    for await (const message of readSSE(response.body!)) {
       handleJsonRpcMessage(message);
     }
     return;
@@ -127,7 +127,6 @@ async function mcpStreamableHttpExample(vj: VectorJSON) {
  */
 async function* readSSE(
   body: ReadableStream<Uint8Array>,
-  vj: VectorJSON,
 ): AsyncGenerator<unknown> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -156,7 +155,7 @@ async function* readSSE(
       const payload = dataLines.join("\n");
 
       // Parse the JSON payload with VectorJSON
-      const r = vj.parse(payload);
+      const r = parse(payload);
       if (r.status === "complete" || r.status === "complete_early") {
         yield r.toJSON();
       }
@@ -176,7 +175,7 @@ async function* readSSE(
 //   data: [DONE]
 //   \n
 
-async function openaiStreamExample(vj: VectorJSON) {
+async function openaiStreamExample() {
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -192,7 +191,7 @@ async function openaiStreamExample(vj: VectorJSON) {
 
   let fullContent = "";
 
-  for await (const event of readSSE(response.body!, vj)) {
+  for await (const event of readSSE(response.body!)) {
     const chunk = event as any;
     // OpenAI: [DONE] is handled by readSSE (not valid JSON, parse returns invalid)
     if (!chunk?.choices?.[0]?.delta) continue;
@@ -224,7 +223,7 @@ async function openaiStreamExample(vj: VectorJSON) {
 //   event: message_stop
 //   data: {"type":"message_stop"}
 
-async function anthropicStreamExample(vj: VectorJSON) {
+async function anthropicStreamExample() {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -242,7 +241,7 @@ async function anthropicStreamExample(vj: VectorJSON) {
 
   let fullContent = "";
 
-  for await (const event of readSSE(response.body!, vj)) {
+  for await (const event of readSSE(response.body!)) {
     const data = event as any;
 
     switch (data.type) {
@@ -282,7 +281,7 @@ interface User {
   age: number;
 }
 
-async function vercelStreamObjectExample(vj: VectorJSON) {
+async function vercelStreamObjectExample() {
   // Simulated growing partial JSON (as the LLM generates tokens)
   const partialSnapshots = [
     '{"users":[{"name":"Alice"',
@@ -292,7 +291,7 @@ async function vercelStreamObjectExample(vj: VectorJSON) {
   ];
 
   for (const snapshot of partialSnapshots) {
-    const r = vj.parse(snapshot);
+    const r = parse(snapshot);
 
     if (r.status === "incomplete" || r.status === "complete") {
       const data = r.value as any;
@@ -328,7 +327,7 @@ async function vercelStreamObjectExample(vj: VectorJSON) {
 //   {"object":"embedding","index":0,"embedding":[0.1,0.2,...]}
 //   {"object":"embedding","index":1,"embedding":[0.3,0.4,...]}
 
-async function embeddingsBatchExample(vj: VectorJSON) {
+async function embeddingsBatchExample() {
   // Simulated JSONL response from embeddings API
   const responseBody =
     '{"object":"embedding","index":0,"embedding":[0.0023,-0.0091,0.0152]}\n' +
@@ -339,7 +338,7 @@ async function embeddingsBatchExample(vj: VectorJSON) {
   let input: string | Uint8Array = responseBody;
 
   while (input.length > 0) {
-    const r = vj.parse(input);
+    const r = parse(input);
     if (r.status === "complete" || r.status === "complete_early") {
       const obj = r.toJSON() as { index: number; embedding: number[] };
       embeddings[obj.index] = obj.embedding;
@@ -365,7 +364,7 @@ async function embeddingsBatchExample(vj: VectorJSON) {
 // This shows the full pattern: fetch() → ReadableStream → VectorJSON.
 // Works with any SSE API (OpenAI, Anthropic, MCP, custom).
 
-async function fullStreamingExample(vj: VectorJSON) {
+async function fullStreamingExample() {
   const response = await fetch("https://api.example.com/stream", {
     method: "POST",
     headers: {
@@ -379,7 +378,7 @@ async function fullStreamingExample(vj: VectorJSON) {
 
   // Option A: SSE stream — use readSSE helper
   if (response.headers.get("Content-Type")?.includes("text/event-stream")) {
-    for await (const message of readSSE(response.body, vj)) {
+    for await (const message of readSSE(response.body)) {
       console.log("SSE message:", message);
     }
     return;
@@ -401,7 +400,7 @@ async function fullStreamingExample(vj: VectorJSON) {
     // Parse as many complete messages as possible
     let input: Uint8Array = combined;
     while (input.byteLength > 0) {
-      const r = vj.parse(input);
+      const r = parse(input);
       if (r.status === "complete" || r.status === "complete_early") {
         console.log("Message:", r.toJSON());
         if (r.remaining && r.remaining.byteLength > 0) {
@@ -439,16 +438,14 @@ function handleJsonRpcMessage(msg: unknown) {
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  const vj = await init();
-
   console.log("=== 1. MCP STDIO (JSONL) ===");
-  await mcpStdioExample(vj);
+  await mcpStdioExample();
 
   console.log("\n=== 5. Vercel AI SDK streamObject ===");
-  await vercelStreamObjectExample(vj);
+  await vercelStreamObjectExample();
 
   console.log("\n=== 6. Embeddings Batch (JSONL) ===");
-  await embeddingsBatchExample(vj);
+  await embeddingsBatchExample();
 
   // Examples 2-4, 7 require live API endpoints — shown for reference
   console.log("\n=== Examples 2-4, 7: require live endpoints (see source) ===");

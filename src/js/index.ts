@@ -12,9 +12,16 @@
  *   Users CAN call .free() to release immediately if desired.
  */
 
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { wasmBase64 } from "./engine-wasm.generated.js";
+
+function decodeBase64(b64: string): Uint8Array {
+  if (typeof Buffer !== "undefined")
+    return new Uint8Array(Buffer.from(b64, "base64").buffer);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
 
 // --- Types ---
 
@@ -280,23 +287,20 @@ export async function init(options?: {
 }): Promise<VectorJSON> {
   if (_instance) return _instance;
 
-  // Resolve WASM file path — always use import.meta.url at runtime
-  // (avoids __dirname being baked in at bundle time by Bun/esbuild)
-  const distDir = dirname(fileURLToPath(import.meta.url));
-  const enginePath = join(distDir, "engine.wasm");
-
-  // Load WASM bytes
-  const engineBytes =
-    options?.engineWasm instanceof ArrayBuffer ||
-    ArrayBuffer.isView(options?.engineWasm)
-      ? (options!.engineWasm as BufferSource)
-      : await readFile(
-          typeof options?.engineWasm === "string"
-            ? options.engineWasm
-            : options?.engineWasm instanceof URL
-              ? fileURLToPath(options.engineWasm)
-              : enginePath,
-        );
+  // Load WASM bytes — embedded base64 by default, filesystem/URL/buffer when explicit
+  let engineBytes: BufferSource;
+  const wasmOpt = options?.engineWasm;
+  if (wasmOpt instanceof ArrayBuffer || ArrayBuffer.isView(wasmOpt)) {
+    engineBytes = wasmOpt as BufferSource;
+  } else if (typeof wasmOpt === "string" || wasmOpt instanceof URL) {
+    // Dynamic import for filesystem — only when user explicitly passes a path
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const path = typeof wasmOpt === "string" ? wasmOpt : fileURLToPath(wasmOpt);
+    engineBytes = await readFile(path);
+  } else {
+    engineBytes = decodeBase64(wasmBase64).buffer as ArrayBuffer;
+  }
 
   // --- Instantiate Zig engine ---
   const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes, {});
@@ -1967,29 +1971,23 @@ export async function init(options?: {
   return _instance;
 }
 
-/**
- * Convenience: parse JSON using a pre-initialized instance.
- * Initializes on first call.
- */
-export async function parse(input: string | Uint8Array): Promise<ParseResult> {
-  const vj = await init();
-  return vj.parse(input);
-}
+// --- Top-level await: auto-initialize with embedded WASM ---
+const _vj = await init();
 
-/**
- * Convenience: parse partial JSON using a pre-initialized instance.
- * Drop-in replacement for AI SDK partial JSON parsers.
- * Initializes on first call.
- *
- * ```ts
- * import { parsePartialJson } from 'vectorjson';
- * const { value, state } = await parsePartialJson('{"a": 1, "b": ');
- * ```
- */
-export async function parsePartialJson(input: string): Promise<PartialJsonResult>;
-export async function parsePartialJson<T>(input: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): Promise<PartialJsonResult<DeepPartial<T>>>;
-export async function parsePartialJson(input: string, schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } }): Promise<PartialJsonResult> {
-  const vj = await init();
-  if (schema) return vj.parsePartialJson(input, schema);
-  return vj.parsePartialJson(input);
-}
+/** Parse a JSON string or Uint8Array. Synchronous — no init needed. */
+export const parse = _vj.parse;
+
+/** Parse partial/incomplete JSON. Compatible with Vercel AI SDK's parsePartialJson. */
+export const parsePartialJson = _vj.parsePartialJson;
+
+/** Deep-compare two values for structural equality. WASM-accelerated for VJ proxies. */
+export const deepCompare = _vj.deepCompare;
+
+/** Create a streaming parser for incremental JSON parsing. */
+export const createParser = _vj.createParser;
+
+/** Create an event-driven streaming parser with path subscriptions. */
+export const createEventParser = _vj.createEventParser;
+
+/** Eagerly materialize a lazy proxy into plain JS objects. */
+export const materialize = _vj.materialize;

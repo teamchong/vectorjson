@@ -8,7 +8,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init } from "../dist/index.js";
+import { parse, deepCompare } from "../dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -23,25 +23,24 @@ function assert(condition, msg) {
 }
 
 console.log("\n🧪 VectorJSON — Deep Compare Tests\n");
-const vj = await init();
 
 // --- Helpers ---
 /** Parse JSON and return the proxy/value */
 function p(json) {
-  return vj.parse(json).value;
+  return parse(json).value;
 }
 /** Parse from Uint8Array and return the proxy/value */
 function pBytes(json) {
-  return vj.parse(new TextEncoder().encode(json)).value;
+  return parse(new TextEncoder().encode(json)).value;
 }
 /** Assert deep comparison result */
 function eq(a, b, expected, msg) {
-  const result = vj.deepCompare(a, b);
+  const result = deepCompare(a, b);
   assert(result === expected, msg || `Expected ${expected}, got ${result}`);
 }
 /** Assert deep comparison with options */
 function eqOpts(a, b, opts, expected, msg) {
-  const result = vj.deepCompare(a, b, opts);
+  const result = deepCompare(a, b, opts);
   assert(result === expected, msg || `Expected ${expected}, got ${result}`);
 }
 
@@ -270,7 +269,7 @@ for (const name of ["tiny", "small", "medium", "large"]) {
   await test(`fixture ${name}.json: self-equal`, () => {
     const a = p(json);
     const b = p(json);
-    assert(vj.deepCompare(a, b) === true, `${name}.json should be equal to itself`);
+    assert(deepCompare(a, b) === true, `${name}.json should be equal to itself`);
   });
 
   await test(`fixture ${name}.json: detects mutation`, () => {
@@ -282,7 +281,7 @@ for (const name of ["tiny", "small", "medium", "large"]) {
     }
     const a = p(json);
     const b = p(JSON.stringify(obj));
-    assert(vj.deepCompare(a, b) === false, `${name}.json mutation should be detected`);
+    assert(deepCompare(a, b) === false, `${name}.json mutation should be detected`);
   });
 }
 

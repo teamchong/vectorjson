@@ -25,4 +25,7 @@ deps/
 # Test results
 test-results/
 
+# Generated WASM embed
+src/js/engine-wasm.generated.ts
+
 # Generated benchmark files

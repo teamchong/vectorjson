@@ -13,9 +13,7 @@
 import { parsePartialJson as vercelParse } from "ai";
 import { parse as partialJsonParse } from "partial-json";
 import { partialParse as anthropicParse } from "@anthropic-ai/sdk/_vendor/partial-json-parser/parser.mjs";
-import { init as vjInit } from "../../dist/index.js";
-
-const vj = await vjInit();
+import { parse as vjParse } from "../../dist/index.js";
 
 // ── Test inputs ──────────────────────────────────────────
 
@@ -116,7 +114,7 @@ for (const tc of testCases) {
   console.log(`  Anthropic SDK:     ${fmt(anthro)}`);
 
   // VectorJSON parse()
-  const vjResult = trySync(() => vj.parse(tc.input));
+  const vjResult = trySync(() => vjParse(tc.input));
   console.log(`  VectorJSON:        ${fmtVJ(vjResult)}`);
 
   console.log();

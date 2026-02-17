@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init } from "../dist/index.js";
+import { parse } from "../dist/index.js";
 import { parse as partialParse } from "./ai-parsers/node_modules/partial-json/dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -63,8 +63,6 @@ function printResult(label, stats) {
 }
 
 async function run() {
-  const vj = await init();
-
   // --- Synthetic: large array with many objects ---
   const syntheticItems = [];
   for (let i = 0; i < 10000; i++) {
@@ -113,7 +111,7 @@ async function run() {
   printResult(
     "VectorJSON.parse → .total",
     bench(() => {
-      const r = vj.parse(syntheticJson);
+      const r = parse(syntheticJson);
       const v = r.value.total;
       r.value.free();
       return v;
@@ -145,7 +143,7 @@ async function run() {
   printResult(
     "VectorJSON.parse → .items[0].name",
     bench(() => {
-      const r = vj.parse(syntheticJson);
+      const r = parse(syntheticJson);
       const v = r.value.items[0].name;
       r.value.free();
       return v;
@@ -187,7 +185,7 @@ async function run() {
   printResult(
     "VectorJSON.parse → 10 items",
     bench(() => {
-      const r = vj.parse(syntheticJson);
+      const r = parse(syntheticJson);
       let sum = 0;
       for (let i = 0; i < 10; i++) {
         sum += r.value.items[i].id;
@@ -238,7 +236,7 @@ async function run() {
     "VectorJSON.parse (full access)",
     bench(
       () => {
-        const r = vj.parse(syntheticJson);
+        const r = parse(syntheticJson);
         const items = r.value.items;
         let sum = 0;
         for (let i = 0; i < items.length; i++) {
@@ -293,7 +291,7 @@ async function run() {
     printResult(
       `VectorJSON.parse → .${firstKey}`,
       bench(() => {
-        const r = vj.parse(json);
+        const r = parse(json);
         const v = r.value[firstKey];
         r.value.free();
         return v;
@@ -305,7 +303,7 @@ async function run() {
       return r[firstKey];
     }).opsPerSec;
     const speedupVJ = bench(() => {
-      const r = vj.parse(json);
+      const r = parse(json);
       const v = r.value[firstKey];
       r.value.free();
       return v;

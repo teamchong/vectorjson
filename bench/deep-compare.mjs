@@ -12,7 +12,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { init } from "../dist/index.js";
+import { parse, deepCompare } from "../dist/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -111,8 +111,6 @@ function deepEqual(a, b) {
 }
 
 async function run() {
-  const vj = await init();
-
   const fixtures = ["tiny", "small", "medium", "large"];
   const data = {};
 
@@ -137,8 +135,8 @@ async function run() {
     const objB = JSON.parse(json);
 
     // Parse with VJ to get proxies for WASM comparison
-    const proxyA = vj.parse(json).value;
-    const proxyB = vj.parse(json).value;
+    const proxyA = parse(json).value;
+    const proxyB = parse(json).value;
 
     console.log(`  ─── ${name}.json (${sizeKB} KB) — identical objects ───`);
 
@@ -156,13 +154,13 @@ async function run() {
 
     // Approach 3: VectorJSON.deepCompare (default — ignore key order)
     const vjResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB);
+      deepCompare(proxyA, proxyB);
     });
     printResult("VJ ignore key order (default)", vjResult);
 
     // Approach 4: VectorJSON.deepCompare (strict key order)
     const vjStrictResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+      deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
     });
     printResult("VJ strict key order", vjStrictResult);
 
@@ -202,9 +200,9 @@ async function run() {
     const objB = JSON.parse(json);
     mutate(objB);
 
-    const proxyA = vj.parse(json).value;
+    const proxyA = parse(json).value;
     const modifiedJson = JSON.stringify(objB);
-    const proxyB = vj.parse(modifiedJson).value;
+    const proxyB = parse(modifiedJson).value;
 
     console.log(`  ─── ${name}.json (${sizeKB} KB) — with modifications ───`);
 
@@ -219,16 +217,16 @@ async function run() {
     printResult("JS deepEqual (recursive)", deepEqResult);
 
     const vjResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB);
+      deepCompare(proxyA, proxyB);
     });
     printResult("VJ ignore key order (default)", vjResult);
 
     const vjStrictResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+      deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
     });
     printResult("VJ strict key order", vjStrictResult);
 
-    const isEqual = vj.deepCompare(proxyA, proxyB);
+    const isEqual = deepCompare(proxyA, proxyB);
     console.log(`  → equal: ${isEqual}\n`);
   }
 
@@ -264,31 +262,31 @@ async function run() {
     const objB = shuffleKeys(objA);
     const jsonB = JSON.stringify(objB);
 
-    const proxyA = vj.parse(json).value;
-    const proxyB = vj.parse(jsonB).value;
+    const proxyA = parse(json).value;
+    const proxyB = parse(jsonB).value;
 
     // Verify they're semantically equal
-    const check = vj.deepCompare(proxyA, proxyB);
+    const check = deepCompare(proxyA, proxyB);
     if (!check) { console.log(`  ⚠ ${name}.json: shuffled keys not equal (skipping)`); continue; }
 
     console.log(`  ─── ${name}.json (${sizeKB} KB) — shuffled keys ───`);
 
     // Strict key order (should return false for reordered keys)
     const vjStrictResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+      deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
     });
     printResult("VJ strict key order (→ false)", vjStrictResult);
 
     // Ignore key order — default (should return true)
     const vjIgnoreResult = bench(() => {
-      vj.deepCompare(proxyA, proxyB);
+      deepCompare(proxyA, proxyB);
     });
     printResult("VJ ignore key order (→ true)", vjIgnoreResult);
 
     // Baseline: same-order comparison for reference
-    const proxyA2 = vj.parse(json).value;
+    const proxyA2 = parse(json).value;
     const vjSameOrderResult = bench(() => {
-      vj.deepCompare(proxyA, proxyA2);
+      deepCompare(proxyA, proxyA2);
     });
     printResult("VJ same-order baseline", vjSameOrderResult);
 

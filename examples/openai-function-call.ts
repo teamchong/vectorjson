@@ -22,7 +22,7 @@
  *   4. Early abort when the model picks an unexpected function
  */
 
-import { init, type EventParser, type FeedStatus } from "../dist/index.js";
+import { createEventParser, type EventParser, type FeedStatus } from "../dist/index.js";
 
 // ─────────────────────────────────────────────────────────
 // Configuration
@@ -204,7 +204,6 @@ function makeTimer() {
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  const vj = await init();
   const elapsed = makeTimer();
 
   const abort = new AbortController();
@@ -278,7 +277,7 @@ async function main() {
 
   // ── Set up the EventParser ──────────────────────────────
 
-  const parser: EventParser = vj.createEventParser();
+  const parser: EventParser = createEventParser();
   let totalBytes = 0;
   let totalChunks = 0;
   let functionName: string | null = null;
