@@ -69,6 +69,8 @@ pub fn build(b: *std.Build) void {
         "stream_get_remaining_len",
         "stream_get_buffer_len",
         "stream_reset_for_next",
+        // Deep comparison
+        "doc_deep_equal",
         // Input classification & autocomplete
         "classify_input",
         "autocomplete_input",

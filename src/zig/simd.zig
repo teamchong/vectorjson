@@ -44,7 +44,7 @@ pub fn allMatch(comptime targets: []const u8, chunk: @Vector(16, u8)) bool {
 
 /// Reduce a bool vector: true if ANY lane is set.
 /// Compiles to WASM `v128.any_true`.
-inline fn vecAnySet(mask: anytype) bool {
+pub inline fn vecAnySet(mask: anytype) bool {
     return @reduce(.Or, mask);
 }
 

@@ -74,7 +74,7 @@ function bench(fn, { warmup = 30, durationMs = 2000 } = {}) {
 
 function printResult(label, stats) {
   console.log(
-    `  ${label.padEnd(35)} ${formatNum(stats.opsPerSec).padStart(10)} ops/s  ` +
+    `  ${label.padEnd(40)} ${formatNum(stats.opsPerSec).padStart(10)} ops/s  ` +
       `${formatTime(stats.meanMs).padStart(10)}  ` +
       `heap Δ ${stats.heapDeltaMB.toFixed(2).padStart(7)} MB`
   );
@@ -112,7 +112,6 @@ function deepEqual(a, b) {
 
 async function run() {
   const vj = await init();
-  const encoder = new TextEncoder();
 
   const fixtures = ["tiny", "small", "medium", "large"];
   const data = {};
@@ -126,9 +125,9 @@ async function run() {
     }
   }
 
-  console.log("\n╔══════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║                Deep Compare Benchmark — Equal Objects                        ║");
-  console.log("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+  console.log("\n╔══════════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                    Deep Compare Benchmark — Equal Objects                        ║");
+  console.log("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
 
   for (const name of fixtures) {
     if (!data[name]) continue;
@@ -136,8 +135,10 @@ async function run() {
     const sizeKB = (Buffer.byteLength(json) / 1024).toFixed(1);
     const objA = JSON.parse(json);
     const objB = JSON.parse(json);
-    const bytesA = encoder.encode(json);
-    const bytesB = encoder.encode(json);
+
+    // Parse with VJ to get proxies for WASM comparison
+    const proxyA = vj.parse(json).value;
+    const proxyB = vj.parse(json).value;
 
     console.log(`  ─── ${name}.json (${sizeKB} KB) — identical objects ───`);
 
@@ -153,11 +154,17 @@ async function run() {
     });
     printResult("JS deepEqual (recursive)", deepEqResult);
 
-    // Approach 3: VectorJSON.deepCompare
+    // Approach 3: VectorJSON.deepCompare (default — ignore key order)
     const vjResult = bench(() => {
-      vj.deepCompare(objA, objB);
+      vj.deepCompare(proxyA, proxyB);
     });
-    printResult("VectorJSON.deepCompare", vjResult);
+    printResult("VJ ignore key order (default)", vjResult);
+
+    // Approach 4: VectorJSON.deepCompare (strict key order)
+    const vjStrictResult = bench(() => {
+      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+    });
+    printResult("VJ strict key order", vjStrictResult);
 
     console.log();
   }
@@ -165,31 +172,39 @@ async function run() {
   // ==============================================
   // Compare with differences
   // ==============================================
-  console.log("╔══════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║              Deep Compare Benchmark — With Differences                       ║");
-  console.log("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+  console.log("╔══════════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                  Deep Compare Benchmark — With Differences                       ║");
+  console.log("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
 
-  for (const name of ["medium", "large"]) {
+  /**
+   * Generic deep mutation: walk the object and change the first string value found.
+   * Works for any fixture shape — no fixture-specific mutation logic needed.
+   */
+  function mutate(obj) {
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        if (typeof item === "object" && item !== null) { mutate(item); return; }
+      }
+      if (obj.length > 0) obj[0] = "__MODIFIED__";
+    } else if (typeof obj === "object" && obj !== null) {
+      for (const key of Object.keys(obj)) {
+        if (typeof obj[key] === "string") { obj[key] = "__MODIFIED__"; return; }
+        if (typeof obj[key] === "object" && obj[key] !== null) { mutate(obj[key]); return; }
+      }
+    }
+  }
+
+  for (const name of fixtures) {
     if (!data[name]) continue;
     const json = data[name];
     const sizeKB = (Buffer.byteLength(json) / 1024).toFixed(1);
     const objA = JSON.parse(json);
-    // Create a modified version
     const objB = JSON.parse(json);
+    mutate(objB);
 
-    // Introduce some differences
-    if (objB.data && Array.isArray(objB.data)) {
-      // Medium: modify some items
-      for (let i = 0; i < Math.min(10, objB.data.length); i++) {
-        objB.data[i].name = "MODIFIED_" + i;
-        objB.data[i].score = 999;
-      }
-    } else if (objB.metrics && Array.isArray(objB.metrics)) {
-      // Large: modify some metrics
-      for (let i = 0; i < Math.min(5, objB.metrics.length); i++) {
-        objB.metrics[i].name = "modified_metric";
-      }
-    }
+    const proxyA = vj.parse(json).value;
+    const modifiedJson = JSON.stringify(objB);
+    const proxyB = vj.parse(modifiedJson).value;
 
     console.log(`  ─── ${name}.json (${sizeKB} KB) — with modifications ───`);
 
@@ -204,13 +219,80 @@ async function run() {
     printResult("JS deepEqual (recursive)", deepEqResult);
 
     const vjResult = bench(() => {
-      vj.deepCompare(objA, objB);
+      vj.deepCompare(proxyA, proxyB);
     });
-    printResult("VectorJSON.deepCompare", vjResult);
+    printResult("VJ ignore key order (default)", vjResult);
 
-    // Show diff count
-    const diffs = vj.deepCompare(objA, objB);
-    console.log(`  → found ${diffs.length} difference(s)\n`);
+    const vjStrictResult = bench(() => {
+      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+    });
+    printResult("VJ strict key order", vjStrictResult);
+
+    const isEqual = vj.deepCompare(proxyA, proxyB);
+    console.log(`  → equal: ${isEqual}\n`);
+  }
+
+  // ==============================================
+  // Shuffled keys — only VJ can handle this correctly
+  // ==============================================
+  console.log("╔══════════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║              Deep Compare Benchmark — Shuffled Key Order                         ║");
+  console.log("╚══════════════════════════════════════════════════════════════════════════════════╝\n");
+
+  /**
+   * Recursively shuffle all object keys (arrays keep element order).
+   */
+  function shuffleKeys(obj) {
+    if (Array.isArray(obj)) return obj.map(shuffleKeys);
+    if (typeof obj !== "object" || obj === null) return obj;
+    const keys = Object.keys(obj);
+    // Fisher-Yates shuffle
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+    const out = {};
+    for (const k of keys) out[k] = shuffleKeys(obj[k]);
+    return out;
+  }
+
+  for (const name of fixtures) {
+    if (!data[name]) continue;
+    const json = data[name];
+    const sizeKB = (Buffer.byteLength(json) / 1024).toFixed(1);
+    const objA = JSON.parse(json);
+    const objB = shuffleKeys(objA);
+    const jsonB = JSON.stringify(objB);
+
+    const proxyA = vj.parse(json).value;
+    const proxyB = vj.parse(jsonB).value;
+
+    // Verify they're semantically equal
+    const check = vj.deepCompare(proxyA, proxyB);
+    if (!check) { console.log(`  ⚠ ${name}.json: shuffled keys not equal (skipping)`); continue; }
+
+    console.log(`  ─── ${name}.json (${sizeKB} KB) — shuffled keys ───`);
+
+    // Strict key order (should return false for reordered keys)
+    const vjStrictResult = bench(() => {
+      vj.deepCompare(proxyA, proxyB, { ignoreKeyOrder: false });
+    });
+    printResult("VJ strict key order (→ false)", vjStrictResult);
+
+    // Ignore key order — default (should return true)
+    const vjIgnoreResult = bench(() => {
+      vj.deepCompare(proxyA, proxyB);
+    });
+    printResult("VJ ignore key order (→ true)", vjIgnoreResult);
+
+    // Baseline: same-order comparison for reference
+    const proxyA2 = vj.parse(json).value;
+    const vjSameOrderResult = bench(() => {
+      vj.deepCompare(proxyA, proxyA2);
+    });
+    printResult("VJ same-order baseline", vjSameOrderResult);
+
+    console.log();
   }
 }
 

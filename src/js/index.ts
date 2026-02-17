@@ -154,6 +154,16 @@ export interface VectorJSON {
    */
   createParser<T>(schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): StreamingParser<T>;
   /**
+   * Deep-compare two values for structural equality.
+   * When both values are VJ proxies, comparison happens entirely in WASM
+   * (walks tapes in linear memory — zero JS allocations, zero Proxy traps).
+   * Falls back to JSON.stringify comparison for plain JS objects.
+   *
+   * By default, object key order does not matter (`{"a":1,"b":2}` equals `{"b":2,"a":1}`).
+   * Pass `{ ordered: true }` for faster key-order-sensitive comparison.
+   */
+  deepCompare(a: unknown, b: unknown, options?: { ignoreKeyOrder?: boolean }): boolean;
+  /**
    * Eagerly materialize a lazy proxy into plain JS objects.
    * If the value is already a plain JS value, returns it as-is.
    */
@@ -237,6 +247,7 @@ interface EngineExports {
   doc_batch_ptr(): number;
   doc_array_elements(docId: number, arrIndex: number, resumeAt: number): number;
   doc_object_keys(docId: number, objIndex: number, resumeAt: number): number;
+  doc_deep_equal(doc_a: number, idx_a: number, doc_b: number, idx_b: number, ordered: number): number;
   stream_create(): number;
   stream_destroy(id: number): void;
   stream_feed(id: number, ptr: number, len: number): number;
@@ -502,7 +513,7 @@ export async function init(options?: {
   const docArrHandler: ProxyHandler<any> = {
     get(target, prop, _receiver) {
       if (prop === 'free' || prop === Symbol.dispose) return target._f;
-      if (prop === LAZY_PROXY) return { docId: target._d, index: target._i };
+      if (prop === LAZY_PROXY) return target._m || (target._m = { docId: target._d, index: target._i });
       if (prop === 'length') return target._l;
       if (prop === Symbol.iterator) {
         const t = target; // single capture instead of 7 locals
@@ -568,7 +579,7 @@ export async function init(options?: {
   const docObjHandler: ProxyHandler<any> = {
     get(target, prop, _receiver) {
       if (prop === 'free' || prop === Symbol.dispose) return target._f;
-      if (prop === LAZY_PROXY) return { docId: target._d, index: target._i };
+      if (prop === LAZY_PROXY) return target._m || (target._m = { docId: target._d, index: target._i });
       if (typeof prop !== 'string') return prop === Symbol.toStringTag ? "Object" : undefined;
       if (!target._c) target._c = Object.create(null);
       if (prop in target._c) return target._c[prop];
@@ -793,6 +804,28 @@ export async function init(options?: {
       }
 
       return invalidResult();
+    },
+
+    deepCompare(a: unknown, b: unknown, options?: { ignoreKeyOrder?: boolean }): boolean {
+      const ordered = (options?.ignoreKeyOrder === false) ? 1 : 0;
+
+      // Fast path: both are VJ proxies → WASM tape comparison.
+      // Single [LAZY_PROXY] access per arg (1 Proxy get trap) instead of
+      // isLazyProxy + [LAZY_PROXY] (has trap + get trap + object allocation × 2).
+      if (a !== null && typeof a === "object" && b !== null && typeof b === "object") {
+        try {
+          const metaA = (a as any)[LAZY_PROXY] as { docId: number; index: number } | undefined;
+          const metaB = (b as any)[LAZY_PROXY] as { docId: number; index: number } | undefined;
+          if (metaA && metaB) {
+            const result = engine.doc_deep_equal(metaA.docId, metaA.index, metaB.docId, metaB.index, ordered);
+            if (result >= 0) return result === 1;
+            // fallthrough on error (-1 = invalid doc_id)
+          }
+        } catch { /* not a proxy, fall through */ }
+      }
+
+      // Fallback: materialize and compare with JSON round-trip
+      return JSON.stringify(a) === JSON.stringify(b);
     },
 
     materialize(value: unknown): unknown {

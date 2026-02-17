@@ -332,6 +332,31 @@ parser.on('tool_calls[*]', ToolCall, (event) => {
 
 Schema-agnostic: any object with `{ safeParse(v) → { success: boolean; data?: T } }` works.
 
+### Deep compare — compare JSON without materializing
+
+Compare two parsed values directly in WASM memory. Returns a boolean — no JS objects allocated, no Proxy traps fired. Useful for diffing LLM outputs, caching, or deduplication:
+
+```js
+const a = vj.parse('{"name":"Alice","age":30}').value;
+const b = vj.parse('{"age":30,"name":"Alice"}').value;
+
+vj.deepCompare(a, b);                          // true — key order ignored by default
+vj.deepCompare(a, b, { ignoreKeyOrder: false }); // false — keys must be in same order
+```
+
+By default, `deepCompare` ignores key order — `{"a":1,"b":2}` equals `{"b":2,"a":1}`, just like `fast-deep-equal`. Set `{ ignoreKeyOrder: false }` for strict key order comparison, which is ~2× faster when you know both values come from the same source.
+
+```
+bun --expose-gc bench/deep-compare.mjs
+
+  Equal objects (560 KB):
+  JS deepEqual (recursive)       1.0K ops/s    heap Δ  8.9 MB
+  VJ ignore key order (default)  2.1K ops/s    heap Δ  0.1 MB    2× faster
+  VJ strict key order            4.8K ops/s    heap Δ  0.2 MB    5× faster
+```
+
+Works with any combination: two VJ proxies (fast WASM path), plain JS objects, or mixed (falls back to `JSON.stringify` comparison).
+
 ### Lazy access — only materialize what you touch
 
 `vj.parse()` returns a lazy Proxy backed by the WASM tape. Fields are only materialized into JS objects when you access them. On a 2 MB payload, reading one field is 2× faster than `JSON.parse` because the other 99% is never allocated:
@@ -491,6 +516,22 @@ interface RootEvent {
 }
 ```
 
+### `vj.deepCompare(a, b, options?): boolean`
+
+Compare two values for deep equality without materializing JS objects. When both values are VJ proxies, comparison runs entirely in WASM memory — zero allocations, zero Proxy traps.
+
+```ts
+deepCompare(
+  a: unknown,
+  b: unknown,
+  options?: { ignoreKeyOrder?: boolean }  // default: true
+): boolean
+```
+
+- **`ignoreKeyOrder: true`** (default) — `{"a":1,"b":2}` equals `{"b":2,"a":1}`. Same semantics as `fast-deep-equal`.
+- **`ignoreKeyOrder: false`** — keys must appear in the same order. ~2× faster for same-source comparisons.
+- Falls back to `JSON.stringify` comparison when either value is a plain JS object.
+
 ### `vj.materialize(value): unknown`
 
 Convert a lazy Proxy into a plain JS object tree. No-op on plain values.
@@ -563,6 +604,7 @@ To reproduce benchmarks:
 bun --expose-gc bench/parse-stream.mjs           # one-shot + streaming parse
 cd bench/ai-parsers && bun install && bun --expose-gc bench.mjs  # AI SDK comparison
 bun run bench:worker                             # Worker transfer vs structured clone benchmark
+node --expose-gc bench/deep-compare.mjs          # deep compare: VJ vs JS deepEqual
 ```
 
 Benchmark numbers in this README were measured on GitHub Actions (Ubuntu, x86_64). Results vary by machine but relative speedups are consistent.
