@@ -691,12 +691,51 @@ interface RootEvent {
 | | `createParser` | `createEventParser` |
 |---|---|---|
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
+| **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
 | **Schema auto-pick** | Yes — schema `.shape` drives field selection | No — use `skip()` and `on()` for filtering |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
 | **`for await` with source** | Yes | Yes |
 | **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |
 | **Multi-root / NDJSON** | No | Yes (`multiRoot: true`) |
 | **Text callbacks** | No | `onText()` for non-JSON text |
+
+**`createParser` stops at the first complete value** — you check the status and break:
+
+```js
+const parser = createParser();
+for await (const chunk of stream) {
+  const status = parser.feed(chunk);
+  if (status === "complete") break;  // done — one JSON value parsed
+}
+const result = parser.getValue();
+parser.destroy();
+```
+
+**`createEventParser` never stops on its own** — it keeps consuming input, firing callbacks as fields complete. This makes it ideal for long-running streams, NDJSON, or reacting to fields the moment they appear:
+
+```js
+const parser = createEventParser();
+parser.on('name', (e) => console.log('got name:', e.value));  // fires per root
+
+for await (const chunk of stream) {
+  parser.feed(chunk);  // never returns "complete" — keeps scanning
+}
+parser.destroy();  // you decide when to stop
+```
+
+With `multiRoot: true`, the event parser auto-resets between values and fires `onRoot` for each:
+
+```js
+const parser = createEventParser({ multiRoot: true, onRoot: (e) => {
+  console.log(`Root #${e.index}:`, e.value);  // fires for each JSON value
+}});
+
+// NDJSON: {"a":1}\n{"a":2}\n{"a":3}
+for await (const chunk of ndjsonStream) {
+  parser.feed(chunk);  // processes all three values
+}
+parser.destroy();
+```
 
 ### `deepCompare(a, b, options?): boolean`
 
