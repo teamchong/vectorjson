@@ -644,6 +644,13 @@ node --expose-gc bench/deep-compare.mjs          # deep compare: VJ vs JS deepEq
 
 Benchmark numbers in this README were measured on GitHub Actions (Ubuntu, x86_64). Results vary by machine but relative speedups are consistent.
 
+## Acknowledgments
+
+VectorJSON is built on the work of:
+
+- **[zimdjson](https://github.com/EzequielRamis/zimdjson)** by Ezequiel Ramis — a Zig port of simdjson that powers the WASM engine
+- **[simdjson](https://simdjson.org/)** by Daniel Lemire & Geoff Langdale — the SIMD-accelerated JSON parsing research that started it all
+
 ## License
 
 Apache-2.0
