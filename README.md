@@ -693,7 +693,7 @@ interface RootEvent {
 | | `createParser` | `createEventParser` |
 |---|---|---|
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
-| **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — parses multiple JSON values in one stream |
+| **On complete** | Stops — `feed()` returns `"complete"` | Never stops — user calls `destroy()` when done |
 | **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
 | **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | Yes — same schema support, plus `skip()` and `on()` |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
@@ -715,7 +715,7 @@ const result = parser.getValue();
 parser.destroy();
 ```
 
-**`createEventParser` keeps going** — it doesn't stop after one JSON value because it's designed to handle an entire LLM response that mixes text, thinking, and multiple JSON values:
+**`createEventParser` never stops** — you feed it data and call `destroy()` when you're done. This lets it handle an entire LLM response that mixes text, thinking, and multiple JSON values:
 
 ```js
 const parser = createEventParser({ multiRoot: true, onRoot: (e) => {
