@@ -617,6 +617,8 @@ createEventParser({ multiRoot: true, onRoot });   // NDJSON
   multiRoot?: boolean;   // auto-reset between JSON values (NDJSON)
   onRoot?: (event: RootEvent) => void;
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+  schema?: ZodLike<T>;   // only parse schema fields (same as createParser)
+  pick?: string[];       // advanced: explicit field paths (overrides schema)
 }
 ```
 
@@ -693,7 +695,7 @@ interface RootEvent {
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
 | **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
 | **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
-| **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | No — use `skip()` and `on()` to filter manually |
+| **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | Yes — same schema support, plus `skip()` and `on()` |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
 | **`for await` with source** | Yes | Yes |
 | **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |

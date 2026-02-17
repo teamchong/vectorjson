@@ -604,6 +604,85 @@ await testAsync("createEventParser no source: asyncIterator throws", async () =>
   p.destroy();
 });
 
+// ── 16. createEventParser with schema — only parse schema fields ──
+
+test("createEventParser schema: only schema fields in getValue()", () => {
+  const p = createEventParser({ schema: {
+    shape: { name: {}, age: {} },
+    safeParse(v) { return { success: true, data: v }; }
+  }});
+  parsersToClean.push(p);
+  p.feed('{"name":"Alice","age":30,"email":"skip@me.com","bio":"long text"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice", age: 30 });
+  p.destroy();
+});
+
+test("createEventParser schema: array transparency", () => {
+  const p = createEventParser({ schema: {
+    shape: { users: { shape: { name: {} } } },
+    safeParse(v) { return { success: true, data: v }; }
+  }});
+  parsersToClean.push(p);
+  p.feed('{"users":[{"name":"Alice","role":"admin"},{"name":"Bob","role":"user"}],"extra":"data"}');
+  const val = p.getValue();
+  assertEqual(val, { users: [{ name: "Alice" }, { name: "Bob" }] });
+  p.destroy();
+});
+
+test("createEventParser schema: nested fields", () => {
+  const p = createEventParser({ schema: {
+    shape: { user: { shape: { name: {}, age: {} } } },
+    safeParse(v) { return { success: true, data: v }; }
+  }});
+  parsersToClean.push(p);
+  p.feed('{"user":{"name":"Bob","age":25,"role":"admin"},"meta":{"v":1}}');
+  const val = p.getValue();
+  assertEqual(val, { user: { name: "Bob", age: 25 } });
+  p.destroy();
+});
+
+test("createEventParser pick: explicit pick paths", () => {
+  const p = createEventParser({ pick: ["name", "age"] });
+  parsersToClean.push(p);
+  p.feed('{"name":"Alice","age":30,"email":"skip@me.com"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice", age: 30 });
+  p.destroy();
+});
+
+test("createEventParser schema: events still fire for picked fields", () => {
+  const p = createEventParser({ schema: {
+    shape: { name: {}, age: {} },
+    safeParse(v) { return { success: true, data: v }; }
+  }});
+  parsersToClean.push(p);
+  const values = [];
+  p.on('name', (e) => values.push(e.value));
+  p.feed('{"name":"Alice","age":30,"email":"skip"}');
+  assertEqual(values, ["Alice"]);
+  p.destroy();
+});
+
+await testAsync("createEventParser schema + source: for-await only yields schema fields", async () => {
+  const chunks = ['{"name":"A', 'lice","age":30,', '"email":"skip","bio":"long"}'];
+  async function* makeSource() {
+    for (const c of chunks) yield c;
+  }
+  const p = createEventParser({ schema: {
+    shape: { name: {}, age: {} },
+    safeParse(v) { return { success: true, data: v }; }
+  }, source: makeSource() });
+  parsersToClean.push(p);
+  const partials = [];
+  for await (const partial of p) {
+    partials.push(JSON.parse(JSON.stringify(partial)));
+  }
+  const last = partials[partials.length - 1];
+  assertEqual(last, { name: "Alice", age: 30 });
+  assert(last.email === undefined, "email should not be present");
+});
+
 // ── Results ──
 console.log(`\n\u2728 Pick Fields Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

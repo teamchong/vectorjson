@@ -1043,10 +1043,20 @@ export async function init(options?: {
       multiRoot?: boolean;
       onRoot?: (event: RootEvent) => void;
       source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+      schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
+      pick?: string[];
     }): EventParser {
       const multiRoot = options?.multiRoot ?? false;
       const onRootCb = options?.onRoot;
       const source = options?.source;
+
+      // Schema-driven field selection (same as createParser)
+      let epPickPaths: PathSegment[][] | null = null;
+      if (options?.pick) {
+        epPickPaths = options.pick.map(compilePath);
+      } else if (options?.schema) {
+        epPickPaths = extractSchemaKeys(options.schema);
+      }
 
       const streamId = engine.stream_create();
       if (streamId < 0) {
@@ -1165,7 +1175,33 @@ export async function init(options?: {
       }
 
       function isPathSkipped(): boolean {
-        return skipPatterns.length > 0 && skipPatterns.some(p => matchPath(p, false) !== null);
+        if (skipPatterns.length > 0 && skipPatterns.some(p => matchPath(p, false) !== null)) return true;
+        if (epPickPaths && !epIsFieldPicked()) return true;
+        return false;
+      }
+
+      /** Check if current path matches any pick path (array-transparent). */
+      function epIsFieldPicked(): boolean {
+        if (!epPickPaths) return true;
+        // Build effective key path (skip array levels)
+        const effective: string[] = [];
+        for (let i = 0; i < ptDepth; i++) {
+          if (ptKeyStack[i] !== null) effective.push(ptKeyStack[i]!);
+        }
+        for (const pick of epPickPaths) {
+          const pickLen = pick.length;
+          const effLen = effective.length;
+          const compareLen = Math.min(effLen, pickLen);
+          let matched = true;
+          for (let i = 0; i < compareLen; i++) {
+            const seg = pick[i];
+            if (seg === '*') continue;
+            if (typeof seg === 'number') continue;
+            if (effective[i] !== seg) { matched = false; break; }
+          }
+          if (matched) return true;
+        }
+        return false;
       }
 
       function fireValueComplete(valueBytes: Uint8Array, offset: number, length: number) {
@@ -1316,10 +1352,12 @@ export async function init(options?: {
               if (ptSkipDepth < 0 && isPathSkipped()) {
                 ptSkipDepth = ptDepth - 1;
               }
-              // Live doc: create object and push to stack
-              const obj: Record<string, unknown> = {};
-              ldSetValue(obj);
-              ldStack.push(obj);
+              // Live doc: create object and push to stack (only if not skipped)
+              if (ptSkipDepth < 0) {
+                const obj: Record<string, unknown> = {};
+                ldSetValue(obj);
+                ldStack.push(obj);
+              }
               break;
             }
             case 0x5B: { // [
@@ -1333,10 +1371,12 @@ export async function init(options?: {
               if (ptSkipDepth < 0 && isPathSkipped()) {
                 ptSkipDepth = ptDepth - 1;
               }
-              // Live doc: create array and push to stack
-              const arr: unknown[] = [];
-              ldSetValue(arr);
-              ldStack.push(arr);
+              // Live doc: create array and push to stack (only if not skipped)
+              if (ptSkipDepth < 0) {
+                const arr: unknown[] = [];
+                ldSetValue(arr);
+                ldStack.push(arr);
+              }
               break;
             }
             case 0x7D: // }
@@ -1359,7 +1399,9 @@ export async function init(options?: {
                 ptAfterColon = false;
               }
               // Live doc: pop container from stack
-              ldStack.pop();
+              if (ptSkipDepth < 0) {
+                ldStack.pop();
+              }
               break;
             }
             case 0x22: { // opening quote
@@ -1388,8 +1430,14 @@ export async function init(options?: {
             case 0x3A: { // colon
               ptExpectingKey = false;
               ptAfterColon = true;
-              // Live doc: set null placeholder for pending key
-              if (ldCurrentKey !== null && ldStack.length > 0) {
+              // Check pick filter after key is stored
+              if (epPickPaths && ptSkipDepth < 0 && !epIsFieldPicked()) {
+                ptSkipDepth = ptDepth - 1;
+                ldCurrentKey = null;
+                break;
+              }
+              // Live doc: pre-set null for pending key (overwritten when real value arrives)
+              if (ptSkipDepth < 0 && ldCurrentKey !== null && ldStack.length > 0) {
                 const parent = ldStack[ldStack.length - 1];
                 if (!Array.isArray(parent)) {
                   (parent as Record<string, unknown>)[ldCurrentKey] = null;
@@ -1399,6 +1447,10 @@ export async function init(options?: {
               break;
             }
             case 0x2C: { // comma
+              // Reset pick-based skip at comma boundary
+              if (epPickPaths && ptSkipDepth >= 0 && ptDepth - 1 <= ptSkipDepth) {
+                ptSkipDepth = -1;
+              }
               // In array: increment index
               if (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a') {
                 const idx = ptIndexStack[ptDepth - 1];
@@ -1632,7 +1684,10 @@ export async function init(options?: {
             return value;
           }
 
-          // complete or end_early — do a final WASM parse for correctness
+          // complete or end_early
+          // When pick paths are active, return the filtered live doc
+          if (epPickPaths) return ldRoot;
+          // Otherwise, do a final WASM parse for correctness
           const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
           const valueLen = engine.stream_get_value_len(streamId);
           new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
