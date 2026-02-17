@@ -692,6 +692,7 @@ interface RootEvent {
 |---|---|---|
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
 | **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
+| **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
 | **Schema auto-pick** | Yes — schema `.shape` drives field selection | No — use `skip()` and `on()` for filtering |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
 | **`for await` with source** | Yes | Yes |
@@ -699,13 +700,14 @@ interface RootEvent {
 | **Multi-root / NDJSON** | No | Yes (`multiRoot: true`) |
 | **Text callbacks** | No | `onText()` for non-JSON text |
 
-**`createParser` stops at the first complete value** — you check the status and break:
+**`createParser` stops at the first complete value** and detects errors — you check the status and react:
 
 ```js
 const parser = createParser();
 for await (const chunk of stream) {
   const status = parser.feed(chunk);
   if (status === "complete") break;  // done — one JSON value parsed
+  if (status === "error") break;     // malformed JSON detected
 }
 const result = parser.getValue();
 parser.destroy();
