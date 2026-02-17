@@ -715,32 +715,28 @@ const result = parser.getValue();
 parser.destroy();
 ```
 
-**`createEventParser` keeps going** — it doesn't stop after one JSON value because it's designed to parse multiple values in one stream (NDJSON, multiple tool calls, SSE events):
+**`createEventParser` keeps going** — it doesn't stop after one JSON value because it's designed to handle an entire LLM response that mixes text, thinking, and multiple JSON values:
 
 ```js
 const parser = createEventParser({ multiRoot: true, onRoot: (e) => {
-  console.log(`Root #${e.index}:`, e.value);  // fires for each JSON value
+  console.log(`Root #${e.index}:`, e.value);
 }});
+parser.onText((text) => thinkingPanel.append(text));
 
-// Stream contains multiple JSON values:
-// {"name":"Alice"}\n{"name":"Bob"}\n{"name":"Charlie"}
-for await (const chunk of stream) {
-  parser.feed(chunk);  // parses all three values, fires onRoot for each
+// A single LLM response can contain all of this:
+// <think>let me reason about this...</think>
+// {"tool":"search","query":"weather"}
+// Here are the results:
+// ```json
+// {"tool":"answer","text":"It's sunny"}
+// ```
+for await (const chunk of llmStream) {
+  parser.feed(chunk);  // handles all of it — text, think tags, code fences, multiple JSON values
 }
 parser.destroy();
 ```
 
-Use `on()` to react to fields across all values in the stream:
-
-```js
-const parser = createEventParser({ multiRoot: true });
-parser.on('name', (e) => console.log('got name:', e.value));  // fires for every root
-
-for await (const chunk of ndjsonStream) {
-  parser.feed(chunk);
-}
-parser.destroy();
-```
+The seeker strips non-JSON content (think tags, code fences, prose), `onText()` captures it, and `multiRoot` parses every JSON value in the stream — no matter what format the LLM wraps them in.
 
 ### `deepCompare(a, b, options?): boolean`
 
