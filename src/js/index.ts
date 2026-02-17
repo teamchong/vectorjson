@@ -133,6 +133,8 @@ export interface EventParser {
   /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
   getRawBuffer(): ArrayBuffer | null;
   destroy(): void;
+  /** Async iteration over partial values when a source was provided. */
+  [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined>;
 }
 
 export interface VectorJSON {
@@ -716,12 +718,147 @@ export async function init(options?: {
     return typeof s?.getReader === 'function';
   }
 
+  // --- JSON Seeker Factory ---
+  // Extracts a reusable state machine that skips non-JSON text (think tags, code fences, prose)
+  // to find the start of JSON content. Used by both createEventParser and createParser.
+  function createSeeker(textCallbacks?: ((text: string) => void)[]) {
+    const SEEKING = 0, IN_THINK = 1, IN_FENCE = 2, FEEDING = 3;
+    let state = SEEKING;
+    let buf = '';
+    let fenceBacktickCount = 0;
+
+    return {
+      feed(text: string): string | null {
+        if (state === FEEDING) return text;
+
+        const cbs = textCallbacks ?? [];
+        let result = '';
+        let i = 0;
+
+        while (i < text.length) {
+          if (state === FEEDING) {
+            result += text.slice(i);
+            break;
+          }
+
+          if (state === IN_THINK) {
+            const closeIdx = text.indexOf('</think>', i);
+            if (closeIdx === -1) {
+              const captured = text.slice(i);
+              for (const cb of cbs) cb(captured);
+              i = text.length;
+            } else {
+              const captured = text.slice(i, closeIdx);
+              if (captured) for (const cb of cbs) cb(captured);
+              i = closeIdx + '</think>'.length;
+              state = SEEKING;
+              buf = '';
+            }
+            continue;
+          }
+
+          if (state === IN_FENCE) {
+            const closeFence = '`'.repeat(fenceBacktickCount);
+            const closeIdx = text.indexOf(closeFence, i);
+            if (closeIdx === -1) {
+              result += text.slice(i);
+              i = text.length;
+            } else {
+              result += text.slice(i, closeIdx);
+              i = closeIdx + fenceBacktickCount;
+              fenceBacktickCount = 0;
+              state = SEEKING;
+              buf = '';
+            }
+            continue;
+          }
+
+          // SEEKING state
+          const ch = text[i];
+
+          if (ch === '{' || ch === '[' || ch === '"') {
+            if (buf) {
+              for (const cb of cbs) cb(buf);
+              buf = '';
+            }
+            state = FEEDING;
+            result += text.slice(i);
+            break;
+          }
+
+          // Check for <think> tag
+          buf += ch;
+          if (buf.endsWith('<think>')) {
+            const beforeTag = buf.slice(0, -'<think>'.length);
+            if (beforeTag) for (const cb of cbs) cb(beforeTag);
+            state = IN_THINK;
+            buf = '';
+            i++;
+            continue;
+          }
+
+          // Check for code fence (``` with optional label)
+          if (ch === '`') {
+            let btCount = 0;
+            let j = i;
+            while (j < text.length && text[j] === '`') { btCount++; j++; }
+            if (btCount >= 3) {
+              while (j < text.length && text[j] !== '\n') j++;
+              if (j < text.length) j++;
+              fenceBacktickCount = btCount;
+              state = IN_FENCE;
+              const beforeFence = buf.slice(0, -1);
+              if (beforeFence) for (const cb of cbs) cb(beforeFence);
+              buf = '';
+              i = j;
+              continue;
+            }
+          }
+
+          i++;
+
+          if (buf.length > 1024) {
+            for (const cb of cbs) cb(buf);
+            buf = '';
+          }
+        }
+
+        if (result.length > 0) return result;
+        return null;
+      },
+      reset() { state = SEEKING; buf = ''; fenceBacktickCount = 0; },
+      isFeeding() { return state === FEEDING; },
+    };
+  }
+
   // --- Path Pattern Compiler ---
   // Segments: string = key, number = index, '*' = wildcard
 
   function compilePath(pattern: string): PathSegment[] {
     return pattern.replace(/\[(\*|\d+)\]/g, '.$1').split('.').filter(Boolean)
       .map(s => s === '*' ? '*' : /^\d+$/.test(s) ? +s : s);
+  }
+
+  /** Extract top-level keys from a Zod-like schema and return as compiled pick paths.
+   *  Supports Zod (.shape), Valibot (.entries), ArkType (.props).
+   *  Recursively extracts nested object keys for nested pick paths.
+   *  Returns null if schema shape can't be detected (no auto-pick). */
+  function extractSchemaKeys(schema: any, prefix: string[] = []): PathSegment[][] | null {
+    const shape = schema?.shape ?? schema?._def?.shape?.() ?? schema?.entries ?? schema?.props;
+    if (!shape || typeof shape !== 'object') return null;
+    const paths: PathSegment[][] = [];
+    for (const key of Object.keys(shape)) {
+      const fullPath = [...prefix, key];
+      // Check if this field's schema has nested shape (nested object)
+      const fieldSchema = shape[key];
+      const nested = extractSchemaKeys(fieldSchema, fullPath);
+      if (nested && nested.length > 0) {
+        paths.push(...nested);
+      } else {
+        paths.push(fullPath.map(s => /^\d+$/.test(s) ? +s : s));
+      }
+    }
+    return paths.length > 0 ? paths : null;
   }
 
   function buildResolvedPath(keyStack: (string | null)[], indexStack: (number | null)[], depth: number): string {
@@ -905,9 +1042,11 @@ export async function init(options?: {
     createEventParser(options?: {
       multiRoot?: boolean;
       onRoot?: (event: RootEvent) => void;
+      source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
     }): EventParser {
       const multiRoot = options?.multiRoot ?? false;
       const onRootCb = options?.onRoot;
+      const source = options?.source;
 
       const streamId = engine.stream_create();
       if (streamId < 0) {
@@ -924,120 +1063,8 @@ export async function init(options?: {
       const skipPatterns: PathSegment[][] = [];
       const textCallbacks: ((text: string) => void)[] = [];
 
-      // --- JSON Seeker state ---
-      const SEEKER_SEEKING = 0, SEEKER_IN_THINK = 1, SEEKER_IN_FENCE = 2, SEEKER_FEEDING = 3;
-      let seekerState = SEEKER_SEEKING;
-      let seekerBuf = ''; // accumulates non-JSON text for seeking
-      let fenceBacktickCount = 0;
-
-      function seekerFeed(text: string): string | null {
-        // In FEEDING state, pass through directly
-        if (seekerState === SEEKER_FEEDING) return text;
-
-        let result = '';
-        let i = 0;
-
-        while (i < text.length) {
-          if (seekerState === SEEKER_FEEDING) {
-            result += text.slice(i);
-            break;
-          }
-
-          if (seekerState === SEEKER_IN_THINK) {
-            const closeIdx = text.indexOf('</think>', i);
-            if (closeIdx === -1) {
-              const captured = text.slice(i);
-              for (const cb of textCallbacks) cb(captured);
-              i = text.length;
-            } else {
-              const captured = text.slice(i, closeIdx);
-              if (captured) for (const cb of textCallbacks) cb(captured);
-              i = closeIdx + '</think>'.length;
-              seekerState = SEEKER_SEEKING;
-              seekerBuf = '';
-            }
-            continue;
-          }
-
-          if (seekerState === SEEKER_IN_FENCE) {
-            // Look for closing fence
-            const closeFence = '`'.repeat(fenceBacktickCount);
-            const closeIdx = text.indexOf(closeFence, i);
-            if (closeIdx === -1) {
-              result += text.slice(i);
-              i = text.length;
-            } else {
-              result += text.slice(i, closeIdx);
-              i = closeIdx + fenceBacktickCount;
-              fenceBacktickCount = 0;
-              seekerState = SEEKER_SEEKING;
-              seekerBuf = '';
-            }
-            continue;
-          }
-
-          // SEEKING state
-          const ch = text[i];
-
-          // Definitive JSON start characters → switch to FEEDING
-          // Only { [ " are reliable indicators — bare keywords (t/f/n) and
-          // digits can appear in prose, so we only treat them as JSON start
-          // if they're not part of other content.
-          if (ch === '{' || ch === '[' || ch === '"') {
-            // Flush remaining seeker buf as text
-            if (seekerBuf) {
-              for (const cb of textCallbacks) cb(seekerBuf);
-              seekerBuf = '';
-            }
-            seekerState = SEEKER_FEEDING;
-            result += text.slice(i);
-            break;
-          }
-
-          // Check for <think> tag
-          seekerBuf += ch;
-          if (seekerBuf.endsWith('<think>')) {
-            const beforeTag = seekerBuf.slice(0, -'<think>'.length);
-            if (beforeTag) for (const cb of textCallbacks) cb(beforeTag);
-            seekerState = SEEKER_IN_THINK;
-            seekerBuf = '';
-            i++;
-            continue;
-          }
-
-          // Check for code fence (``` with optional label)
-          if (ch === '`') {
-            // Count consecutive backticks
-            let btCount = 0;
-            let j = i;
-            while (j < text.length && text[j] === '`') { btCount++; j++; }
-            if (btCount >= 3) {
-              // Skip label (e.g., "json") until newline
-              while (j < text.length && text[j] !== '\n') j++;
-              if (j < text.length) j++; // skip the newline
-              fenceBacktickCount = btCount;
-              seekerState = SEEKER_IN_FENCE;
-              const beforeFence = seekerBuf.slice(0, -1); // remove only the 1 backtick appended to seekerBuf
-              if (beforeFence) for (const cb of textCallbacks) cb(beforeFence);
-              seekerBuf = '';
-              i = j;
-              continue;
-            }
-          }
-
-          // Whitespace and other non-JSON chars — keep seeking
-          i++;
-
-          // Flush accumulated non-JSON text periodically
-          if (seekerBuf.length > 1024) {
-            for (const cb of textCallbacks) cb(seekerBuf);
-            seekerBuf = '';
-          }
-        }
-
-        if (result.length > 0) return result;
-        return null;
-      }
+      // --- JSON Seeker (reusable factory) ---
+      const seeker = createSeeker(textCallbacks);
 
       // --- PathTracker state ---
       let ptDepth = 0;
@@ -1489,14 +1516,14 @@ export async function init(options?: {
           // Run through JSON seeker first
           let jsonContent: string | Uint8Array | null;
           if (typeof chunk === 'string') {
-            jsonContent = seekerFeed(chunk);
+            jsonContent = seeker.feed(chunk);
             if (jsonContent === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-          } else if (seekerState === SEEKER_FEEDING) {
+          } else if (seeker.isFeeding()) {
             // Fast path: skip string conversion when seeker is already feeding JSON
             jsonContent = chunk;
           } else {
             const str = utf8Decoder.decode(chunk);
-            const result = seekerFeed(str);
+            const result = seeker.feed(str);
             if (result === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
             jsonContent = encoder.encode(result);
           }
@@ -1651,6 +1678,55 @@ export async function init(options?: {
             destroyed = true;
           }
         },
+
+        [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined> {
+          if (!source) throw new Error("No source provided — use feed() for push-based parsing");
+          const ep = this;
+          const reader = isReadableStream(source) ? source.getReader() : null;
+          const iter = reader ? null : (source as AsyncIterable<any>)[Symbol.asyncIterator]();
+          let finished = false;
+
+          return {
+            async next() {
+              if (finished) {
+                ep.destroy();
+                return { done: true as const, value: undefined };
+              }
+
+              const result = reader
+                ? await reader.read()
+                : await iter!.next();
+
+              if (result.done || !result.value) {
+                finished = true;
+                ep.destroy();
+                return { done: true as const, value: undefined };
+              }
+
+              const status = ep.feed(result.value);
+              const partial = ep.getValue();
+
+              if (status === "complete" || status === "end_early") {
+                finished = true;
+                return { done: false, value: partial };
+              }
+              if (status === "error") {
+                finished = true;
+                ep.destroy();
+                throw new SyntaxError("VectorJSON: Parse error in stream");
+              }
+
+              return { done: false, value: partial };
+            },
+            async return() {
+              finished = true;
+              ep.destroy();
+              if (reader) reader.cancel();
+              return { done: true as const, value: undefined };
+            },
+            [Symbol.asyncIterator]() { return this; },
+          };
+        },
       };
 
       return self;
@@ -1665,12 +1741,22 @@ export async function init(options?: {
       if (arg && typeof arg === 'object' && 'safeParse' in arg && !('pick' in arg) && !('source' in arg) && !('schema' in arg)) {
         // Legacy: createParser(zodSchema)
         schema = arg;
+        // Auto-derive pick paths from schema shape (Zod, Valibot, ArkType)
+        pickPaths = extractSchemaKeys(arg);
       } else if (arg && typeof arg === 'object' && ('pick' in arg || 'source' in arg || 'schema' in arg)) {
         // New: createParser({ pick, schema, source })
         schema = arg.schema;
         source = arg.source;
-        if (arg.pick) pickPaths = arg.pick.map(compilePath);
+        if (arg.pick) {
+          pickPaths = arg.pick.map(compilePath);
+        } else if (arg.schema) {
+          // Auto-derive pick paths from schema when no explicit pick
+          pickPaths = extractSchemaKeys(arg.schema);
+        }
       }
+      // Seeker: skip junk text when schema is provided (dirty input handling)
+      const cpSeeker = schema ? createSeeker() : null;
+
       const streamId = engine.stream_create();
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
@@ -1707,24 +1793,25 @@ export async function init(options?: {
       let spSkipDepth = -1;
 
       /** Check if the current path (from spKeyStack + scanDepth) matches any pick path.
-       *  Returns true if current path is an ancestor, descendant, or exact match. */
+       *  Returns true if current path is an ancestor, descendant, or exact match.
+       *  Array levels (null entries in spKeyStack) are transparent — skipped during comparison. */
       function isFieldPicked(): boolean {
         if (!pickPaths) return true;
+        // Build effective key path (skip null = array levels)
+        const effective: string[] = [];
+        for (let i = 0; i < scanDepth; i++) {
+          if (spKeyStack[i] !== null) effective.push(spKeyStack[i]!);
+        }
         for (const pick of pickPaths) {
-          // Compare each segment of the pick path against current path
-          const currentDepth = scanDepth;
           const pickLen = pick.length;
-          const compareLen = Math.min(currentDepth, pickLen);
+          const effLen = effective.length;
+          const compareLen = Math.min(effLen, pickLen);
           let matched = true;
           for (let i = 0; i < compareLen; i++) {
             const seg = pick[i];
-            const key = spKeyStack[i];
             if (seg === '*') continue; // wildcard matches anything
-            if (typeof seg === 'number') {
-              // Index matching — not tracked in spKeyStack for pick (only object keys matter)
-              continue;
-            }
-            if (key !== seg) { matched = false; break; }
+            if (typeof seg === 'number') continue; // index matching — arrays are transparent
+            if (effective[i] !== seg) { matched = false; break; }
           }
           if (matched) return true; // ancestor, descendant, or exact match
         }
@@ -1843,9 +1930,14 @@ export async function init(options?: {
             }
             case 0x7D: case 0x5D: {
               scanDepth--;
-              if (spSkipDepth >= 0 && scanDepth <= spSkipDepth) {
-                spSkipDepth = -1;
-              } else if (spSkipDepth < 0) {
+              if (spSkipDepth >= 0) {
+                if (scanDepth <= spSkipDepth) {
+                  spSkipDepth = -1;
+                  // Container was opened before skip started — pop it
+                  ldStack.pop();
+                }
+                // else: still inside skipped region, container wasn't pushed
+              } else {
                 ldStack.pop();
               }
               if (scanDepth > 0) {
@@ -1967,6 +2059,13 @@ export async function init(options?: {
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
           if (destroyed) throw new Error("Parser already destroyed");
+          // Run through seeker to skip non-JSON junk (when schema is set)
+          if (cpSeeker) {
+            const text = typeof chunk === 'string' ? chunk : utf8Decoder.decode(chunk);
+            const jsonContent = cpSeeker.feed(text);
+            if (jsonContent === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
+            chunk = jsonContent;
+          }
           const chunkLen = typeof chunk === "string" ? chunk.length : chunk.byteLength;
           if (chunkLen === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
           const { ptr, len } = writeToWasm(chunk, feedBuf, 0, 4096);

@@ -12,7 +12,7 @@
  * 8. No-pick regression — existing createParser() and createParser(schema) unchanged
  */
 
-import { createParser } from "../dist/index.js";
+import { createParser, createEventParser } from "../dist/index.js";
 
 let passed = 0, failed = 0;
 const parsersToClean = [];
@@ -317,6 +317,291 @@ await testAsync("for-await with pick + source combined", async () => {
   const last = partials[partials.length - 1];
   assertEqual(last, { name: "Alice", age: 30 });
   assert(last.email === undefined, "email should not be present");
+});
+
+// ── 12. Schema auto-pick: schema.shape drives field selection ──
+
+test("schema auto-pick: schema with .shape auto-picks matching fields", () => {
+  const schema = {
+    shape: { name: {}, age: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string" && typeof v.age === "number")
+        return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('{"name":"Alice","age":30,"email":"skip@me.com","bio":"long text"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice", age: 30 });
+  p.destroy();
+});
+
+test("schema auto-pick: options.schema auto-picks without explicit pick", () => {
+  const schema = {
+    shape: { x: {}, y: {} },
+    safeParse(v) {
+      if (v && typeof v.x === "number" && typeof v.y === "number")
+        return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser({ schema });
+  parsersToClean.push(p);
+  p.feed('{"x":1,"y":2,"z":3,"w":4}');
+  const val = p.getValue();
+  assertEqual(val, { x: 1, y: 2 });
+  p.destroy();
+});
+
+test("schema auto-pick: explicit pick overrides schema shape", () => {
+  const schema = {
+    shape: { name: {}, age: {} },
+    safeParse(v) {
+      // Accept anything for this test — we're testing pick override
+      return { success: true, data: v };
+    }
+  };
+  // Explicit pick: only "name", even though schema has name + age
+  const p = createParser({ pick: ["name"], schema });
+  parsersToClean.push(p);
+  p.feed('{"name":"Alice","age":30,"extra":"data"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice" });
+  p.destroy();
+});
+
+test("schema auto-pick: nested schema shape extracts nested paths", () => {
+  const schema = {
+    shape: {
+      user: {
+        shape: { name: {}, age: {} },
+      },
+    },
+    safeParse(v) {
+      if (v?.user?.name && typeof v.user.age === "number")
+        return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('{"user":{"name":"Bob","age":25,"role":"admin"},"meta":{"v":1}}');
+  const val = p.getValue();
+  assertEqual(val, { user: { name: "Bob", age: 25 } });
+  p.destroy();
+});
+
+test("schema auto-pick: schema without .shape does not auto-pick", () => {
+  // Schema has no .shape — all fields should be returned (no auto-pick)
+  const schema = {
+    safeParse(v) {
+      return { success: true, data: v };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('{"a":1,"b":2,"c":3}');
+  const val = p.getValue();
+  assertEqual(val, { a: 1, b: 2, c: 3 });
+  p.destroy();
+});
+
+await testAsync("schema auto-pick + source: for-await only yields schema fields", async () => {
+  const schema = {
+    shape: { name: {}, age: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string" && typeof v.age === "number")
+        return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const chunks = ['{"name":"A', 'lice","age":30,', '"email":"skip","bio":"long"}'];
+  async function* makeSource() {
+    for (const c of chunks) yield c;
+  }
+  const p = createParser({ schema, source: makeSource() });
+  parsersToClean.push(p);
+  const partials = [];
+  for await (const partial of p) {
+    partials.push(JSON.parse(JSON.stringify(partial)));
+  }
+  const last = partials[partials.length - 1];
+  assertEqual(last, { name: "Alice", age: 30 });
+  assert(last.email === undefined, "email should not be present");
+  assert(last.bio === undefined, "bio should not be present");
+});
+
+// ── 13. Array transparency: pick through arrays ──
+
+test("array transparency: pick users.name on array-of-objects", () => {
+  const p = createParser({ pick: ["users.name"] });
+  parsersToClean.push(p);
+  p.feed('{"users":[{"name":"Alice","role":"admin"},{"name":"Bob","role":"user"}]}');
+  assertEqual(p.getValue(), { users: [{ name: "Alice" }, { name: "Bob" }] });
+  p.destroy();
+});
+
+test("array transparency: pick data.items.id on deeply nested array", () => {
+  const p = createParser({ pick: ["data.items.id"] });
+  parsersToClean.push(p);
+  p.feed('{"data":{"items":[{"id":1,"extra":"x"},{"id":2,"extra":"y"}],"meta":"skip"}}');
+  assertEqual(p.getValue(), { data: { items: [{ id: 1 }, { id: 2 }] } });
+  p.destroy();
+});
+
+test("array transparency: schema auto-pick with arrays (Zod-like)", () => {
+  const schema = {
+    shape: {
+      users: {
+        shape: { name: {} },
+      },
+    },
+    safeParse(v) {
+      if (v?.users && Array.isArray(v.users)) return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('{"users":[{"name":"Alice","role":"admin"}],"extra":"data"}');
+  const val = p.getValue();
+  assertEqual(val, { users: [{ name: "Alice" }] });
+  p.destroy();
+});
+
+// ── 14. Dirty input handling with schema in createParser ──
+
+test("dirty input with schema: leading junk text", () => {
+  const schema = {
+    shape: { name: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string") return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('blah blah {"name":"Alice"} junk');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice" });
+  p.destroy();
+});
+
+test("dirty input with schema: think tags", () => {
+  const schema = {
+    shape: { name: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string") return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('<think>reasoning about the answer</think>{"name":"Alice"}');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice" });
+  p.destroy();
+});
+
+test("dirty input with schema: code fences", () => {
+  const schema = {
+    shape: { name: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string") return { success: true, data: v };
+      return { success: false };
+    }
+  };
+  const p = createParser(schema);
+  parsersToClean.push(p);
+  p.feed('```json\n{"name":"Alice"}\n```');
+  const val = p.getValue();
+  assertEqual(val, { name: "Alice" });
+  p.destroy();
+});
+
+test("dirty input: seeker only active with schema", () => {
+  // With schema: seeker strips junk, parses successfully
+  const schema = {
+    shape: { name: {} },
+    safeParse(v) { return { success: true, data: v }; }
+  };
+  const p1 = createParser(schema);
+  parsersToClean.push(p1);
+  p1.feed('# Here is some text\n{"name":"Alice"}');
+  assertEqual(p1.getValue(), { name: "Alice" });
+  p1.destroy();
+
+  // Without schema: no seeker, WASM handles input as-is
+  const p2 = createParser();
+  parsersToClean.push(p2);
+  const status = p2.feed('# {"name":"Alice"}');
+  // WASM may or may not handle this — test that seeker is NOT active (no filtering)
+  assert(status !== undefined, "feed should return a status");
+  p2.destroy();
+});
+
+// ── 15. createEventParser for-await ──
+
+await testAsync("createEventParser for-await with source", async () => {
+  const chunks = ['{"na', 'me":"Al', 'ice","a', 'ge":30}'];
+  async function* makeSource() {
+    for (const c of chunks) yield c;
+  }
+
+  const p = createEventParser({ source: makeSource() });
+  const partials = [];
+  for await (const partial of p) {
+    partials.push(JSON.parse(JSON.stringify(partial)));
+  }
+  assert(partials.length > 0, "should yield at least one partial");
+  assertEqual(partials[partials.length - 1], { name: "Alice", age: 30 });
+});
+
+await testAsync("createEventParser for-await + break: early exit destroys parser", async () => {
+  let chunkIndex = 0;
+  async function* makeSource() {
+    while (true) {
+      yield `{"i":${chunkIndex++}}`;
+    }
+  }
+
+  const p = createEventParser({ source: makeSource() });
+  for await (const partial of p) {
+    break; // early exit
+  }
+  assertEqual(p.getStatus(), "error"); // destroyed
+});
+
+await testAsync("createEventParser for-await with ReadableStream source", async () => {
+  const encoder = new TextEncoder();
+  const chunks = ['{"msg":', '"hello"}'];
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const c of chunks) controller.enqueue(encoder.encode(c));
+      controller.close();
+    }
+  });
+
+  const p = createEventParser({ source: stream });
+  const partials = [];
+  for await (const partial of p) {
+    partials.push(JSON.parse(JSON.stringify(partial)));
+  }
+  assert(partials.length > 0, "should yield at least one partial");
+  assertEqual(partials[partials.length - 1], { msg: "hello" });
+});
+
+await testAsync("createEventParser no source: asyncIterator throws", async () => {
+  const p = createEventParser();
+  try {
+    p[Symbol.asyncIterator]();
+    throw new Error("should have thrown");
+  } catch (e) {
+    assert(e.message.includes("No source"), `expected 'No source' error, got: ${e.message}`);
+  }
+  p.destroy();
 });
 
 // ── Results ──

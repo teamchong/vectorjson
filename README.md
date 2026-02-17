@@ -59,26 +59,23 @@ parser.destroy();
 
 `getValue()` returns a **live JS object** that grows incrementally on each `feed()`. No re-parsing — each byte is scanned exactly once.
 
-**Schema-aware field picking** — an LLM streams a 50KB tool call, but you only need `name` and `age`. With `pick`, the parser skips everything else *during byte scanning* — no JS objects allocated for skipped fields. Combined with `source`, you get a pull-based `for await` loop that yields partial objects as chunks arrive, and validates the final result against your schema:
+**Schema-driven streaming** — pass a schema, get only what it defines. An LLM streams a 50KB tool call with `name`, `age`, `bio`, `metadata` — but your schema only needs `name` and `age`. Everything else is skipped at the byte level, never allocated in JS:
 
 ```js
 import { z } from "zod";
 import { createParser } from "vectorjson";
 
-const parser = createParser({
-  pick: ["name", "age"],                              // skip all other fields at byte level
-  schema: z.object({ name: z.string(), age: z.number() }),
-  source: response.body,                              // ReadableStream or AsyncIterable
-});
+const User = z.object({ name: z.string(), age: z.number() });
 
-for await (const partial of parser) {
+for await (const partial of createParser({ schema: User, source: response.body })) {
   console.log(partial);
-  // { name: "Ali" }              ← partial string, render immediately
-  // { name: "Alice" }            ← string complete
-  // { name: "Alice", age: 30 }   ← schema-validated on complete
+  // { name: "Ali" }              ← partial, render immediately
+  // { name: "Alice" }
+  // { name: "Alice", age: 30 }   ← validated on complete
 }
-// auto-destroys when source ends or you break
 ```
+
+The schema defines what to parse. Fields outside the schema are ignored during scanning — no objects created, no strings decoded, no memory wasted.
 
 **Or skip intermediate access entirely** — if you only need the final value:
 
@@ -329,56 +326,42 @@ parser.onText((text) => thinkingPanel.append(text)); // opt-in
 parser.feed(llmOutput);
 ```
 
-### Field picking — only parse what you need
+### Schema-driven streaming — parse only what the schema defines
 
-When streaming a large tool call, you often only need 2-3 fields. `pick` tells the parser to skip everything else during byte scanning — skipped fields never allocate JS objects:
+Pass a schema and VectorJSON extracts only the fields it defines. Everything else is skipped at the byte level — no objects created, no strings decoded. Arrays are transparent: `{ users: z.array(z.object({ name })) }` picks through arrays automatically.
 
 ```js
+import { z } from "zod";
 import { createParser } from "vectorjson";
 
-const parser = createParser({ pick: ["name", "age"] });
-parser.feed('{"name":"Alice","age":30,"bio":"...10KB of text...","metadata":{}}');
-parser.getValue(); // { name: "Alice", age: 30 } — bio and metadata never materialized
-parser.destroy();
-```
+const User = z.object({ name: z.string(), age: z.number() });
 
-Nested paths work with dot notation:
-
-```js
-const parser = createParser({ pick: ["user.name", "user.age"] });
-parser.feed('{"user":{"name":"Bob","age":25,"role":"admin"},"extra":"data"}');
-parser.getValue(); // { user: { name: "Bob", age: 25 } }
-parser.destroy();
-```
-
-### `for await` — pull-based streaming from any source
-
-Pass a `source` (ReadableStream or AsyncIterable) and iterate with `for await`. Each iteration yields the growing partial value:
-
-```js
-import { createParser } from "vectorjson";
-
-const parser = createParser({ source: response.body });
-
-for await (const partial of parser) {
+for await (const partial of createParser({ schema: User, source: response.body })) {
   console.log(partial);
-  // { name: "Ali" }
-  // { name: "Alice" }
-  // { name: "Alice", age: 30 }
+  // { name: "Ali" }              ← partial, render immediately
+  // { name: "Alice", age: 30 }   ← validated on complete
 }
-// Parser auto-destroys when the source ends or you break out of the loop
 ```
 
-Combine `pick` + `source` for minimal allocation streaming:
+Works on dirty LLM output — think tags, code fences, and leading prose are stripped automatically when a schema is provided:
 
 ```js
-const parser = createParser({
-  pick: ["name", "age"],
-  source: response.body,
-});
+// All of these work with createParser(schema):
+// <think>reasoning</think>{"name":"Alice","age":30}
+// ```json\n{"name":"Alice","age":30}\n```
+// Here's the result: {"name":"Alice","age":30}
+```
+
+Both `createParser` and `createEventParser` support `source` + `for await`:
+
+```js
+import { createEventParser } from "vectorjson";
+
+const parser = createEventParser({ source: response.body });
+parser.on('tool', (e) => showToolUI(e.value));
 
 for await (const partial of parser) {
-  updateUI(partial); // only picked fields, growing incrementally
+  updateUI(partial); // growing partial value
 }
 ```
 
@@ -543,25 +526,31 @@ Each `feed()` processes only new bytes — O(n) total. Three overloads:
 
 ```ts
 createParser();                    // no validation
-createParser(schema);              // schema validation (Zod, Valibot, etc.)
-createParser({ pick, schema, source }); // options object
+createParser(schema);              // schema validation + auto-pick + dirty input handling
+createParser({ schema, source });  // options object
 ```
 
 **Options object:**
 
 ```ts
 interface CreateParserOptions<T = unknown> {
-  pick?: string[];       // only include these fields (dot-separated paths)
-  schema?: ZodLike<T>;   // validate on complete
+  schema?: ZodLike<T>;   // validate on complete, auto-pick from shape, skip dirty input
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+  pick?: string[];       // advanced: explicit field paths (overrides schema auto-pick)
 }
 ```
+
+When a `schema` is provided:
+- Fields are auto-picked from the schema's `.shape` — only matching fields are parsed
+- Arrays are transparent — `{ users: z.array(z.object({ name })) }` picks `users.name` through arrays
+- Dirty input (think tags, code fences, leading prose) is stripped before parsing
+- On complete, `safeParse()` validates the final value
 
 When `source` is provided, the parser becomes async-iterable — use `for await` to consume partial values:
 
 ```ts
-for await (const partial of createParser({ source: stream, pick: ["name"] })) {
-  console.log(partial); // growing object with only picked fields
+for await (const partial of createParser({ schema: User, source: stream })) {
+  console.log(partial); // growing object with only schema fields
 }
 ```
 
@@ -616,6 +605,33 @@ type DeepPartial<T> = T extends object
 Event-driven streaming parser. Events fire synchronously during `feed()`.
 
 ```ts
+createEventParser();                              // basic
+createEventParser({ source: stream });            // for-await iteration
+createEventParser({ multiRoot: true, onRoot });   // NDJSON
+```
+
+**Options:**
+
+```ts
+{
+  multiRoot?: boolean;   // auto-reset between JSON values (NDJSON)
+  onRoot?: (event: RootEvent) => void;
+  source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+}
+```
+
+When `source` is provided, the parser becomes async-iterable — `for await` yields growing partial values, just like `createParser`:
+
+```ts
+const parser = createEventParser({ source: stream });
+parser.on('tool', (e) => showToolUI(e.value));
+
+for await (const partial of parser) {
+  updateUI(partial);
+}
+```
+
+```ts
 interface EventParser {
   on(path: string, callback: (event: PathEvent) => void): EventParser;
   on<T>(path: string, schema: { safeParse: Function }, callback: (event: PathEvent & { value: T }) => void): EventParser;
@@ -629,6 +645,7 @@ interface EventParser {
   getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
   getStatus(): FeedStatus;
   destroy(): void;
+  [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined>;  // requires source
 }
 ```
 
@@ -668,6 +685,18 @@ interface RootEvent {
   value: unknown;         // parsed via doc_parse
 }
 ```
+
+### Parser comparison
+
+| | `createParser` | `createEventParser` |
+|---|---|---|
+| **Use case** | Get a growing partial object | React to individual fields as they arrive |
+| **Schema auto-pick** | Yes — schema `.shape` drives field selection | No — use `skip()` and `on()` for filtering |
+| **Dirty input handling** | Yes (when schema provided) | Yes (always) |
+| **`for await` with source** | Yes | Yes |
+| **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |
+| **Multi-root / NDJSON** | No | Yes (`multiRoot: true`) |
+| **Text callbacks** | No | `onText()` for non-JSON text |
 
 ### `deepCompare(a, b, options?): boolean`
 
