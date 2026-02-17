@@ -98,7 +98,6 @@ const parser = createEventParser();
 
 parser.on('tool', (e) => showToolUI(e.value));             // fires immediately
 parser.onDelta('code', (e) => editor.append(e.value));     // streams char-by-char
-parser.skip('explanation');                                // never materialized
 
 for await (const chunk of llmStream) {
   parser.feed(chunk);  // O(n) — only new bytes scanned
@@ -279,9 +278,6 @@ parser.onDelta('tool_calls[0].args.code', (e) => {
   editor.append(e.value); // just the new characters, decoded
 });
 
-// Don't waste CPU on fields you don't need
-parser.skip('tool_calls[*].args.explanation');
-
 for await (const chunk of llmStream) {
   parser.feed(chunk);
 }
@@ -341,15 +337,6 @@ for await (const partial of createParser({ schema: User, source: response.body }
   // { name: "Ali" }              ← partial, render immediately
   // { name: "Alice", age: 30 }   ← validated on complete
 }
-```
-
-Works on dirty LLM output — think tags, code fences, and leading prose are stripped automatically when a schema is provided:
-
-```js
-// All of these work with createParser(schema):
-// <think>reasoning</think>{"name":"Alice","age":30}
-// ```json\n{"name":"Alice","age":30}\n```
-// Here's the result: {"name":"Alice","age":30}
 ```
 
 Both `createParser` and `createEventParser` support `source` + `for await`:
@@ -526,7 +513,7 @@ Each `feed()` processes only new bytes — O(n) total. Three overloads:
 
 ```ts
 createParser();                    // no validation
-createParser(schema);              // only parse schema fields, validate, skip dirty input
+createParser(schema);              // only parse schema fields, validate on complete
 createParser({ schema, source });  // options object
 ```
 
@@ -534,16 +521,14 @@ createParser({ schema, source });  // options object
 
 ```ts
 interface CreateParserOptions<T = unknown> {
-  schema?: ZodLike<T>;   // only parse schema fields, validate on complete, skip dirty input
+  schema?: ZodLike<T>;   // only parse schema fields, validate on complete
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
-  pick?: string[];       // advanced: explicit field paths (overrides schema)
 }
 ```
 
 When a `schema` is provided:
 - Only fields defined in the schema are parsed — everything else is skipped at the byte level
 - Arrays are transparent — `z.array(z.object({ name }))` parses `name` inside each array element
-- Dirty input (think tags, code fences, leading prose) is stripped before parsing
 - On complete, `safeParse()` validates the final value
 
 When `source` is provided, the parser becomes async-iterable — use `for await` to consume partial values:
@@ -618,7 +603,6 @@ createEventParser({ multiRoot: true, onRoot });   // NDJSON
   onRoot?: (event: RootEvent) => void;
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
   schema?: ZodLike<T>;   // only parse schema fields (same as createParser)
-  pick?: string[];       // advanced: explicit field paths (overrides schema)
 }
 ```
 
@@ -639,7 +623,6 @@ interface EventParser {
   on<T>(path: string, schema: { safeParse: Function }, callback: (event: PathEvent & { value: T }) => void): EventParser;
   onDelta(path: string, callback: (event: DeltaEvent) => void): EventParser;
   onText(callback: (text: string) => void): EventParser;
-  skip(...paths: string[]): EventParser;
   off(path: string, callback?: Function): EventParser;
   feed(chunk: string | Uint8Array): FeedStatus;
   getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
@@ -651,7 +634,7 @@ interface EventParser {
 }
 ```
 
-All methods return `self` for chaining: `parser.on(...).onDelta(...).skip(...)`.
+All methods return `self` for chaining: `parser.on(...).onDelta(...)`.
 
 **Path syntax:**
 - `foo.bar` — exact key
@@ -692,17 +675,16 @@ interface RootEvent {
 
 | | `createParser` | `createEventParser` |
 |---|---|---|
-| **Use case** | Get a growing partial object | React to individual fields as they arrive |
-| **On complete** | Stops — `feed()` returns `"complete"` | Never stops — user calls `destroy()` when done |
-| **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
-| **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | Yes — same schema support, plus `skip()` and `on()` |
-| **Dirty input handling** | Yes (when schema provided) | Yes (always) |
-| **`for await` with source** | Yes | Yes |
-| **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |
-| **Multi-root / NDJSON** | No | Yes (`multiRoot: true`) |
-| **Text callbacks** | No | `onText()` for non-JSON text |
+| **Completion** | `feed()` returns `"complete"` after one JSON value | Handles multiple JSON values — user calls `destroy()` when done |
+| **Malformed JSON** | `feed()` returns `"error"` | Skips it, finds the next JSON |
+| **Schema** | Pass Zod/Valibot, only schema fields are parsed | Same |
+| **Skip non-JSON** (think tags, code fences, prose) | — | Always |
+| **`for await`** | With `source` option | With `source` option |
+| **Field subscriptions** | — | `on()`, `onDelta()` |
+| **Multi-root / NDJSON** | — | `multiRoot: true` |
+| **Text callbacks** | — | `onText()` |
 
-**`createParser` stops at the first complete value** and detects errors — you check the status and react:
+**`createParser` parses one JSON value** and reports status — you check it and react:
 
 ```js
 const parser = createParser();
@@ -715,7 +697,7 @@ const result = parser.getValue();
 parser.destroy();
 ```
 
-**`createEventParser` never stops** — you feed it data and call `destroy()` when you're done. This lets it handle an entire LLM response that mixes text, thinking, and multiple JSON values:
+**`createEventParser` handles an entire LLM response** — text, thinking, code fences, multiple JSON values, all in one stream:
 
 ```js
 const parser = createEventParser({ multiRoot: true, onRoot: (e) => {

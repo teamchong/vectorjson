@@ -245,31 +245,6 @@ await test("multiRoot: scalar values", () => {
 // 5. Skip paths
 // =============================================================
 
-await test("skip: skipped path doesn't fire value events", () => {
-  withParser((parser) => {
-    const events = [];
-    parser.on("big", (e) => events.push(e));
-    parser.on("small", (e) => events.push(e));
-    parser.skip("big");
-    parser.feed('{"big":"lots of data here","small":"ok"}');
-    assertEqual(events.length, 1);
-    assertEqual(events[0].path, "small");
-    assertEqual(events[0].value, "ok");
-  });
-});
-
-await test("skip: skipped nested path", () => {
-  withParser((parser) => {
-    const events = [];
-    parser.on("data.result", (e) => events.push(e));
-    parser.on("data.debug", (e) => events.push(e));
-    parser.skip("data.debug");
-    parser.feed('{"data":{"debug":{"verbose":true},"result":42}}');
-    assertEqual(events.length, 1);
-    assertEqual(events[0].value, 42);
-  });
-});
-
 // =============================================================
 // 6. JSON Boundary Detection (seeker)
 // =============================================================
@@ -500,8 +475,7 @@ await test("methods return self for chaining", () => {
     const result = parser
       .on("a", () => {})
       .onDelta("b", () => {})
-      .onText(() => {})
-      .skip("c");
+      .onText(() => {});
     assert(result === parser, "Should return self for chaining");
   });
 });
@@ -717,29 +691,6 @@ await test("multiRoot: various whitespace between values", () => {
 // =============================================================
 // 18. Skip edge cases
 // =============================================================
-
-await test("skip: delta on skipped path does not fire", () => {
-  withParser((parser) => {
-    const deltas = [];
-    parser.skip("secret");
-    parser.onDelta("secret", (e) => deltas.push(e));
-    parser.feed('{"secret":"password","ok":"yes"}');
-    assertEqual(deltas.length, 0);
-  });
-});
-
-await test("skip: wildcard skip pattern", () => {
-  withParser((parser) => {
-    const events = [];
-    parser.on("items[*].data", (e) => events.push(e));
-    parser.on("items[*].id", (e) => events.push(e));
-    parser.skip("items[*].data");
-    parser.feed('{"items":[{"id":1,"data":"big"},{"id":2,"data":"big"}]}');
-    assertEqual(events.length, 2);
-    assertEqual(events[0].value, 1);
-    assertEqual(events[1].value, 2);
-  });
-});
 
 // =============================================================
 // 19. Schema edge cases

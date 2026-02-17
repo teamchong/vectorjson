@@ -70,8 +70,6 @@ export type ZodLike<T> = { safeParse: (v: unknown) => { success: boolean; data?:
 
 /** Options for createParser when using an options object. */
 export interface CreateParserOptions<T = unknown> {
-  /** Only include these top-level or nested fields (dot-separated paths). */
-  pick?: string[];
   /** Schema for validation on complete values. */
   schema?: ZodLike<T>;
   /** Stream source — makes the parser async-iterable via for-await. */
@@ -124,7 +122,6 @@ export interface EventParser {
   on<T>(path: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }, callback: (event: PathEvent & { value: T }) => void): EventParser;
   onDelta(path: string, callback: (event: DeltaEvent) => void): EventParser;
   onText(callback: (text: string) => void): EventParser;
-  skip(...paths: string[]): EventParser;
   off(path: string, callback?: Function): EventParser;
   feed(chunk: string | Uint8Array): FeedStatus;
   getValue(): unknown | undefined;
@@ -1044,7 +1041,6 @@ export async function init(options?: {
       onRoot?: (event: RootEvent) => void;
       source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
       schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
-      pick?: string[];
     }): EventParser {
       const multiRoot = options?.multiRoot ?? false;
       const onRootCb = options?.onRoot;
@@ -1053,9 +1049,7 @@ export async function init(options?: {
       // Schema-driven field selection + validation (same as createParser)
       const epSchema = options?.schema;
       let epPickPaths: PathSegment[][] | null = null;
-      if (options?.pick) {
-        epPickPaths = options.pick.map(compilePath);
-      } else if (options?.schema) {
+      if (options?.schema) {
         epPickPaths = extractSchemaKeys(options.schema);
       }
 
@@ -1543,10 +1537,6 @@ export async function init(options?: {
           return self;
         },
 
-        skip(...paths: string[]): EventParser {
-          for (const p of paths) skipPatterns.push(compilePath(p));
-          return self;
-        },
 
         off(path: string, callback?: Function): EventParser {
           const compiled = compilePath(path);
@@ -1805,25 +1795,18 @@ export async function init(options?: {
       let pickPaths: PathSegment[][] | null = null;
       let source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string> | undefined;
 
-      if (arg && typeof arg === 'object' && 'safeParse' in arg && !('pick' in arg) && !('source' in arg) && !('schema' in arg)) {
+      if (arg && typeof arg === 'object' && 'safeParse' in arg && !('source' in arg) && !('schema' in arg)) {
         // Legacy: createParser(zodSchema)
         schema = arg;
-        // Auto-derive pick paths from schema shape (Zod, Valibot, ArkType)
         pickPaths = extractSchemaKeys(arg);
-      } else if (arg && typeof arg === 'object' && ('pick' in arg || 'source' in arg || 'schema' in arg)) {
-        // New: createParser({ pick, schema, source })
+      } else if (arg && typeof arg === 'object' && ('source' in arg || 'schema' in arg)) {
+        // createParser({ schema, source })
         schema = arg.schema;
         source = arg.source;
-        if (arg.pick) {
-          pickPaths = arg.pick.map(compilePath);
-        } else if (arg.schema) {
-          // Auto-derive pick paths from schema when no explicit pick
+        if (arg.schema) {
           pickPaths = extractSchemaKeys(arg.schema);
         }
       }
-      // Seeker: skip junk text when schema is provided (dirty input handling)
-      const cpSeeker = schema ? createSeeker() : null;
-
       const streamId = engine.stream_create();
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
@@ -2126,13 +2109,6 @@ export async function init(options?: {
       return {
         feed(chunk: Uint8Array | string): FeedStatus {
           if (destroyed) throw new Error("Parser already destroyed");
-          // Run through seeker to skip non-JSON junk (when schema is set)
-          if (cpSeeker) {
-            const text = typeof chunk === 'string' ? chunk : utf8Decoder.decode(chunk);
-            const jsonContent = cpSeeker.feed(text);
-            if (jsonContent === null) return FEED_STATUS[engine.stream_get_status(streamId)]!;
-            chunk = jsonContent;
-          }
           const chunkLen = typeof chunk === "string" ? chunk.length : chunk.byteLength;
           if (chunkLen === 0) return FEED_STATUS[engine.stream_get_status(streamId)]!;
           const { ptr, len } = writeToWasm(chunk, feedBuf, 0, 4096);
