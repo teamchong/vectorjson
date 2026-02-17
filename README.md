@@ -693,7 +693,7 @@ interface RootEvent {
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
 | **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
 | **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
-| **Schema auto-pick** | Yes — schema `.shape` drives field selection | No — use `skip()` and `on()` for filtering |
+| **Schema → only parse matching fields** | Yes — reads `.shape` from Zod/Valibot, skips everything else | No — use `skip()` and `on()` to filter manually |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
 | **`for await` with source** | Yes | Yes |
 | **Field subscriptions** | No | `on()`, `onDelta()`, `skip()` |
