@@ -308,6 +308,73 @@ parser.onText((text) => thinkingPanel.append(text)); // opt-in
 parser.feed(llmOutput);
 ```
 
+### Field picking — only parse what you need
+
+When streaming a large tool call, you often only need 2-3 fields. `pick` tells the parser to skip everything else during byte scanning — skipped fields never allocate JS objects:
+
+```js
+import { createParser } from "vectorjson";
+
+const parser = createParser({ pick: ["name", "age"] });
+parser.feed('{"name":"Alice","age":30,"bio":"...10KB of text...","metadata":{}}');
+parser.getValue(); // { name: "Alice", age: 30 } — bio and metadata never materialized
+parser.destroy();
+```
+
+Nested paths work with dot notation:
+
+```js
+const parser = createParser({ pick: ["user.name", "user.age"] });
+parser.feed('{"user":{"name":"Bob","age":25,"role":"admin"},"extra":"data"}');
+parser.getValue(); // { user: { name: "Bob", age: 25 } }
+parser.destroy();
+```
+
+### `for await` — pull-based streaming from any source
+
+Pass a `source` (ReadableStream or AsyncIterable) and iterate with `for await`. Each iteration yields the growing partial value:
+
+```js
+import { createParser } from "vectorjson";
+
+const parser = createParser({ source: response.body });
+
+for await (const partial of parser) {
+  console.log(partial);
+  // { name: "Ali" }
+  // { name: "Alice" }
+  // { name: "Alice", age: 30 }
+}
+// Parser auto-destroys when the source ends or you break out of the loop
+```
+
+Combine `pick` + `source` for minimal allocation streaming:
+
+```js
+const parser = createParser({
+  pick: ["name", "age"],
+  source: response.body,
+});
+
+for await (const partial of parser) {
+  updateUI(partial); // only picked fields, growing incrementally
+}
+```
+
+Works with any async source — fetch body, WebSocket wrapper, SSE adapter, or a plain async generator:
+
+```js
+async function* chunks() {
+  yield '{"status":"';
+  yield 'ok","data":';
+  yield '[1,2,3]}';
+}
+
+for await (const partial of createParser({ source: chunks() })) {
+  console.log(partial);
+}
+```
+
 ### Schema validation
 
 Validate and auto-infer types with Zod, Valibot, ArkType, or any lib with `.safeParse()`. Works on all three APIs:
@@ -449,8 +516,33 @@ interface ParseResult {
 - **`invalid`** — broken JSON
 
 ### `createParser(schema?): StreamingParser<T>`
+### `createParser(options?): StreamingParser<T>`
 
-Each `feed()` processes only new bytes — O(n) total. Pass an optional schema to auto-validate and infer the return type.
+Each `feed()` processes only new bytes — O(n) total. Three overloads:
+
+```ts
+createParser();                    // no validation
+createParser(schema);              // schema validation (Zod, Valibot, etc.)
+createParser({ pick, schema, source }); // options object
+```
+
+**Options object:**
+
+```ts
+interface CreateParserOptions<T = unknown> {
+  pick?: string[];       // only include these fields (dot-separated paths)
+  schema?: ZodLike<T>;   // validate on complete
+  source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+}
+```
+
+When `source` is provided, the parser becomes async-iterable — use `for await` to consume partial values:
+
+```ts
+for await (const partial of createParser({ source: stream, pick: ["name"] })) {
+  console.log(partial); // growing object with only picked fields
+}
+```
 
 ```ts
 interface StreamingParser<T = unknown> {
@@ -460,6 +552,7 @@ interface StreamingParser<T = unknown> {
   getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
   getStatus(): FeedStatus;
   destroy(): void;
+  [Symbol.asyncIterator](): AsyncIterableIterator<T | undefined>;  // requires source
 }
 type FeedStatus = "incomplete" | "complete" | "error" | "end_early";
 ```

@@ -41,6 +41,7 @@ export fn get_error_code() i32 {
 // When complete, JS can doc_parse the accumulated buffer.
 
 const stream = @import("stream.zig");
+const FeedStatus = stream.FeedStatus;
 
 /// Global stream state slots (support multiple concurrent streams)
 var streams: [4]?*stream.StreamState = .{ null, null, null, null };
@@ -464,11 +465,11 @@ export fn doc_object_keys(doc_id: i32, obj_index: u32, resume_at: u32) u32 {
 var classify_value_end: u32 = 0;
 
 /// Classify JSON input without parsing.
-/// Returns: 0=incomplete, 1=complete, 2=complete_early, 3=invalid
-export fn classify_input(ptr: [*]const u8, len: u32) u32 {
+/// Returns FeedStatus: incomplete, complete, end_early, or err.
+export fn classify_input(ptr: [*]const u8, len: u32) FeedStatus {
     classify_value_end = 0;
 
-    if (len == 0) return 0; // empty = incomplete
+    if (len == 0) return .incomplete;
 
     var depth_val: i32 = 0;
     var in_string: bool = false;
@@ -521,7 +522,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
             },
             '}', ']' => {
                 depth_val -= 1;
-                if (depth_val < 0) return 3; // invalid: unmatched closing bracket
+                if (depth_val < 0) return .err; // unmatched closing bracket
                 if (depth_val == 0 and root_state != .completed) {
                     root_state = .completed;
                     classify_value_end = i + 1;
@@ -545,13 +546,13 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
         const scalar = ptr[scalar_start..len];
         // Partial keyword prefix → incomplete (e.g. "tr", "fal", "nul")
         for ([_][]const u8{ "true", "false", "null" }) |kw| {
-            if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) return 0;
+            if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) return .incomplete;
         }
         // Trailing incomplete number char → incomplete (e.g. "1.", "1e", "1e-")
         if (scalar.len > 0) {
             const last_ch = scalar[scalar.len - 1];
             if (last_ch == '.' or last_ch == '-' or last_ch == '+' or last_ch == 'e' or last_ch == 'E') {
-                return 0;
+                return .incomplete;
             }
         }
         root_state = .completed;
@@ -560,7 +561,7 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
 
     if (root_state != .completed) {
         // Nothing started, still mid-string, or depth > 0 → incomplete
-        return 0;
+        return .incomplete;
     }
 
     // Root value is complete. Check for trailing content.
@@ -568,15 +569,15 @@ export fn classify_input(ptr: [*]const u8, len: u32) u32 {
     while (j < len) : (j += 1) {
         const c = ptr[j];
         if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
-            // Non-whitespace after complete value → complete_early
-            return 2;
+            // Non-whitespace after complete value → end_early
+            return .end_early;
         }
     }
 
-    return 1; // complete (only whitespace after)
+    return .complete;
 }
 
-/// Get the stored value_end offset (for complete_early classification).
+/// Get the stored value_end offset (for end_early classification).
 export fn get_value_end() u32 {
     return classify_value_end;
 }

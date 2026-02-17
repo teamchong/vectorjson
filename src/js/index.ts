@@ -61,6 +61,21 @@ export interface StreamingParser<T = unknown> {
   getRawBuffer(): ArrayBuffer | null;
   /** Destroy the parser and free all resources. */
   destroy(): void;
+  /** Async iteration over partial values when a source was provided. */
+  [Symbol.asyncIterator](): AsyncIterableIterator<T | undefined>;
+}
+
+/** Zod-like schema type for createParser options. */
+export type ZodLike<T> = { safeParse: (v: unknown) => { success: boolean; data?: T } };
+
+/** Options for createParser when using an options object. */
+export interface CreateParserOptions<T = unknown> {
+  /** Only include these top-level or nested fields (dot-separated paths). */
+  pick?: string[];
+  /** Schema for validation on complete values. */
+  schema?: ZodLike<T>;
+  /** Stream source — makes the parser async-iterable via for-await. */
+  source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
 }
 
 export interface ParseResult {
@@ -159,7 +174,22 @@ export interface VectorJSON {
    * parser.getValue(); // { name: string } | undefined
    * ```
    */
-  createParser<T>(schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): StreamingParser<T>;
+  createParser<T>(schema: ZodLike<T>): StreamingParser<T>;
+  /**
+   * Create a streaming parser with options: field picking, schema, and/or stream source.
+   *
+   * ```ts
+   * // Pick specific fields + async iteration:
+   * const parser = vj.createParser({
+   *   pick: ["name", "age"],
+   *   source: response.body,
+   * });
+   * for await (const partial of parser) {
+   *   console.log(partial); // only picked fields
+   * }
+   * ```
+   */
+  createParser<T = unknown>(options: CreateParserOptions<T>): StreamingParser<T>;
   /**
    * Deep-compare two values for structural equality.
    * When both values are VJ proxies, comparison happens entirely in WASM
@@ -303,7 +333,7 @@ export async function init(options?: {
   }
 
   // --- Instantiate Zig engine ---
-  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes, {});
+  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes as ArrayBuffer, {});
   const engine = engineInstance.exports as unknown as EngineExports;
 
   const encoder = new TextEncoder();
@@ -365,9 +395,9 @@ export async function init(options?: {
   const TAG_ARRAY = 6;
 
   const FEED_STATUS: readonly FeedStatus[] = ["incomplete", "complete", "error", "end_early"];
-  const CLASSIFY_INCOMPLETE = 0;
-  const CLASSIFY_COMPLETE_EARLY = 2;
-  const CLASSIFY_INVALID = 3;
+  const CLASSIFY_INCOMPLETE = 0;  // FeedStatus.incomplete
+  const CLASSIFY_ERR = 2;         // FeedStatus.err
+  const CLASSIFY_END_EARLY = 3;   // FeedStatus.end_early
 
   // --- Sentinels ---
   const LAZY_PROXY = Symbol("vectorjson.lazy");
@@ -681,6 +711,11 @@ export async function init(options?: {
     return docId;
   }
 
+  // --- Helpers ---
+  function isReadableStream(s: any): s is ReadableStream {
+    return typeof s?.getReader === 'function';
+  }
+
   // --- Path Pattern Compiler ---
   // Segments: string = key, number = index, '*' = wildcard
 
@@ -771,11 +806,11 @@ export async function init(options?: {
       // ── doc_parse failed — classify to determine why ──
       const classification = engine.classify_input(ptr, len);
 
-      if (classification === CLASSIFY_INVALID) {
+      if (classification === CLASSIFY_ERR) {
         return invalidResult("Invalid JSON structure");
       }
 
-      if (classification === CLASSIFY_COMPLETE_EARLY) {
+      if (classification === CLASSIFY_END_EARLY) {
         const parseLen = engine.get_value_end();
         const remainLen = len - parseLen;
         const remainingCopy = new Uint8Array(remainLen);
@@ -1621,7 +1656,21 @@ export async function init(options?: {
       return self;
     },
 
-    createParser(schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } }): StreamingParser {
+    createParser(arg?: any): StreamingParser {
+      // --- Argument parsing: detect legacy schema vs options object ---
+      let schema: { safeParse: (v: unknown) => { success: boolean; data?: unknown } } | undefined;
+      let pickPaths: PathSegment[][] | null = null;
+      let source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string> | undefined;
+
+      if (arg && typeof arg === 'object' && 'safeParse' in arg && !('pick' in arg) && !('source' in arg) && !('schema' in arg)) {
+        // Legacy: createParser(zodSchema)
+        schema = arg;
+      } else if (arg && typeof arg === 'object' && ('pick' in arg || 'source' in arg || 'schema' in arg)) {
+        // New: createParser({ pick, schema, source })
+        schema = arg.schema;
+        source = arg.source;
+        if (arg.pick) pickPaths = arg.pick.map(compilePath);
+      }
       const streamId = engine.stream_create();
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
@@ -1651,6 +1700,37 @@ export async function init(options?: {
       let scanAccumulatingKey = false;
       let scanInScalar = false;
 
+      // --- Pick state ---
+      // spKeyStack tracks the current key at each depth for pick matching.
+      // spSkipDepth >= 0 means we're inside a non-picked field and should skip building.
+      let spKeyStack: (string | null)[] = [];
+      let spSkipDepth = -1;
+
+      /** Check if the current path (from spKeyStack + scanDepth) matches any pick path.
+       *  Returns true if current path is an ancestor, descendant, or exact match. */
+      function isFieldPicked(): boolean {
+        if (!pickPaths) return true;
+        for (const pick of pickPaths) {
+          // Compare each segment of the pick path against current path
+          const currentDepth = scanDepth;
+          const pickLen = pick.length;
+          const compareLen = Math.min(currentDepth, pickLen);
+          let matched = true;
+          for (let i = 0; i < compareLen; i++) {
+            const seg = pick[i];
+            const key = spKeyStack[i];
+            if (seg === '*') continue; // wildcard matches anything
+            if (typeof seg === 'number') {
+              // Index matching — not tracked in spKeyStack for pick (only object keys matter)
+              continue;
+            }
+            if (key !== seg) { matched = false; break; }
+          }
+          if (matched) return true; // ancestor, descendant, or exact match
+        }
+        return false;
+      }
+
       function spSetValue(value: unknown) {
         if (ldStack.length === 0) { ldRoot = value; return; }
         const parent = ldStack[ldStack.length - 1];
@@ -1667,25 +1747,29 @@ export async function init(options?: {
         } else if (ldActiveKey !== null) { parent[ldActiveKey] = str; }
       }
 
-      /** Scan new bytes to incrementally build the live JS document */
+      /** Scan new bytes to incrementally build the live JS document.
+       *  When pickPaths is set, fields not matching any pick path are skipped. */
       function spScan(buf: Uint8Array, from: number, to: number) {
+        const picking = pickPaths !== null;
         for (let i = from; i < to; i++) {
           const c = buf[i];
 
           if (scanInScalar) {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
-              try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+              if (spSkipDepth < 0) {
+                try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+              }
               ldScalarAccum = '';
               scanInScalar = false;
               i--; continue;
             }
-            ldScalarAccum += B2C[c];
+            if (spSkipDepth < 0) ldScalarAccum += B2C[c];
             continue;
           }
 
           if (scanEscapeNext) {
             scanEscapeNext = false;
-            if (ldInStringValue) {
+            if (ldInStringValue && spSkipDepth < 0) {
               let decoded: string;
               switch (c) {
                 case 0x6E: decoded = '\n'; break;
@@ -1711,18 +1795,21 @@ export async function init(options?: {
               if (scanAccumulatingKey) {
                 scanAccumulatingKey = false;
                 ldCurrentKey = scanKeyAccum;
+                // Store key in spKeyStack for pick path matching
+                if (picking && scanDepth > 0) {
+                  spKeyStack[scanDepth - 1] = scanKeyAccum;
+                }
                 scanKeyAccum = '';
                 continue;
               }
-              if (ldInStringValue) {
-                // Final update at string close (value already in parent from spSetValue('') at open)
+              if (ldInStringValue && spSkipDepth < 0) {
                 spUpdateString(ldStringAccum);
                 ldStringAccum = '';
                 ldInStringValue = false;
               }
               continue;
             }
-            if (ldInStringValue) ldStringAccum += B2C[c];
+            if (ldInStringValue && spSkipDepth < 0) ldStringAccum += B2C[c];
             if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             continue;
           }
@@ -1730,27 +1817,37 @@ export async function init(options?: {
           switch (c) {
             case 0x7B: {
               scanContext[scanDepth] = 'o';
+              if (picking) spKeyStack[scanDepth] = null;
               scanDepth++;
               scanExpectingKey = true;
               scanAfterColon = false;
-              const obj: Record<string, unknown> = {};
-              spSetValue(obj);
-              ldStack.push(obj);
+              if (spSkipDepth < 0) {
+                const obj: Record<string, unknown> = {};
+                spSetValue(obj);
+                ldStack.push(obj);
+              }
               break;
             }
             case 0x5B: {
               scanContext[scanDepth] = 'a';
+              if (picking) spKeyStack[scanDepth] = null;
               scanDepth++;
               scanExpectingKey = false;
               scanAfterColon = false;
-              const arr: unknown[] = [];
-              spSetValue(arr);
-              ldStack.push(arr);
+              if (spSkipDepth < 0) {
+                const arr: unknown[] = [];
+                spSetValue(arr);
+                ldStack.push(arr);
+              }
               break;
             }
             case 0x7D: case 0x5D: {
               scanDepth--;
-              ldStack.pop();
+              if (spSkipDepth >= 0 && scanDepth <= spSkipDepth) {
+                spSkipDepth = -1;
+              } else if (spSkipDepth < 0) {
+                ldStack.pop();
+              }
               if (scanDepth > 0) {
                 scanExpectingKey = scanContext[scanDepth - 1] === 'o';
                 scanAfterColon = false;
@@ -1763,7 +1860,7 @@ export async function init(options?: {
               if (scanExpectingKey) {
                 scanAccumulatingKey = true;
                 scanKeyAccum = '';
-              } else if (isValue) {
+              } else if (isValue && spSkipDepth < 0) {
                 ldStringAccum = '';
                 ldInStringValue = true;
                 spSetValue('');
@@ -1774,10 +1871,16 @@ export async function init(options?: {
             case 0x3A: {
               scanExpectingKey = false;
               scanAfterColon = true;
-              // Set null placeholder for the pending key — will be overwritten
-              // when the real value arrives. This ensures getValue() during
-              // incomplete streaming shows {"key": null} instead of {}.
-              if (ldCurrentKey !== null && ldStack.length > 0) {
+              // Check pick filter after key is stored
+              if (picking && spSkipDepth < 0 && !isFieldPicked()) {
+                spSkipDepth = scanDepth - 1;
+                ldCurrentKey = null; // discard key since field is skipped
+                break;
+              }
+              // Pre-set null for the pending key — overwritten when the real
+              // value arrives. Ensures getValue() shows {"key": null} while
+              // the value is still being streamed.
+              if (spSkipDepth < 0 && ldCurrentKey !== null && ldStack.length > 0) {
                 const parent = ldStack[ldStack.length - 1];
                 if (!Array.isArray(parent)) {
                   (parent as Record<string, unknown>)[ldCurrentKey] = null;
@@ -1787,13 +1890,18 @@ export async function init(options?: {
               break;
             }
             case 0x2C: {
+              if (picking && spSkipDepth >= 0 && scanDepth - 1 <= spSkipDepth) {
+                spSkipDepth = -1;
+              }
               if (scanDepth > 0 && scanContext[scanDepth - 1] === 'o') {
                 scanExpectingKey = true;
+                if (picking) spKeyStack[scanDepth - 1] = null;
               }
               scanAfterColon = false;
               break;
             }
             default: {
+              if (spSkipDepth >= 0) break; // skip scalars inside non-picked fields
               const isValuePos = scanAfterColon || scanDepth === 0 || (scanDepth > 0 && scanContext[scanDepth - 1] === 'a');
               if (isValuePos) {
                 if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
@@ -1821,7 +1929,7 @@ export async function init(options?: {
         }
 
         // End-of-chunk: flush accumulated string to parent (batched update)
-        if (ldInStringValue && ldStringAccum) {
+        if (ldInStringValue && ldStringAccum && spSkipDepth < 0) {
           spUpdateString(ldStringAccum);
         }
 
@@ -1963,6 +2071,55 @@ export async function init(options?: {
             destroyed = true;
             cachedValue = UNCACHED;
           }
+        },
+
+        [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined> {
+          if (!source) throw new Error("No source provided — use feed() for push-based parsing");
+          const self = this;
+          const reader = isReadableStream(source) ? source.getReader() : null;
+          const iter = reader ? null : (source as AsyncIterable<any>)[Symbol.asyncIterator]();
+          let finished = false;
+
+          return {
+            async next() {
+              if (finished) {
+                self.destroy();
+                return { done: true as const, value: undefined };
+              }
+
+              const result = reader
+                ? await reader.read()
+                : await iter!.next();
+
+              if (result.done || !result.value) {
+                finished = true;
+                self.destroy();
+                return { done: true as const, value: undefined };
+              }
+
+              const status = self.feed(result.value);
+              const partial = self.getValue();
+
+              if (status === "complete" || status === "end_early") {
+                finished = true;
+                return { done: false, value: partial };
+              }
+              if (status === "error") {
+                finished = true;
+                self.destroy();
+                throw new SyntaxError("VectorJSON: Parse error in stream");
+              }
+
+              return { done: false, value: partial };
+            },
+            async return() {
+              finished = true;
+              self.destroy();
+              if (reader) reader.cancel();
+              return { done: true as const, value: undefined };
+            },
+            [Symbol.asyncIterator]() { return this; },
+          };
         },
       };
     },
