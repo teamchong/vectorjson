@@ -683,6 +683,43 @@ await testAsync("createEventParser schema + source: for-await only yields schema
   assert(last.email === undefined, "email should not be present");
 });
 
+// ── 17. createEventParser schema validation ──
+
+test("createEventParser schema: validates on complete, returns data", () => {
+  const p = createEventParser({ schema: {
+    shape: { name: {}, age: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string" && typeof v.age === "number")
+        return { success: true, data: { ...v, validated: true } };
+      return { success: false };
+    }
+  }});
+  parsersToClean.push(p);
+  p.feed('{"name":"Alice","age":30,"extra":"skip"}');
+  const val = p.getValue();
+  assertEqual(val.name, "Alice");
+  assertEqual(val.age, 30);
+  assertEqual(val.validated, true);
+  p.destroy();
+});
+
+test("createEventParser schema: rejects invalid returns undefined", () => {
+  const p = createEventParser({ schema: {
+    shape: { name: {}, age: {} },
+    safeParse(v) {
+      if (v && typeof v.name === "string" && typeof v.age === "number")
+        return { success: true, data: v };
+      return { success: false };
+    }
+  }});
+  parsersToClean.push(p);
+  // Only "name" in schema shape, but age is required — will fail validation
+  p.feed('{"name":"Alice","extra":"data"}');
+  const val = p.getValue();
+  assertEqual(val, undefined);
+  p.destroy();
+});
+
 // ── Results ──
 console.log(`\n\u2728 Pick Fields Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

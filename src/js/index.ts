@@ -1050,7 +1050,8 @@ export async function init(options?: {
       const onRootCb = options?.onRoot;
       const source = options?.source;
 
-      // Schema-driven field selection (same as createParser)
+      // Schema-driven field selection + validation (same as createParser)
+      const epSchema = options?.schema;
       let epPickPaths: PathSegment[][] | null = null;
       if (options?.pick) {
         epPickPaths = options.pick.map(compilePath);
@@ -1685,19 +1686,30 @@ export async function init(options?: {
           }
 
           // complete or end_early
-          // When pick paths are active, return the filtered live doc
-          if (epPickPaths) return ldRoot;
-          // Otherwise, do a final WASM parse for correctness
-          const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
-          const valueLen = engine.stream_get_value_len(streamId);
-          new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
-          const docId = engine.doc_parse(bufPtr, valueLen);
-          if (docId < 0) {
-            const errorCode = engine.get_error_code();
-            const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-            throw new SyntaxError(`VectorJSON: ${msg}`);
+          let value: unknown;
+          if (epPickPaths) {
+            // Pick active — return the filtered live doc
+            value = ldRoot;
+          } else {
+            // Full WASM parse for correctness
+            const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
+            const valueLen = engine.stream_get_value_len(streamId);
+            new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
+            const docId = engine.doc_parse(bufPtr, valueLen);
+            if (docId < 0) {
+              const errorCode = engine.get_error_code();
+              const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+              throw new SyntaxError(`VectorJSON: ${msg}`);
+            }
+            value = buildDocRoot(docId);
           }
-          return buildDocRoot(docId);
+          // Schema validation on complete
+          if (epSchema) {
+            const result = epSchema.safeParse(value);
+            if (!result.success) return undefined;
+            return result.data;
+          }
+          return value;
         },
 
         getRemaining(): Uint8Array | null {
