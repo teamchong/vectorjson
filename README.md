@@ -693,7 +693,7 @@ interface RootEvent {
 | | `createParser` | `createEventParser` |
 |---|---|---|
 | **Use case** | Get a growing partial object | React to individual fields as they arrive |
-| **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — fires callbacks, never stops on its own |
+| **On complete** | Stops — `feed()` returns `"complete"` | Keeps going — parses multiple JSON values in one stream |
 | **Error detection** | `feed()` returns `"error"` on malformed JSON | No error detection — best-effort, keeps scanning |
 | **Schema** | Yes — pass Zod/Valibot, only schema fields are parsed | Yes — same schema support, plus `skip()` and `on()` |
 | **Dirty input handling** | Yes (when schema provided) | Yes (always) |
@@ -715,28 +715,29 @@ const result = parser.getValue();
 parser.destroy();
 ```
 
-**`createEventParser` never stops on its own** — it keeps consuming input, firing callbacks as fields complete. This makes it ideal for long-running streams, NDJSON, or reacting to fields the moment they appear:
-
-```js
-const parser = createEventParser();
-parser.on('name', (e) => console.log('got name:', e.value));  // fires per root
-
-for await (const chunk of stream) {
-  parser.feed(chunk);  // never returns "complete" — keeps scanning
-}
-parser.destroy();  // you decide when to stop
-```
-
-With `multiRoot: true`, the event parser auto-resets between values and fires `onRoot` for each:
+**`createEventParser` keeps going** — it doesn't stop after one JSON value because it's designed to parse multiple values in one stream (NDJSON, multiple tool calls, SSE events):
 
 ```js
 const parser = createEventParser({ multiRoot: true, onRoot: (e) => {
   console.log(`Root #${e.index}:`, e.value);  // fires for each JSON value
 }});
 
-// NDJSON: {"a":1}\n{"a":2}\n{"a":3}
+// Stream contains multiple JSON values:
+// {"name":"Alice"}\n{"name":"Bob"}\n{"name":"Charlie"}
+for await (const chunk of stream) {
+  parser.feed(chunk);  // parses all three values, fires onRoot for each
+}
+parser.destroy();
+```
+
+Use `on()` to react to fields across all values in the stream:
+
+```js
+const parser = createEventParser({ multiRoot: true });
+parser.on('name', (e) => console.log('got name:', e.value));  // fires for every root
+
 for await (const chunk of ndjsonStream) {
-  parser.feed(chunk);  // processes all three values
+  parser.feed(chunk);
 }
 parser.destroy();
 ```
