@@ -284,26 +284,6 @@ for await (const chunk of llmStream) {
 parser.destroy();
 ```
 
-### Multi-root / NDJSON
-
-Some LLM APIs stream multiple JSON values separated by newlines. VectorJSON auto-resets between values:
-
-```js
-import { createEventParser } from "vectorjson";
-
-const parser = createEventParser({
-  multiRoot: true,
-  onRoot(event) {
-    console.log(`Root #${event.index}:`, event.value);
-  }
-});
-
-for await (const chunk of ndjsonStream) {
-  parser.feed(chunk);
-}
-parser.destroy();
-```
-
 ### Mixed LLM output (chain-of-thought, code fences)
 
 Some models emit thinking text before JSON, or wrap JSON in code fences. VectorJSON finds the JSON automatically:
@@ -592,17 +572,16 @@ Event-driven streaming parser. Events fire synchronously during `feed()`.
 ```ts
 createEventParser();                              // basic
 createEventParser({ source: stream });            // for-await iteration
-createEventParser({ multiRoot: true, onRoot });   // NDJSON
+createEventParser({ schema, source });              // schema + for-await
 ```
 
 **Options:**
 
 ```ts
 {
-  multiRoot?: boolean;   // auto-reset between JSON values (NDJSON)
-  onRoot?: (event: RootEvent) => void;
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
   schema?: ZodLike<T>;   // only parse schema fields (same as createParser)
+  // format?: "json" | "jsonl";  // planned — JSONL support for both parsers
 }
 ```
 
@@ -664,11 +643,6 @@ interface DeltaEvent {
   length: number;         // byte length of delta (raw bytes, not char count)
 }
 
-interface RootEvent {
-  type: 'root';
-  index: number;          // which root value (0, 1, 2...)
-  value: unknown;         // parsed via doc_parse
-}
 ```
 
 ### Parser comparison
@@ -679,9 +653,8 @@ interface RootEvent {
 | **Malformed JSON** | `feed()` returns `"error"` | Skips it, finds the next JSON |
 | **Schema** | Pass Zod/Valibot, only schema fields are parsed | Same |
 | **Skip non-JSON** (think tags, code fences, prose) | — | Always |
-| **`for await`** | With `source` option | With `source` option |
 | **Field subscriptions** | — | `on()`, `onDelta()` |
-| **Multi-root / NDJSON** | — | `multiRoot: true` |
+| **JSONL** | `format: "jsonl"` (planned) | `format: "jsonl"` (planned) |
 | **Text callbacks** | — | `onText()` |
 
 **`createParser` parses one JSON value** and reports status — you check it and react:
@@ -697,28 +670,21 @@ const result = parser.getValue();
 parser.destroy();
 ```
 
-**`createEventParser` handles an entire LLM response** — text, thinking, code fences, multiple JSON values, all in one stream:
+**`createEventParser` handles an entire LLM response** — text, thinking, code fences, all in one stream:
 
 ```js
-const parser = createEventParser({ multiRoot: true, onRoot: (e) => {
-  console.log(`Root #${e.index}:`, e.value);
-}});
+const parser = createEventParser();
+parser.on('tool', (e) => showToolUI(e.value));
 parser.onText((text) => thinkingPanel.append(text));
 
-// A single LLM response can contain all of this:
+// LLM output with mixed content:
 // <think>let me reason about this...</think>
 // {"tool":"search","query":"weather"}
-// Here are the results:
-// ```json
-// {"tool":"answer","text":"It's sunny"}
-// ```
 for await (const chunk of llmStream) {
-  parser.feed(chunk);  // handles all of it — text, think tags, code fences, multiple JSON values
+  parser.feed(chunk);  // strips think tags, finds JSON, fires callbacks
 }
 parser.destroy();
 ```
-
-The seeker strips non-JSON content (think tags, code fences, prose), `onText()` captures it, and `multiRoot` parses every JSON value in the stream — no matter what format the LLM wraps them in.
 
 ### `deepCompare(a, b, options?): boolean`
 

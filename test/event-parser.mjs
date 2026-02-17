@@ -204,43 +204,6 @@ await test("onDelta: path with escaped characters", () => {
 // 4. Multi-root / NDJSON
 // =============================================================
 
-await test("multiRoot: fires onRoot for each value in NDJSON", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e) }, (parser) => {
-    parser.feed('{"a":1}\n{"b":2}\n{"c":3}');
-  });
-  assertEqual(roots.length, 3);
-  assertEqual(roots[0].index, 0);
-  assertEqual(roots[0].value, { a: 1 });
-  assertEqual(roots[1].index, 1);
-  assertEqual(roots[1].value, { b: 2 });
-  assertEqual(roots[2].index, 2);
-  assertEqual(roots[2].value, { c: 3 });
-});
-
-await test("multiRoot: handles values split across chunks", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e) }, (parser) => {
-    parser.feed('{"a":');
-    parser.feed('1}\n{"b"');
-    parser.feed(':2}');
-  });
-  assertEqual(roots.length, 2);
-  assertEqual(roots[0].value, { a: 1 });
-  assertEqual(roots[1].value, { b: 2 });
-});
-
-await test("multiRoot: scalar values", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e.value) }, (parser) => {
-    parser.feed('"hello"\n42\ntrue');
-  });
-  assertEqual(roots.length, 3);
-  assertEqual(roots[0], "hello");
-  assertEqual(roots[1], 42);
-  assertEqual(roots[2], true);
-});
-
 // =============================================================
 // 5. Skip paths
 // =============================================================
@@ -644,56 +607,7 @@ await test("onDelta: both delta and path subscription on same string", () => {
 });
 
 // =============================================================
-// 17. Multi-root edge cases
-// =============================================================
-
-await test("multiRoot: single value (no reset needed)", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e) }, (parser) => {
-    parser.feed('{"single":1}');
-  });
-  assertEqual(roots.length, 1);
-  assertEqual(roots[0].value, { single: 1 });
-});
-
-await test("multiRoot: with path subscriptions active", () => {
-  const roots = [], events = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e) }, (parser) => {
-    parser.on("id", (e) => events.push(e.value));
-    parser.feed('{"id":1}\n{"id":2}');
-  });
-  assertEqual(roots.length, 2);
-  // Path events fire per-root before reset
-  assert(events.length >= 1, "Path events should fire in multi-root");
-});
-
-await test("multiRoot: empty objects", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e.value) }, (parser) => {
-    parser.feed('{}\n[]\n{}');
-  });
-  assertEqual(roots.length, 3);
-  assertEqual(roots[0], {});
-  assertEqual(roots[1], []);
-  assertEqual(roots[2], {});
-});
-
-await test("multiRoot: various whitespace between values", () => {
-  const roots = [];
-  withParser({ multiRoot: true, onRoot: (e) => roots.push(e.value) }, (parser) => {
-    parser.feed('{"a":1}  \t  {"b":2}');
-  });
-  assertEqual(roots.length, 2);
-  assertEqual(roots[0], { a: 1 });
-  assertEqual(roots[1], { b: 2 });
-});
-
-// =============================================================
-// 18. Skip edge cases
-// =============================================================
-
-// =============================================================
-// 19. Schema edge cases
+// 17. Schema edge cases
 // =============================================================
 
 await test("schema: always-failing schema suppresses all events", () => {

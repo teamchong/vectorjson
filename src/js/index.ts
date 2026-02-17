@@ -111,12 +111,6 @@ export interface DeltaEvent {
   length: number;
 }
 
-export interface RootEvent {
-  type: 'root';
-  index: number;
-  value: unknown;
-}
-
 export interface EventParser {
   on(path: string, callback: (event: PathEvent) => void): EventParser;
   on<T>(path: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }, callback: (event: PathEvent & { value: T }) => void): EventParser;
@@ -237,11 +231,11 @@ export interface VectorJSON {
   parsePartialJson<T>(input: string, schema: { safeParse: (v: unknown) => { success: boolean; data?: T } }): PartialJsonResult<DeepPartial<T>>;
   /**
    * Create an event-driven streaming parser with path subscriptions,
-   * string delta emission, multi-root support, and JSON boundary detection.
+   * string delta emission, and JSON boundary detection.
    */
   createEventParser(options?: {
-    multiRoot?: boolean;
-    onRoot?: (event: RootEvent) => void;
+    source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+    schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
   }): EventParser;
 }
 
@@ -1037,13 +1031,9 @@ export async function init(options?: {
     },
 
     createEventParser(options?: {
-      multiRoot?: boolean;
-      onRoot?: (event: RootEvent) => void;
       source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
       schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
     }): EventParser {
-      const multiRoot = options?.multiRoot ?? false;
-      const onRootCb = options?.onRoot;
       const source = options?.source;
 
       // Schema-driven field selection + validation (same as createParser)
@@ -1059,13 +1049,11 @@ export async function init(options?: {
       }
 
       let destroyed = false;
-      let rootIndex = 0;
 
       // --- Subscription storage ---
       type Sub = { segments: PathSegment[]; callback: Function; schema?: { safeParse: Function } };
       const pathSubs: Sub[] = [];
       const deltaSubs: Sub[] = [];
-      const skipPatterns: PathSegment[][] = [];
       const textCallbacks: ((text: string) => void)[] = [];
 
       // --- JSON Seeker (reusable factory) ---
@@ -1170,7 +1158,6 @@ export async function init(options?: {
       }
 
       function isPathSkipped(): boolean {
-        if (skipPatterns.length > 0 && skipPatterns.some(p => matchPath(p, false) !== null)) return true;
         if (epPickPaths && !epIsFieldPicked()) return true;
         return false;
       }
@@ -1598,51 +1585,6 @@ export async function init(options?: {
           }
 
           const feedStatus = FEED_STATUS[status] || "error";
-
-          // Multi-root handling: drain all complete values
-          if (multiRoot && (feedStatus === 'complete' || feedStatus === 'end_early')) {
-            let loopGuard = 0;
-            while (loopGuard++ < 10000) {
-              const curStatus = engine.stream_get_status(streamId);
-              if (curStatus !== 1 && curStatus !== 3) break; // not complete/end_early
-
-              // Copy value bytes before reset (SIMD padding would overwrite remaining)
-              const bp = (engine.stream_get_buffer_ptr(streamId) >>> 0);
-              const vl = engine.stream_get_value_len(streamId);
-              const valueCopy = new Uint8Array(vl + 64);
-              valueCopy.set(new Uint8Array(engine.memory.buffer, bp, vl));
-              // Pad copy for SIMD safety
-              valueCopy.fill(0x20, vl);
-
-              // Reset stream for next value BEFORE parsing (preserves remaining bytes)
-              const remaining = engine.stream_reset_for_next(streamId);
-              ptReset();
-
-              // Now parse the copied value bytes
-              const parsePtr = engine.alloc(valueCopy.length) >>> 0;
-              if (parsePtr) {
-                new Uint8Array(engine.memory.buffer, parsePtr, valueCopy.length).set(valueCopy);
-                const did = engine.doc_parse(parsePtr, vl);
-                engine.dealloc(parsePtr, valueCopy.length);
-                if (did >= 0 && onRootCb) {
-                  onRootCb({ type: 'root', index: rootIndex++, value: buildDocRoot(did) });
-                }
-              }
-
-              // Scan remaining bytes with PathTracker
-              if (remaining > 0 && (pathSubs.length > 0 || deltaSubs.length > 0)) {
-                const nbp = (engine.stream_get_buffer_ptr(streamId) >>> 0);
-                const nbl = engine.stream_get_buffer_len(streamId);
-                if (nbl > 0) {
-                  const wb = new Uint8Array(engine.memory.buffer, nbp, nbl);
-                  ptScan(wb, 0, nbl);
-                }
-              }
-
-              if (remaining === 0) break;
-            }
-            return FEED_STATUS[engine.stream_get_status(streamId)] || "incomplete";
-          }
 
           return feedStatus;
         },
