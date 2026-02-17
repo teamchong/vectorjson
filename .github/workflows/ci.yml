@@ -76,6 +76,10 @@ jobs:
         run: |
           cd bench/ai-parsers && timeout 300 bun --expose-gc bench.mjs 2>&1 | tee /tmp/bench-ai.txt || echo '⏱ Exceeded 5 min timeout' >> /tmp/bench-ai.txt
 
+      - name: Benchmark — Deep Compare
+        run: |
+          timeout 300 node --expose-gc bench/deep-compare.mjs 2>&1 | tee /tmp/bench-deep-compare.txt || echo '⏱ Exceeded 5 min timeout' >> /tmp/bench-deep-compare.txt
+
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
@@ -106,6 +110,13 @@ jobs:
           echo '' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat /tmp/bench-ai.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Deep Compare</summary>' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/bench-deep-compare.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo '</details>' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
