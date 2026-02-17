@@ -59,28 +59,26 @@ parser.destroy();
 
 `getValue()` returns a **live JS object** that grows incrementally on each `feed()`. No re-parsing — each byte is scanned exactly once.
 
-**`for await` with field picking** — pass a stream source, pick fields, validate with a schema:
+**Schema-aware field picking** — an LLM streams a 50KB tool call, but you only need `name` and `age`. With `pick`, the parser skips everything else *during byte scanning* — no JS objects allocated for skipped fields. Combined with `source`, you get a pull-based `for await` loop that yields partial objects as chunks arrive, and validates the final result against your schema:
 
 ```js
 import { z } from "zod";
 import { createParser } from "vectorjson";
 
 const parser = createParser({
-  pick: ["name", "age"],                              // only these fields — rest skipped at byte level
+  pick: ["name", "age"],                              // skip all other fields at byte level
   schema: z.object({ name: z.string(), age: z.number() }),
   source: response.body,                              // ReadableStream or AsyncIterable
 });
 
 for await (const partial of parser) {
   console.log(partial);
-  // { name: "Ali" }
-  // { name: "Alice" }
-  // { name: "Alice", age: 30 }  ← schema-validated on complete
+  // { name: "Ali" }              ← partial string, render immediately
+  // { name: "Alice" }            ← string complete
+  // { name: "Alice", age: 30 }   ← schema-validated on complete
 }
 // auto-destroys when source ends or you break
 ```
-
-Fields you don't `pick` are never materialized — skipped at the byte level for zero overhead.
 
 **Or skip intermediate access entirely** — if you only need the final value:
 
