@@ -95,6 +95,26 @@ await test("imported result supports .free()", async () => {
   obj.free(); // should not throw
 });
 
+await test("json5 format round-trip", async () => {
+  const parser = createParser({ format: "json5" });
+  // JSON5: unquoted keys, single-quoted strings, trailing comma, comments
+  parser.feed(`{
+    name: 'Alice', // line comment
+    age: 30,
+    /* block comment */
+    tags: ['a', 'b',],
+  }`);
+  const tape = parser.getTapeBuffer();
+  parser.destroy();
+  assert(tape !== null, "getTapeBuffer should succeed for complete json5");
+  const obj = importTape(tape);
+  assertEqual(obj.name, "Alice");
+  assertEqual(obj.age, 30);
+  assertEqual(obj.tags[0], "a");
+  assertEqual(obj.tags[1], "b");
+  assertEqual(obj.tags.length, 2);
+});
+
 await test("large payload (1000 items)", async () => {
   const items = Array.from({ length: 1000 }, (_, i) => ({
     id: i, name: `item_${i}`, value: Math.random(),

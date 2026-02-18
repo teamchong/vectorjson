@@ -717,7 +717,7 @@ export async function init(options?: {
 
   // --- Tape export/import helpers ---
   /** Parse a stream's buffer, export packed tape, free the temp doc slot. */
-  function streamExportTape(streamId: number): ArrayBuffer | null {
+  function streamExportTape(streamId: number, formatCode = 0): ArrayBuffer | null {
     const status = engine.stream_get_status(streamId);
     if (status !== 1 /* complete */ && status !== 3 /* end_early */) return null;
     const bufPtr = engine.stream_get_buffer_ptr(streamId) >>> 0;
@@ -730,7 +730,9 @@ export async function init(options?: {
       new Uint8Array(engine.memory.buffer, bufPtr, bufLen),
     );
     new Uint8Array(engine.memory.buffer, padPtr + bufLen, 64).fill(0x20);
-    const docId = engine.doc_parse(padPtr, bufLen);
+    const docId = formatCode === 2
+      ? engine.doc_parse_fmt(padPtr, bufLen, 2)
+      : engine.doc_parse(padPtr, bufLen);
     engine.dealloc(padPtr, bufLen + 64);
     if (docId < 0) return null;
     // Export tape → JS ArrayBuffer, then free slot
@@ -1759,7 +1761,7 @@ export async function init(options?: {
         },
 
         getTapeBuffer(): ArrayBuffer | null {
-          return destroyed ? null : streamExportTape(streamId);
+          return destroyed ? null : streamExportTape(streamId, FORMAT_CODE);
         },
 
         destroy(): void {
@@ -2340,7 +2342,7 @@ export async function init(options?: {
         },
 
         getTapeBuffer(): ArrayBuffer | null {
-          return destroyed ? null : streamExportTape(streamId);
+          return destroyed ? null : streamExportTape(streamId, FORMAT_CODE);
         },
 
         destroy(): void {
