@@ -721,19 +721,20 @@ export async function init(options?: {
     const status = engine.stream_get_status(streamId);
     if (status !== 1 /* complete */ && status !== 3 /* end_early */) return null;
     const bufPtr = engine.stream_get_buffer_ptr(streamId) >>> 0;
-    const bufLen = engine.stream_get_buffer_len(streamId);
-    if (bufLen === 0) return null;
-    // Copy stream buffer with SIMD padding for doc_parse
-    const padPtr = engine.alloc(bufLen + 64) >>> 0;
+    // Use value_len (not buffer_len) — in JSONL mode buffer may contain next value's bytes
+    const valueLen = engine.stream_get_value_len(streamId);
+    if (valueLen === 0) return null;
+    // Copy with SIMD padding for doc_parse
+    const padPtr = engine.alloc(valueLen + 64) >>> 0;
     if (padPtr === 0) return null;
-    new Uint8Array(engine.memory.buffer, padPtr, bufLen).set(
-      new Uint8Array(engine.memory.buffer, bufPtr, bufLen),
+    new Uint8Array(engine.memory.buffer, padPtr, valueLen).set(
+      new Uint8Array(engine.memory.buffer, bufPtr, valueLen),
     );
-    new Uint8Array(engine.memory.buffer, padPtr + bufLen, 64).fill(0x20);
+    new Uint8Array(engine.memory.buffer, padPtr + valueLen, 64).fill(0x20);
     const docId = formatCode === 2
-      ? engine.doc_parse_fmt(padPtr, bufLen, 2)
-      : engine.doc_parse(padPtr, bufLen);
-    engine.dealloc(padPtr, bufLen + 64);
+      ? engine.doc_parse_fmt(padPtr, valueLen, 2)
+      : engine.doc_parse(padPtr, valueLen);
+    engine.dealloc(padPtr, valueLen + 64);
     if (docId < 0) return null;
     // Export tape → JS ArrayBuffer, then free slot
     const size = engine.doc_export_tape_size(docId);

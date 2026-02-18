@@ -95,6 +95,19 @@ await test("imported result supports .free()", async () => {
   obj.free(); // should not throw
 });
 
+await test("jsonl format round-trip", async () => {
+  const parser = createParser({ format: "jsonl" });
+  // Two JSONL values — getTapeBuffer should export only the first
+  parser.feed('{"a":1}\n{"b":2}');
+  const tape = parser.getTapeBuffer();
+  assert(tape !== null, "getTapeBuffer should succeed for complete jsonl value");
+  const obj = importTape(tape);
+  assertEqual(obj.a, 1);
+  // Second value should not leak into the first
+  assertEqual(obj.b, undefined);
+  parser.destroy();
+});
+
 await test("json5 format round-trip", async () => {
   const parser = createParser({ format: "json5" });
   // JSON5: unquoted keys, single-quoted strings, trailing comma, comments
