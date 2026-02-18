@@ -137,9 +137,13 @@ test.describe("Worker Transferable API", () => {
       );
 
       // Encode the WASM bytes as base64 to pass into Worker
-      const wasmB64 = btoa(
-        String.fromCharCode(...new Uint8Array(wasmBytes))
-      );
+      // Chunked encoding to avoid stack overflow from spread on large arrays
+      const wasmU8 = new Uint8Array(wasmBytes);
+      let wasmBin = '';
+      for (let i = 0; i < wasmU8.length; i += 8192) {
+        wasmBin += String.fromCharCode(...wasmU8.subarray(i, i + 8192));
+      }
+      const wasmB64 = btoa(wasmBin);
 
       const json = JSON.stringify({
         type: "tool_use",
