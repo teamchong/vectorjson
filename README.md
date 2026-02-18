@@ -454,6 +454,24 @@ result.status;       // "complete" | "complete_early" | "incomplete" | "invalid"
 result.value.users;  // lazy Proxy — materializes on access
 ```
 
+### JSONL & JSON5
+
+Both `createParser` and `createEventParser` accept `format: "jsonl" | "json5"`:
+
+```js
+// JSONL — yields each value separately
+for await (const value of createParser({ format: "jsonl", source: stream })) {
+  console.log(value);  // { user: "Alice" }, { user: "Bob" }, ...
+}
+
+// JSON5 — comments, trailing commas, unquoted keys, single-quoted strings, hex, Infinity/NaN
+const p = createParser({ format: "json5" });
+p.feed(`{ name: 'Alice', tags: ['admin',], color: 0xFF0000, timeout: Infinity, }`);
+p.getValue(); // { name: "Alice", tags: ["admin"], color: 16711680, timeout: Infinity }
+```
+
+JSONL push-based: call `resetForNext()` after each value. JSON5 comments are stripped at the byte level during streaming.
+
 ## API Reference
 
 ### Direct exports (recommended)
@@ -503,6 +521,7 @@ createParser({ schema, source });  // options object
 interface CreateParserOptions<T = unknown> {
   schema?: ZodLike<T>;   // only parse schema fields, validate on complete
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+  format?: "json" | "jsonl" | "json5";  // default: "json"
 }
 ```
 
@@ -526,6 +545,7 @@ interface StreamingParser<T = unknown> {
   getRemaining(): Uint8Array | null;
   getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
   getStatus(): FeedStatus;
+  resetForNext(): number;  // JSONL: reset for next value, returns remaining byte count
   destroy(): void;
   [Symbol.asyncIterator](): AsyncIterableIterator<T | undefined>;  // requires source
 }
@@ -581,7 +601,7 @@ createEventParser({ schema, source });              // schema + for-await
 {
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
   schema?: ZodLike<T>;   // only parse schema fields (same as createParser)
-  // format?: "json" | "jsonl";  // planned — JSONL support for both parsers
+  format?: "json" | "jsonl" | "json5";  // default: "json"
 }
 ```
 
@@ -654,7 +674,7 @@ interface DeltaEvent {
 | **Schema** | Pass Zod/Valibot, only schema fields are parsed | Same |
 | **Skip non-JSON** (think tags, code fences, prose) | — | Always |
 | **Field subscriptions** | — | `on()`, `onDelta()` |
-| **JSONL** | `format: "jsonl"` (planned) | `format: "jsonl"` (planned) |
+| **JSONL** | `format: "jsonl"` | `format: "jsonl"` |
 | **Text callbacks** | — | `onText()` |
 
 **`createParser` parses one JSON value** and reports status — you check it and react:

@@ -17,6 +17,13 @@ pub const FeedStatus = enum(i32) {
     end_early = 3,
 };
 
+/// Format enum: controls parsing behavior
+pub const Format = enum(i32) {
+    json = 0,
+    jsonl = 1,
+    json5 = 2,
+};
+
 /// Maximum total buffer size (1 GB)
 const MAX_BUFFER_SIZE = 1024 * 1024 * 1024;
 
@@ -39,13 +46,23 @@ pub const StreamState = struct {
     // Root value tracking — state machine: none → container/string/scalar → completed
     root_state: enum { none, container, string, scalar, completed } = .none,
 
+    // --- Format ---
+    format: Format = .json,
+
+    // --- JSON5 comment tracking ---
+    comment_state: enum { none, maybe_start, in_line, in_block, block_maybe_end } = .none,
+
+    // --- JSON5 single-quoted string tracking ---
+    quote_char: u8 = '"',
+
     // --- Allocator ---
     allocator: std.mem.Allocator = undefined,
 
-    pub fn init(allocator: std.mem.Allocator) !*StreamState {
+    pub fn init(allocator: std.mem.Allocator, format: Format) !*StreamState {
         const self = try allocator.create(StreamState);
         self.* = .{};
         self.allocator = allocator;
+        self.format = format;
 
         const initial_cap: u32 = 4096;
         const buf = try allocator.alloc(u8, initial_cap);
@@ -93,18 +110,85 @@ pub const StreamState = struct {
 
     fn scanStructure(self: *StreamState) void {
         const buf = self.buffer orelse return;
+        const is_json5 = self.format == .json5;
         var i = self.scan_offset;
 
         while (i < self.buffer_len) {
             // Stop scanning once root is complete
             if (self.root_state == .completed) break;
 
-            // SIMD fast-skip for string content: scan 16 bytes at a time for '"' or '\'
+            // --- JSON5 comment state machine ---
+            if (is_json5) {
+                switch (self.comment_state) {
+                    .maybe_start => {
+                        // Previous char was '/', check what follows
+                        if (buf[i] == '/') {
+                            self.comment_state = .in_line;
+                            buf[i - 1] = ' '; // replace the initial '/'
+                            buf[i] = ' ';
+                            i += 1;
+                            continue;
+                        } else if (buf[i] == '*') {
+                            self.comment_state = .in_block;
+                            buf[i - 1] = ' '; // replace the initial '/'
+                            buf[i] = ' ';
+                            i += 1;
+                            continue;
+                        } else {
+                            self.comment_state = .none;
+                            // Fall through — the '/' was not a comment start.
+                            // The previous '/' char is already at i-1, was not modified.
+                            // Current char at i needs normal processing.
+                        }
+                    },
+                    .in_line => {
+                        // Line comment: replace bytes with spaces until newline
+                        if (buf[i] == '\n' or buf[i] == '\r') {
+                            self.comment_state = .none;
+                        } else {
+                            buf[i] = ' ';
+                        }
+                        i += 1;
+                        continue;
+                    },
+                    .in_block => {
+                        if (buf[i] == '*') {
+                            self.comment_state = .block_maybe_end;
+                        }
+                        buf[i] = ' ';
+                        i += 1;
+                        continue;
+                    },
+                    .block_maybe_end => {
+                        if (buf[i] == '/') {
+                            self.comment_state = .none;
+                            buf[i] = ' ';
+                            i += 1;
+                            continue;
+                        } else if (buf[i] != '*') {
+                            self.comment_state = .in_block;
+                        }
+                        // If it's another '*', stay in block_maybe_end
+                        buf[i] = ' ';
+                        i += 1;
+                        continue;
+                    },
+                    .none => {},
+                }
+            }
+
+            // SIMD fast-skip for string content: scan 16 bytes at a time for quote char or '\'
             if (self.in_string and !self.escape_next) {
-                while (i + 16 <= self.buffer_len) {
-                    const chunk: @Vector(16, u8) = (buf + i)[0..16].*;
-                    if (simd.anyMatch(&.{ '"', '\\' }, chunk)) break;
-                    i += 16;
+                if (!is_json5 or self.quote_char == '"') {
+                    // Standard double-quoted string: SIMD fast-skip
+                    while (i + 16 <= self.buffer_len) {
+                        const chunk: @Vector(16, u8) = (buf + i)[0..16].*;
+                        if (simd.anyMatch(&.{ '"', '\\' }, chunk)) break;
+                        i += 16;
+                    }
+                } else {
+                    // JSON5 single-quoted string: byte-by-byte (SIMD can't distinguish ' from other chars efficiently)
+                    // Fall through to byte-by-byte processing below
                 }
                 if (i >= self.buffer_len) break;
             }
@@ -120,7 +204,7 @@ pub const StreamState = struct {
             if (self.in_string) {
                 if (c == '\\') {
                     self.escape_next = true;
-                } else if (c == '"') {
+                } else if (c == self.quote_char) {
                     self.in_string = false;
                     if (self.depth == 0 and self.root_state == .string) {
                         self.markRootComplete(i + 1);
@@ -133,8 +217,18 @@ pub const StreamState = struct {
             switch (c) {
                 '"' => {
                     self.in_string = true;
+                    self.quote_char = '"';
                     if (self.depth == 0 and self.root_state == .none) {
                         self.root_state = .string;
+                    }
+                },
+                '\'' => {
+                    if (is_json5) {
+                        self.in_string = true;
+                        self.quote_char = '\'';
+                        if (self.depth == 0 and self.root_state == .none) {
+                            self.root_state = .string;
+                        }
                     }
                 },
                 '{', '[' => {
@@ -154,9 +248,21 @@ pub const StreamState = struct {
                         return;
                     }
                 },
+                '/' => {
+                    if (is_json5) {
+                        self.comment_state = .maybe_start;
+                    }
+                },
                 't', 'f', 'n', '-', '0'...'9' => {
                     if (self.depth == 0 and self.root_state == .none) {
                         self.root_state = .scalar;
+                    }
+                },
+                'I', 'N', '+' => {
+                    if (is_json5) {
+                        if (self.depth == 0 and self.root_state == .none) {
+                            self.root_state = .scalar;
+                        }
                     }
                 },
                 ' ', '\t', '\n', '\r' => {
@@ -228,6 +334,8 @@ pub const StreamState = struct {
         self.status = .incomplete;
         self.remaining_offset = 0;
         self.root_state = .none;
+        self.comment_state = .none;
+        self.quote_char = '"';
 
         // Immediately scan remaining bytes (they may contain a complete value)
         if (remain_len > 0) self.scanStructure();

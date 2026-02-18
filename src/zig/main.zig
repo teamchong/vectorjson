@@ -11,6 +11,7 @@ const gpa: std.mem.Allocator = .{ .ptr = undefined, .vtable = &std.heap.WasmAllo
 
 // --- Parser state ---
 const DomParser = zimdjson.dom.FullParser(.default);
+const DomParserJson5 = zimdjson.dom.FullParser(.{ .json5 = true });
 
 var last_error_code: i32 = 0;
 
@@ -51,10 +52,14 @@ fn getStream(id: i32) ?*stream.StreamState {
     return streams[@intCast(id)];
 }
 
-export fn stream_create() i32 {
+export fn stream_create(format: i32) i32 {
+    const fmt: stream.Format = if (format >= 0 and format <= 2)
+        @enumFromInt(format)
+    else
+        .json;
     for (&streams, 0..) |*slot, i| {
         if (slot.* == null) {
-            slot.* = stream.StreamState.init(gpa) catch return -1;
+            slot.* = stream.StreamState.init(gpa, fmt) catch return -1;
             return @intCast(i);
         }
     }
@@ -127,6 +132,7 @@ export fn stream_reset_for_next(id: i32) u32 {
 const MAX_DOC_SLOTS = 128;
 var doc_parsers: [MAX_DOC_SLOTS]DomParser = .{DomParser.init} ** MAX_DOC_SLOTS;
 var doc_active: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
+var doc_is_json5: [MAX_DOC_SLOTS]bool = .{false} ** MAX_DOC_SLOTS;
 
 // --- Source position tracking ---
 // Per-slot arrays mapping tape index → byte offset in the parsed input.
@@ -216,6 +222,13 @@ fn getDocParser(doc_id: i32) ?*DomParser {
     if (doc_id < 0 or doc_id >= MAX_DOC_SLOTS) return null;
     const uid: usize = @intCast(doc_id);
     if (!doc_active[uid]) return null;
+    if (doc_is_json5[uid]) {
+        // DomParser and DomParserJson5 have identical memory layout —
+        // same fields (document_buffer, tape, max_capacity) at same offsets.
+        // The only difference is comptime dispatch in buildFromSlice (already done).
+        // Safe to reinterpret the pointer for tape navigation.
+        return @ptrCast(&doc_parsers_json5[uid]);
+    }
     return &doc_parsers[uid];
 }
 
@@ -239,7 +252,343 @@ export fn doc_parse(ptr: [*]const u8, len: u32) i32 {
     };
 
     doc_active[uid] = true;
+    doc_is_json5[uid] = false;
     doc_src[uid].built = false; // mark for lazy build on first src_pos query
+
+    return @intCast(uid);
+}
+
+// --- JSON5 document slots (separate array for json5 comptime parser) ---
+var doc_parsers_json5: [MAX_DOC_SLOTS]DomParserJson5 = .{DomParserJson5.init} ** MAX_DOC_SLOTS;
+
+/// Preprocess JSON5 input to valid JSON.
+/// 1. Strip // and /* */ comments
+/// 2. Remove trailing commas (,} → ' }', ,] → ' ]')
+/// 3. Convert single-quoted strings to double-quoted (escape inner ", unescape inner ')
+/// 4. Wrap unquoted keys in double quotes
+/// 5. Convert hex 0xFF → decimal
+/// 6. Convert NaN → null (Infinity/+Infinity/-Infinity handled by DomParserJson5)
+///
+/// Uses an intermediate output buffer, then copies back. Returns new length.
+export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
+    if (len == 0) return 0;
+
+    // Allocate output buffer (worst case: unquoted keys need wrapping → ~2x)
+    const out_cap = len * 2 + 64;
+    const out_buf = gpa.alloc(u8, out_cap) catch return 0;
+    defer gpa.free(out_buf);
+
+    var i: u32 = 0;
+    var o: u32 = 0;
+    var in_string: bool = false;
+    var quote_char: u8 = '"';
+    var escape_next: bool = false;
+    var expecting_key: bool = false;
+    var depth: i32 = 0;
+    var last_non_ws: u8 = 0;
+    var context_stack: [256]u8 = undefined; // '{' or '['
+    var stack_depth: u32 = 0;
+
+    while (i < len) {
+        const c = ptr[i];
+
+        if (escape_next) {
+            escape_next = false;
+            if (in_string and quote_char == '\'') {
+                // In single-quoted string: unescape \' → ', escape " → \"
+                if (c == '\'') {
+                    out_buf[o] = '\'';
+                    o += 1;
+                } else if (c == '"') {
+                    out_buf[o] = '\\';
+                    o += 1;
+                    out_buf[o] = '"';
+                    o += 1;
+                } else {
+                    out_buf[o] = '\\';
+                    o += 1;
+                    out_buf[o] = c;
+                    o += 1;
+                }
+            } else {
+                out_buf[o] = '\\';
+                o += 1;
+                out_buf[o] = c;
+                o += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (in_string) {
+            if (c == '\\') {
+                escape_next = true;
+                i += 1;
+                continue;
+            }
+            if (c == quote_char) {
+                in_string = false;
+                out_buf[o] = '"'; // Always close with double quote
+                o += 1;
+                last_non_ws = '"';
+                i += 1;
+                continue;
+            }
+            // Inside single-quoted string: escape any literal " chars
+            if (quote_char == '\'' and c == '"') {
+                out_buf[o] = '\\';
+                o += 1;
+                out_buf[o] = '"';
+                o += 1;
+            } else {
+                out_buf[o] = c;
+                o += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Not in string — handle comments
+        if (c == '/' and i + 1 < len) {
+            if (ptr[i + 1] == '/') {
+                // Line comment — skip to end of line
+                i += 2;
+                while (i < len and ptr[i] != '\n' and ptr[i] != '\r') i += 1;
+                continue;
+            }
+            if (ptr[i + 1] == '*') {
+                // Block comment — skip to */
+                i += 2;
+                while (i + 1 < len) {
+                    if (ptr[i] == '*' and ptr[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                } else {
+                    i = len; // unterminated block comment
+                }
+                continue;
+            }
+        }
+
+        // Handle trailing commas: if last non-ws was ',' and current is '}' or ']'
+        if (c == '}' or c == ']') {
+            if (last_non_ws == ',') {
+                // Replace the last comma in output with space
+                var j: u32 = o;
+                while (j > 0) {
+                    j -= 1;
+                    if (out_buf[j] == ',') {
+                        out_buf[j] = ' ';
+                        break;
+                    }
+                }
+            }
+            depth -= 1;
+            if (stack_depth > 0) stack_depth -= 1;
+            out_buf[o] = c;
+            o += 1;
+            last_non_ws = c;
+            expecting_key = if (stack_depth > 0) context_stack[stack_depth - 1] == '{' else false;
+            i += 1;
+            continue;
+        }
+
+        if (c == '{') {
+            if (stack_depth < context_stack.len) {
+                context_stack[stack_depth] = '{';
+                stack_depth += 1;
+            }
+            depth += 1;
+            expecting_key = true;
+            out_buf[o] = c;
+            o += 1;
+            last_non_ws = c;
+            i += 1;
+            continue;
+        }
+
+        if (c == '[') {
+            if (stack_depth < context_stack.len) {
+                context_stack[stack_depth] = '[';
+                stack_depth += 1;
+            }
+            depth += 1;
+            expecting_key = false;
+            out_buf[o] = c;
+            o += 1;
+            last_non_ws = c;
+            i += 1;
+            continue;
+        }
+
+        if (c == ',') {
+            expecting_key = if (stack_depth > 0) context_stack[stack_depth - 1] == '{' else false;
+            out_buf[o] = c;
+            o += 1;
+            last_non_ws = c;
+            i += 1;
+            continue;
+        }
+
+        if (c == ':') {
+            expecting_key = false;
+            out_buf[o] = c;
+            o += 1;
+            last_non_ws = c;
+            i += 1;
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            quote_char = '"';
+            expecting_key = false;
+            out_buf[o] = '"';
+            o += 1;
+            last_non_ws = '"';
+            i += 1;
+            continue;
+        }
+
+        if (c == '\'') {
+            in_string = true;
+            quote_char = '\'';
+            expecting_key = false;
+            out_buf[o] = '"'; // Open with double quote
+            o += 1;
+            last_non_ws = '"';
+            i += 1;
+            continue;
+        }
+
+        // Whitespace
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            out_buf[o] = c;
+            o += 1;
+            i += 1;
+            continue;
+        }
+
+        // Hex number: 0x... or 0X...
+        if (c == '0' and i + 1 < len and (ptr[i + 1] == 'x' or ptr[i + 1] == 'X')) {
+            i += 2;
+            var hex_val: u64 = 0;
+            while (i < len) {
+                const h = ptr[i];
+                if (h >= '0' and h <= '9') {
+                    hex_val = hex_val * 16 + (h - '0');
+                } else if (h >= 'a' and h <= 'f') {
+                    hex_val = hex_val * 16 + (h - 'a' + 10);
+                } else if (h >= 'A' and h <= 'F') {
+                    hex_val = hex_val * 16 + (h - 'A' + 10);
+                } else break;
+                i += 1;
+            }
+            // Write decimal number
+            var num_buf: [20]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{hex_val}) catch "0";
+            for (num_str) |ch| {
+                out_buf[o] = ch;
+                o += 1;
+            }
+            if (num_str.len > 0) last_non_ws = num_str[num_str.len - 1];
+            expecting_key = false;
+            continue;
+        }
+
+        // NaN → null
+        if (c == 'N' and i + 2 < len and ptr[i + 1] == 'a' and ptr[i + 2] == 'N') {
+            out_buf[o] = 'n';
+            o += 1;
+            out_buf[o] = 'u';
+            o += 1;
+            out_buf[o] = 'l';
+            o += 1;
+            out_buf[o] = 'l';
+            o += 1;
+            last_non_ws = 'l';
+            i += 3;
+            expecting_key = false;
+            continue;
+        }
+
+        // Unquoted key: identifier chars before ':'
+        if (expecting_key and isIdentStart(c)) {
+            out_buf[o] = '"';
+            o += 1;
+            out_buf[o] = c;
+            o += 1;
+            i += 1;
+            while (i < len and isIdentPart(ptr[i])) {
+                out_buf[o] = ptr[i];
+                o += 1;
+                i += 1;
+            }
+            out_buf[o] = '"';
+            o += 1;
+            last_non_ws = '"';
+            expecting_key = false;
+            continue;
+        }
+
+        // Default: copy byte through
+        out_buf[o] = c;
+        o += 1;
+        last_non_ws = c;
+        expecting_key = false;
+        i += 1;
+    }
+
+    // Copy output back to input buffer
+    @memcpy(ptr[0..o], out_buf[0..o]);
+    return o;
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn isIdentPart(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
+/// Parse JSON with format awareness.
+/// format: 0=json, 1=jsonl, 2=json5
+/// For json5: runs preprocess_json5 first, then uses DomParserJson5.
+export fn doc_parse_fmt(ptr: [*]u8, len: u32, format: i32) i32 {
+    if (format != 2) return doc_parse(ptr, len);
+
+    // JSON5 mode: preprocess, then parse with json5-aware parser
+    const new_len = preprocess_json5(ptr, len);
+    if (new_len == 0 and len > 0) {
+        last_error_code = 99;
+        return -1;
+    }
+
+    last_error_code = 0;
+
+    const uid: usize = for (doc_active, 0..) |active, i| {
+        if (!active) break i;
+    } else {
+        last_error_code = 2;
+        return -1;
+    };
+
+    // Pad for SIMD safety
+    if (new_len + 64 <= len * 2 + 64) {
+        @memset(ptr[new_len..][0..64], ' ');
+    }
+
+    _ = doc_parsers_json5[uid].parseFromSlice(gpa, ptr[0..new_len]) catch |err| {
+        last_error_code = mapError(err);
+        return -1;
+    };
+
+    doc_active[uid] = true;
+    doc_is_json5[uid] = true;
+    doc_src[uid].built = false;
 
     return @intCast(uid);
 }
@@ -580,6 +929,127 @@ export fn classify_input(ptr: [*]const u8, len: u32) FeedStatus {
 /// Get the stored value_end offset (for end_early classification).
 export fn get_value_end() u32 {
     return classify_value_end;
+}
+
+/// Autocomplete incomplete JSON5 input — extends autocomplete_input with JSON5 awareness.
+/// Handles single-quoted strings, skips comments, and doesn't add filler after trailing commas.
+export fn autocomplete_input_json5(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
+    if (len == 0) return 0;
+
+    const max_suffix = if (buf_cap > len) buf_cap - len else @as(u32, 0);
+    if (max_suffix == 0) return len;
+
+    var container_stack: [256]u8 = undefined;
+    var stack_depth: u32 = 0;
+    var in_string: bool = false;
+    var escape_next: bool = false;
+    var quote_char: u8 = '"';
+    var pending: enum { none, colon, comma_obj, comma_arr } = .none;
+
+    var i: u32 = 0;
+    while (i < len) {
+        const c = ptr[i];
+
+        if (escape_next) {
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+
+        if (in_string) {
+            if (c == '\\') {
+                escape_next = true;
+            } else if (c == quote_char) {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Skip comments
+        if (c == '/' and i + 1 < len) {
+            if (ptr[i + 1] == '/') {
+                i += 2;
+                while (i < len and ptr[i] != '\n' and ptr[i] != '\r') i += 1;
+                continue;
+            }
+            if (ptr[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < len) {
+                    if (ptr[i] == '*' and ptr[i + 1] == '/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                } else {
+                    i = len;
+                }
+                continue;
+            }
+        }
+
+        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') pending = .none;
+        switch (c) {
+            ':' => pending = .colon,
+            ',' => {
+                // In JSON5 mode, trailing commas are valid — don't generate filler
+                // Just track for container closing
+                pending = .none;
+            },
+            '"' => {
+                in_string = true;
+                quote_char = '"';
+            },
+            '\'' => {
+                in_string = true;
+                quote_char = '\'';
+            },
+            '{', '[' => {
+                if (stack_depth < container_stack.len) {
+                    container_stack[stack_depth] = c;
+                    stack_depth += 1;
+                }
+            },
+            '}', ']' => {
+                if (stack_depth > 0) stack_depth -= 1;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+
+    var write_pos: u32 = len;
+    const Writer = struct {
+        buf: [*]u8,
+        pos: *u32,
+        cap: u32,
+        fn append(self: @This(), s: []const u8) void {
+            for (s) |ch| {
+                if (self.pos.* < self.cap) {
+                    self.buf[self.pos.*] = ch;
+                    self.pos.* += 1;
+                }
+            }
+        }
+    };
+    const w = Writer{ .buf = ptr, .pos = &write_pos, .cap = buf_cap };
+
+    if (in_string or escape_next) {
+        if (escape_next) {
+            w.append("n");
+        }
+        // Close with the matching quote converted to double quote for JSON compat
+        w.append("\"");
+    } else if (pending == .colon) {
+        w.append("null");
+    }
+
+    while (stack_depth > 0) {
+        stack_depth -= 1;
+        w.append(if (container_stack[stack_depth] == '{') "}" else "]");
+    }
+
+    return write_pos;
 }
 
 /// Autocomplete incomplete JSON input by appending closing tokens.

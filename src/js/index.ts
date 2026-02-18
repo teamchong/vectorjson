@@ -59,6 +59,8 @@ export interface StreamingParser<T = unknown> {
   getStatus(): FeedStatus;
   /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
   getRawBuffer(): ArrayBuffer | null;
+  /** Reset for next value in JSONL mode. Shifts remaining bytes, resets state. Returns remaining byte count. */
+  resetForNext(): number;
   /** Destroy the parser and free all resources. */
   destroy(): void;
   /** Async iteration over partial values when a source was provided. */
@@ -68,12 +70,17 @@ export interface StreamingParser<T = unknown> {
 /** Zod-like schema type for createParser options. */
 export type ZodLike<T> = { safeParse: (v: unknown) => { success: boolean; data?: T } };
 
+/** Format for JSON parsing. */
+export type JsonFormat = "json" | "jsonl" | "json5";
+
 /** Options for createParser when using an options object. */
 export interface CreateParserOptions<T = unknown> {
   /** Schema for validation on complete values. */
   schema?: ZodLike<T>;
   /** Stream source — makes the parser async-iterable via for-await. */
   source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
+  /** Format: "json" (default), "jsonl" (newline-delimited), or "json5" (relaxed). */
+  format?: JsonFormat;
 }
 
 export interface ParseResult {
@@ -236,6 +243,7 @@ export interface VectorJSON {
   createEventParser(options?: {
     source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
     schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
+    format?: JsonFormat;
   }): EventParser;
 }
 
@@ -278,7 +286,7 @@ interface EngineExports {
   doc_array_elements(docId: number, arrIndex: number, resumeAt: number): number;
   doc_object_keys(docId: number, objIndex: number, resumeAt: number): number;
   doc_deep_equal(doc_a: number, idx_a: number, doc_b: number, idx_b: number, ordered: number): number;
-  stream_create(): number;
+  stream_create(format: number): number;
   stream_destroy(id: number): void;
   stream_feed(id: number, ptr: number, len: number): number;
   stream_get_status(id: number): number;
@@ -291,7 +299,10 @@ interface EngineExports {
   stream_reset_for_next(id: number): number;
   classify_input(ptr: number, len: number): number;
   autocomplete_input(ptr: number, len: number, buf_cap: number): number;
+  autocomplete_input_json5(ptr: number, len: number, buf_cap: number): number;
   get_value_end(): number;
+  doc_parse_fmt(ptr: number, len: number, format: number): number;
+  preprocess_json5(ptr: number, len: number): number;
 }
 
 const utf8Decoder = new TextDecoder('utf-8');
@@ -712,7 +723,7 @@ export async function init(options?: {
   // --- JSON Seeker Factory ---
   // Extracts a reusable state machine that skips non-JSON text (think tags, code fences, prose)
   // to find the start of JSON content. Used by both createEventParser and createParser.
-  function createSeeker(textCallbacks?: ((text: string) => void)[]) {
+  function createSeeker(textCallbacks?: ((text: string) => void)[], json5 = false) {
     const SEEKING = 0, IN_THINK = 1, IN_FENCE = 2, FEEDING = 3;
     let state = SEEKING;
     let buf = '';
@@ -767,7 +778,7 @@ export async function init(options?: {
           // SEEKING state
           const ch = text[i];
 
-          if (ch === '{' || ch === '[' || ch === '"') {
+          if (ch === '{' || ch === '[' || ch === '"' || (json5 && ch === "'")) {
             if (buf) {
               for (const cb of cbs) cb(buf);
               buf = '';
@@ -859,6 +870,23 @@ export async function init(options?: {
       else if (indexStack[i] !== null) parts.push(String(indexStack[i]));
     }
     return parts.join('.');
+  }
+
+  function isJson5IdentStart(c: number): boolean {
+    return (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) || c === 0x5F || c === 0x24;
+  }
+
+  function isJson5IdentPart(c: number): boolean {
+    return isJson5IdentStart(c) || (c >= 0x30 && c <= 0x39);
+  }
+
+  /** Parse a JSON5 scalar value (handles Infinity, -Infinity, +Infinity, NaN, hex numbers). */
+  function parseJson5Scalar(s: string): unknown {
+    if (s === "Infinity" || s === "+Infinity") return Infinity;
+    if (s === "-Infinity") return -Infinity;
+    if (s === "NaN") return null; // NaN → null (same as preprocess_json5)
+    if (s.startsWith("0x") || s.startsWith("0X")) return parseInt(s, 16);
+    return JSON.parse(s);
   }
 
   // --- Public API ---
@@ -1033,8 +1061,11 @@ export async function init(options?: {
     createEventParser(options?: {
       source?: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>;
       schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
+      format?: JsonFormat;
     }): EventParser {
       const source = options?.source;
+      const format = options?.format ?? "json";
+      const FORMAT_CODE = format === "jsonl" ? 1 : format === "json5" ? 2 : 0;
 
       // Schema-driven field selection + validation (same as createParser)
       const epSchema = options?.schema;
@@ -1043,7 +1074,7 @@ export async function init(options?: {
         epPickPaths = extractSchemaKeys(options.schema);
       }
 
-      const streamId = engine.stream_create();
+      const streamId = engine.stream_create(FORMAT_CODE);
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create event parser (max 4 concurrent)");
       }
@@ -1057,11 +1088,12 @@ export async function init(options?: {
       const textCallbacks: ((text: string) => void)[] = [];
 
       // --- JSON Seeker (reusable factory) ---
-      const seeker = createSeeker(textCallbacks);
+      const seeker = createSeeker(textCallbacks, format === "json5");
 
       // --- PathTracker state ---
       let ptDepth = 0;
       let ptInString = false;
+      let ptQuoteChar = 0x22;
       let ptEscapeNext = false;
       let ptContextStack: ('o' | 'a')[] = [];       // object or array at each level
       let ptKeyStack: (string | null)[] = [];        // current key at each depth
@@ -1131,7 +1163,7 @@ export async function init(options?: {
       }
 
       function ptReset() {
-        ptDepth = 0; ptInString = false; ptEscapeNext = false;
+        ptDepth = 0; ptInString = false; ptQuoteChar = 0x22; ptEscapeNext = false;
         ptContextStack.length = 0; ptKeyStack.length = 0;
         ptIndexStack.length = 0; ptValueStartStack.length = 0;
         ptSkipDepth = -1; ptExpectingKey = false; ptAfterColon = false;
@@ -1275,7 +1307,7 @@ export async function init(options?: {
               ptEscapeNext = true;
               continue;
             }
-            if (c === 0x22) { // closing quote
+            if (c === ptQuoteChar) { // closing quote
               ptInString = false;
               if (ptAccumulatingKey) {
                 ptAccumulatingKey = false;
@@ -1386,23 +1418,22 @@ export async function init(options?: {
               }
               break;
             }
-            case 0x22: { // opening quote
+            case 0x22: // opening double quote
+            case 0x27: { // opening single quote (JSON5)
+              if (c === 0x27 && format !== "json5") break;
               ptInString = true;
+              ptQuoteChar = c;
               if (ptExpectingKey && ptSkipDepth < 0) {
-                // Start accumulating key
                 ptAccumulatingKey = true;
                 ptKeyAccum = '';
               } else if (ptAfterColon || ptDepth === 0 || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
-                // String value — only track if not in a skipped path
                 if (ptSkipDepth < 0 && !isPathSkipped()) {
                   ptInStringValue = true;
                   ptStringValueStart = i;
                   ptDeltaAccum = '';
-                  ptDeltaByteStart = i + 1; // byte after opening quote
-                  // Live doc: start string value accumulation
+                  ptDeltaByteStart = i + 1;
                   ldStringAccum = '';
                   ldInStringValue = true;
-                  // Push an empty string as placeholder so updates work
                   ldSetValue('');
                 }
                 ptAfterColon = false;
@@ -1451,10 +1482,22 @@ export async function init(options?: {
               break;
             }
             default: {
-              // Scalar values (numbers, true, false, null)
+              // JSON5 unquoted keys: identifier chars when expecting a key
+              if (format === "json5" && ptExpectingKey && isJson5IdentStart(c)) {
+                let j = i + 1;
+                while (j < to && isJson5IdentPart(buf[j])) j++;
+                const key = utf8Decoder.decode(buf.slice(i, j));
+                if (ptDepth > 0) ptKeyStack[ptDepth - 1] = key;
+                ldCurrentKey = key;
+                ptExpectingKey = false;
+                i = j - 1;
+                break;
+              }
+              // Scalar values (numbers, true, false, null, JSON5: Infinity, NaN, hex)
               if (ptAfterColon || ptDepth === 0 || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
-                if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
-                  // Find end of scalar
+                const isScalarStart = (c >= 0x30 && c <= 0x39) || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E
+                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B));
+                if (isScalarStart) {
                   if (ptSkipDepth < 0 && !isPathSkipped()) {
                     let j = i + 1;
                     while (j < to) {
@@ -1463,18 +1506,15 @@ export async function init(options?: {
                       j++;
                     }
                     if (j < to) {
-                      // Complete scalar within this chunk
                       fireValueComplete(buf.slice(i, j), i, j - i);
-                      // Live doc: parse and set scalar value
                       const scalarStr = utf8Decoder.decode(buf.slice(i, j));
-                      try { ldSetValue(JSON.parse(scalarStr)); } catch { ldSetValue(null); }
-                      i = j - 1; // -1 because loop will increment
+                      try { ldSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { ldSetValue(null); }
+                      i = j - 1;
                     } else {
-                      // Scalar extends past this chunk — track it
                       ptInScalar = true;
                       ptScalarStart = i;
                       ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
-                      i = to; // skip to end, will resume on next feed
+                      i = to;
                     }
                   }
                   ptAfterColon = false;
@@ -1626,8 +1666,12 @@ export async function init(options?: {
             // Full WASM parse for correctness
             const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
             const valueLen = engine.stream_get_value_len(streamId);
-            new Uint8Array(engine.memory.buffer, bufPtr + valueLen, 64).fill(0x20);
-            const docId = engine.doc_parse(bufPtr, valueLen);
+            // Pad after the full buffer (not after valueLen) to preserve remaining data for JSONL
+            const fullLen = engine.stream_get_buffer_len(streamId);
+            new Uint8Array(engine.memory.buffer, bufPtr + fullLen, 64).fill(0x20);
+            const docId = FORMAT_CODE === 2
+              ? engine.doc_parse_fmt(bufPtr, valueLen, 2)
+              : engine.doc_parse(bufPtr, valueLen);
             if (docId < 0) {
               const errorCode = engine.get_error_code();
               const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
@@ -1684,9 +1728,16 @@ export async function init(options?: {
           const reader = isReadableStream(source) ? source.getReader() : null;
           const iter = reader ? null : (source as AsyncIterable<any>)[Symbol.asyncIterator]();
           let finished = false;
+          // JSONL: queue of completed values from a single feed
+          const jsonlQueue: unknown[] = [];
 
           return {
-            async next() {
+            async next(): Promise<IteratorResult<unknown | undefined>> {
+              // Drain JSONL queue first
+              if (jsonlQueue.length > 0) {
+                return { done: false, value: jsonlQueue.shift() };
+              }
+
               if (finished) {
                 ep.destroy();
                 return { done: true as const, value: undefined };
@@ -1703,19 +1754,45 @@ export async function init(options?: {
               }
 
               const status = ep.feed(result.value);
-              const partial = ep.getValue();
 
-              if (status === "complete" || status === "end_early") {
-                finished = true;
-                return { done: false, value: partial };
-              }
               if (status === "error") {
                 finished = true;
                 ep.destroy();
                 throw new SyntaxError("VectorJSON: Parse error in stream");
               }
 
-              return { done: false, value: partial };
+              if (format === "jsonl" && (status === "complete" || status === "end_early")) {
+                const value = ep.getValue();
+                // Reset for next value
+                engine.stream_reset_for_next(streamId);
+                ptReset();
+                seeker.reset();
+                // Check if remaining bytes already contain complete values
+                let nextStatus = engine.stream_get_status(streamId);
+                while (nextStatus === 1 || nextStatus === 3) { // complete or end_early
+                  const bufPtr2 = (engine.stream_get_buffer_ptr(streamId) >>> 0);
+                  const newLen2 = engine.stream_get_buffer_len(streamId);
+                  const scanEnd2 = Math.min(newLen2, engine.stream_get_value_len(streamId));
+                  if (scanEnd2 > 0) {
+                    const wasmBuf2 = new Uint8Array(engine.memory.buffer, bufPtr2, scanEnd2);
+                    ptScan(wasmBuf2, 0, scanEnd2);
+                  }
+                  const nextVal = ep.getValue();
+                  jsonlQueue.push(nextVal);
+                  engine.stream_reset_for_next(streamId);
+                  ptReset();
+                  seeker.reset();
+                  nextStatus = engine.stream_get_status(streamId);
+                }
+                return { done: false, value };
+              }
+
+              if (status === "complete" || status === "end_early") {
+                finished = true;
+                return { done: false, value: ep.getValue() };
+              }
+
+              return { done: false, value: ep.getValue() };
             },
             async return() {
               finished = true;
@@ -1736,20 +1813,23 @@ export async function init(options?: {
       let schema: { safeParse: (v: unknown) => { success: boolean; data?: unknown } } | undefined;
       let pickPaths: PathSegment[][] | null = null;
       let source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string> | undefined;
+      let format: JsonFormat = "json";
 
       if (arg && typeof arg === 'object' && 'safeParse' in arg && !('source' in arg) && !('schema' in arg)) {
         // Legacy: createParser(zodSchema)
         schema = arg;
         pickPaths = extractSchemaKeys(arg);
-      } else if (arg && typeof arg === 'object' && ('source' in arg || 'schema' in arg)) {
-        // createParser({ schema, source })
+      } else if (arg && typeof arg === 'object' && ('source' in arg || 'schema' in arg || 'format' in arg)) {
+        // createParser({ schema, source, format })
         schema = arg.schema;
         source = arg.source;
+        format = arg.format ?? "json";
         if (arg.schema) {
           pickPaths = extractSchemaKeys(arg.schema);
         }
       }
-      const streamId = engine.stream_create();
+      const FORMAT_CODE = format === "jsonl" ? 1 : format === "json5" ? 2 : 0;
+      const streamId = engine.stream_create(FORMAT_CODE);
       if (streamId < 0) {
         throw new Error("VectorJSON: Failed to create streaming parser (max 4 concurrent)");
       }
@@ -1769,6 +1849,7 @@ export async function init(options?: {
 
       // Byte scanner state
       let scanInString = false;
+      let scanQuoteChar = 0x22; // tracks which quote (" or ') opened the current string
       let scanEscapeNext = false;
       let scanDepth = 0;
       let scanContext: ('o' | 'a')[] = [];
@@ -1783,6 +1864,32 @@ export async function init(options?: {
       // spSkipDepth >= 0 means we're inside a non-picked field and should skip building.
       let spKeyStack: (string | null)[] = [];
       let spSkipDepth = -1;
+
+      /** Reset all live document builder and scanner state (used by JSONL resetForNext). */
+      function spReset() {
+        ldRoot = undefined;
+        ldStack.length = 0;
+        ldCurrentKey = null;
+        ldActiveKey = null;
+        ldStringAccum = '';
+        ldInStringValue = false;
+        ldScalarAccum = '';
+        scanInString = false;
+        scanQuoteChar = 0x22;
+        scanEscapeNext = false;
+        scanDepth = 0;
+        scanContext.length = 0;
+        scanExpectingKey = false;
+        scanAfterColon = false;
+        scanKeyAccum = '';
+        scanAccumulatingKey = false;
+        scanInScalar = false;
+        spKeyStack.length = 0;
+        spSkipDepth = -1;
+        prevLen = 0;
+        cachedValue = UNCACHED;
+        cachedRemaining = undefined;
+      }
 
       /** Check if the current path (from spKeyStack + scanDepth) matches any pick path.
        *  Returns true if current path is an ancestor, descendant, or exact match.
@@ -1869,7 +1976,7 @@ export async function init(options?: {
 
           if (scanInString) {
             if (c === 0x5C) { scanEscapeNext = true; continue; }
-            if (c === 0x22) {
+            if (c === scanQuoteChar) {
               scanInString = false;
               if (scanAccumulatingKey) {
                 scanAccumulatingKey = false;
@@ -1938,8 +2045,11 @@ export async function init(options?: {
               }
               break;
             }
-            case 0x22: {
+            case 0x22: // double quote
+            case 0x27: { // single quote (JSON5)
+              if (c === 0x27 && format !== "json5") break;
               scanInString = true;
+              scanQuoteChar = c;
               const isValue = scanAfterColon || scanDepth === 0 || (scanDepth > 0 && scanContext[scanDepth - 1] === 'a');
               if (scanExpectingKey) {
                 scanAccumulatingKey = true;
@@ -1985,10 +2095,43 @@ export async function init(options?: {
               break;
             }
             default: {
-              if (spSkipDepth >= 0) break; // skip scalars inside non-picked fields
+              // JSON5 unquoted keys: identifier chars when expecting a key
+              if (format === "json5" && scanExpectingKey && isJson5IdentStart(c)) {
+                let j = i + 1;
+                while (j < to && isJson5IdentPart(buf[j])) j++;
+                const key = utf8Decoder.decode(buf.slice(i, j));
+                ldCurrentKey = key;
+                if (picking && scanDepth > 0) spKeyStack[scanDepth - 1] = key;
+                scanExpectingKey = false;
+                i = j - 1; // -1 because loop increments
+                break;
+              }
+              if (spSkipDepth >= 0) break;
               const isValuePos = scanAfterColon || scanDepth === 0 || (scanDepth > 0 && scanContext[scanDepth - 1] === 'a');
               if (isValuePos) {
-                if (c >= 0x30 && c <= 0x39 || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E) {
+                // JSON5 hex number: 0x...
+                if (format === "json5" && c === 0x30 && i + 1 < to && (buf[i + 1] === 0x78 || buf[i + 1] === 0x58)) {
+                  let j = i + 2;
+                  while (j < to) {
+                    const h = buf[j];
+                    if (!((h >= 0x30 && h <= 0x39) || (h >= 0x61 && h <= 0x66) || (h >= 0x41 && h <= 0x46))) break;
+                    j++;
+                  }
+                  if (j < to) {
+                    const hexStr = utf8Decoder.decode(buf.slice(i, j));
+                    spSetValue(parseInt(hexStr, 16));
+                    i = j - 1;
+                  } else {
+                    scanInScalar = true;
+                    ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
+                    i = to;
+                  }
+                  scanAfterColon = false;
+                  break;
+                }
+                const isScalarStart = (c >= 0x30 && c <= 0x39) || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E
+                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B));
+                if (isScalarStart) {
                   let j = i + 1;
                   while (j < to) {
                     const sc = buf[j];
@@ -1997,7 +2140,7 @@ export async function init(options?: {
                   }
                   if (j < to) {
                     const scalarStr = utf8Decoder.decode(buf.slice(i, j));
-                    try { spSetValue(JSON.parse(scalarStr)); } catch { spSetValue(null); }
+                    try { spSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { spSetValue(null); }
                     i = j - 1;
                   } else {
                     scanInScalar = true;
@@ -2157,15 +2300,42 @@ export async function init(options?: {
           }
         },
 
+        /** Reset parser state for the next value in JSONL mode. Returns remaining byte count. */
+        resetForNext(): number {
+          const remain = engine.stream_reset_for_next(streamId);
+          spReset();
+          // Scan any leftover bytes that were shifted to the front
+          if (remain > 0) {
+            const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
+            const newLen = engine.stream_get_buffer_len(streamId);
+            const status = engine.stream_get_status(streamId);
+            const scanEnd = (status === 1 || status === 3)
+              ? Math.min(newLen, engine.stream_get_value_len(streamId))
+              : newLen;
+            if (scanEnd > 0) {
+              const wasmBuf = new Uint8Array(engine.memory.buffer, bufPtr, scanEnd);
+              spScan(wasmBuf, 0, scanEnd);
+            }
+            prevLen = newLen;
+          }
+          return remain;
+        },
+
         [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined> {
           if (!source) throw new Error("No source provided — use feed() for push-based parsing");
           const self = this;
           const reader = isReadableStream(source) ? source.getReader() : null;
           const iter = reader ? null : (source as AsyncIterable<any>)[Symbol.asyncIterator]();
           let finished = false;
+          const jsonlQueue: unknown[] = [];
 
           return {
-            async next() {
+            async next(): Promise<IteratorResult<unknown | undefined>> {
+              // Drain JSONL queue first
+              if (jsonlQueue.length > 0) {
+                return { done: false, value: jsonlQueue.shift() };
+              }
+
               if (finished) {
                 self.destroy();
                 return { done: true as const, value: undefined };
@@ -2182,19 +2352,33 @@ export async function init(options?: {
               }
 
               const status = self.feed(result.value);
-              const partial = self.getValue();
 
-              if (status === "complete" || status === "end_early") {
-                finished = true;
-                return { done: false, value: partial };
-              }
               if (status === "error") {
                 finished = true;
                 self.destroy();
                 throw new SyntaxError("VectorJSON: Parse error in stream");
               }
 
-              return { done: false, value: partial };
+              if (format === "jsonl" && (status === "complete" || status === "end_early")) {
+                const value = self.getValue();
+                self.resetForNext();
+                // Check if remaining bytes already contain complete values
+                let nextStatus = engine.stream_get_status(streamId);
+                while (nextStatus === 1 || nextStatus === 3) {
+                  const nextVal = self.getValue();
+                  jsonlQueue.push(nextVal);
+                  self.resetForNext();
+                  nextStatus = engine.stream_get_status(streamId);
+                }
+                return { done: false, value };
+              }
+
+              if (status === "complete" || status === "end_early") {
+                finished = true;
+                return { done: false, value: self.getValue() };
+              }
+
+              return { done: false, value: self.getValue() };
             },
             async return() {
               finished = true;

@@ -48,6 +48,11 @@ pub const FullOptions = struct {
     /// When parsing from a slice, you must ensure it is padded or undefined behavior will
     /// occur.
     assume_padding: bool = false,
+
+    /// Enable JSON5 extensions: Infinity, -Infinity, +Infinity, NaN as f64 values.
+    /// The pre-processor handles comments, trailing commas, unquoted keys, etc.
+    /// This option only affects the tape parser (visitPrimitive).
+    json5: bool = false,
 };
 
 pub fn FullParser(comptime options: FullOptions) type {
@@ -476,18 +481,41 @@ pub fn Parser(comptime options: FullOptions) type {
 
             inline fn visitPrimitive(self: *Tape, ptr: [*]const u8) Error!void {
                 const t = ptr[0];
-                switch (t) {
-                    '"' => {
-                        @branchHint(.likely);
-                        return self.visitString(ptr);
-                    },
-                    't' => return self.visitTrue(ptr),
-                    'f' => return self.visitFalse(ptr),
-                    'n' => return self.visitNull(ptr),
-                    else => {
-                        @branchHint(.likely);
-                        return self.visitNumber(ptr);
-                    },
+                if (comptime options.json5) {
+                    switch (t) {
+                        '"' => return self.visitString(ptr),
+                        't' => return self.visitTrue(ptr),
+                        'f' => return self.visitFalse(ptr),
+                        'n' => {
+                            if (ptr[1] == 'u') return self.visitNull(ptr);
+                            return self.visitNaN(ptr);
+                        },
+                        'I' => return self.visitInfinity(ptr, false),
+                        '+' => {
+                            if (ptr[1] == 'I') return self.visitInfinity(ptr + 1, false);
+                            return self.visitNumber(ptr);
+                        },
+                        '-' => {
+                            if (ptr[1] == 'I') return self.visitInfinity(ptr + 1, true);
+                            return self.visitNumber(ptr);
+                        },
+                        'N' => return self.visitNaN(ptr),
+                        else => return self.visitNumber(ptr),
+                    }
+                } else {
+                    switch (t) {
+                        '"' => {
+                            @branchHint(.likely);
+                            return self.visitString(ptr);
+                        },
+                        't' => return self.visitTrue(ptr),
+                        'f' => return self.visitFalse(ptr),
+                        'n' => return self.visitNull(ptr),
+                        else => {
+                            @branchHint(.likely);
+                            return self.visitNumber(ptr);
+                        },
+                    }
                 }
             }
 
@@ -531,6 +559,7 @@ pub fn Parser(comptime options: FullOptions) type {
             }
 
             inline fn visitNumber(self: *Tape, ptr: [*]const u8) Error!void {
+                @setEvalBranchQuota(10000);
                 const number = try @import("parsers/number/parser.zig").parse(null, ptr);
                 switch (number) {
                     inline else => |n| {
@@ -569,6 +598,26 @@ pub fn Parser(comptime options: FullOptions) type {
                 self.appendWordAssumeCapacity(.{
                     .tag = .null,
                     .data = undefined,
+                });
+            }
+
+            inline fn visitInfinity(self: *Tape, ptr: [*]const u8, negative: bool) Error!void {
+                const atoms = @import("parsers/atoms.zig");
+                try atoms.checkInfinity(ptr);
+                const val: f64 = if (negative) -std.math.inf(f64) else std.math.inf(f64);
+                self.appendTwoWordsAssumeCapacity(.{
+                    .{ .tag = .double, .data = undefined },
+                    @bitCast(val),
+                });
+            }
+
+            inline fn visitNaN(self: *Tape, ptr: [*]const u8) Error!void {
+                const atoms = @import("parsers/atoms.zig");
+                try atoms.checkNaN(ptr);
+                const val: f64 = std.math.nan(f64);
+                self.appendTwoWordsAssumeCapacity(.{
+                    .{ .tag = .double, .data = undefined },
+                    @bitCast(val),
                 });
             }
         };

@@ -33,3 +33,24 @@ pub inline fn checkNull(ptr: [*]const u8) Error!void {
     if ((dword_null ^ dword_atom | @intFromBool(not_struct_white[chunk[4]])) != 0)
         return error.IncorrectType;
 }
+
+/// Check "Infinity" literal (8 chars + structural/whitespace after).
+pub inline fn checkInfinity(ptr: [*]const u8) Error!void {
+    const not_struct_white = common.tables.is_structural_or_whitespace_negated;
+    // Check "Infi" as u32
+    const dword_infi = readInt(u32, "Infi", native_endian);
+    const dword_atom1 = readInt(u32, ptr[0..4], native_endian);
+    if (dword_infi ^ dword_atom1 != 0) return error.IncorrectType;
+    // Check "nity" as u32
+    const dword_nity = readInt(u32, "nity", native_endian);
+    const dword_atom2 = readInt(u32, ptr[4..8], native_endian);
+    if ((dword_nity ^ dword_atom2 | @intFromBool(not_struct_white[ptr[8]])) != 0)
+        return error.IncorrectType;
+}
+
+/// Check "NaN" literal (3 chars + structural/whitespace after).
+pub inline fn checkNaN(ptr: [*]const u8) Error!void {
+    const not_struct_white = common.tables.is_structural_or_whitespace_negated;
+    if (ptr[0] != 'N' or ptr[1] != 'a' or ptr[2] != 'N' or not_struct_white[ptr[3]])
+        return error.IncorrectType;
+}

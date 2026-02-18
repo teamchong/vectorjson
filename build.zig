@@ -74,7 +74,11 @@ pub fn build(b: *std.Build) void {
         // Input classification & autocomplete
         "classify_input",
         "autocomplete_input",
+        "autocomplete_input_json5",
         "get_value_end",
+        // JSON5 support
+        "doc_parse_fmt",
+        "preprocess_json5",
         // Error code
         "get_error_code",
     };
