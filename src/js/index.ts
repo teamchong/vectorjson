@@ -2444,6 +2444,7 @@ export async function init(options?: {
     },
 
     importTape(buf: ArrayBuffer): unknown {
+      if (buf.byteLength < 8) throw new Error("VectorJSON: tape buffer too small");
       const bytes = new Uint8Array(buf);
       const wasmPtr = engine.alloc(bytes.length) >>> 0;
       if (wasmPtr === 0) throw new Error("VectorJSON: allocation failed for tape import");

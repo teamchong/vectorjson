@@ -1675,20 +1675,27 @@ fn docTapeDims(p: anytype) TapeDims {
     };
 }
 
+/// Packed buffer total size (overflow-safe).
+fn tapePackedSize(d: TapeDims) u32 {
+    const tape_bytes: u64 = @as(u64, d.tape_count) * 8;
+    const total: u64 = 8 + tape_bytes + @as(u64, d.input_len);
+    if (total > std.math.maxInt(u32)) return 0;
+    return @intCast(total);
+}
+
 /// Returns the size needed for the packed tape buffer.
 export fn doc_export_tape_size(doc_id: i32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
-    const d = docTapeDims(p);
-    return 8 + d.tape_count * 8 + d.input_len;
+    return tapePackedSize(docTapeDims(p));
 }
 
 /// Write packed tape buffer to out_ptr. Returns bytes written, or 0 on error.
 export fn doc_export_tape(doc_id: i32, out_ptr: [*]u8, out_cap: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
     const d = docTapeDims(p);
+    const total = tapePackedSize(d);
+    if (total == 0 or out_cap < total) return 0;
     const tape_bytes = d.tape_count * 8;
-    const total: u32 = 8 + tape_bytes + d.input_len;
-    if (out_cap < total) return 0;
 
     // Header: tape_count, input_len (WASM is always little-endian)
     const header: [*]align(1) u32 = @ptrCast(out_ptr);
@@ -1713,7 +1720,10 @@ export fn doc_import_tape(buf_ptr: [*]const u8, buf_len: u32) i32 {
     const tape_count = header[0];
     const input_len = header[1];
 
-    // Overflow-safe size validation: check tape_bytes won't overflow u32
+    // A valid tape has at least 2 words (root opening + closing)
+    if (tape_count < 2) return -1;
+
+    // Overflow-safe size validation
     const tape_bytes: u64 = @as(u64, tape_count) * 8;
     const expected: u64 = 8 + tape_bytes + @as(u64, input_len);
     if (expected > buf_len) return -1;
@@ -1747,9 +1757,10 @@ export fn doc_import_tape(buf_ptr: [*]const u8, buf_len: u32) i32 {
     // Activate slot
     doc_active[uid] = true;
     doc_is_json5[uid] = false;
-    // Mark src positions as built (empty) — imported tapes lack token data
-    // needed by buildDocSrcPositions, so doc_get_src_pos returns 0xFFFFFFFF.
-    doc_src[uid] = .{ .positions = doc_src[uid].positions, .cap = doc_src[uid].cap, .len = 0, .built = true };
+    // Imported tapes lack token data for buildDocSrcPositions.
+    // Mark as built with len=0 so doc_get_src_pos returns 0xFFFFFFFF.
+    doc_src[uid].len = 0;
+    doc_src[uid].built = true;
 
     return @intCast(uid);
 }

@@ -347,7 +347,7 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
 
           // Pre-encode keys outside the hot loop
           const enc = new TextEncoder();
-          const keys = { name: enc.encode("name"), input: enc.encode("input"), command: enc.encode("command") };
+          const keys = { name: enc.encode("name"), input: enc.encode("input"), command: enc.encode("command"), path: enc.encode("path") };
 
           function findField(docId: number, objIdx: number, key: Uint8Array) {
             const ptr = me.alloc(key.length) >>> 0;
@@ -369,12 +369,18 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
                 const docId = me.doc_import_tape(ptr, bytes.length);
                 me.dealloc(ptr, bytes.length);
 
-                // Read fields via tape navigation
+                if (docId < 0) {
+                  resolve({ mainBlock: performance.now() - t0, parseMs: e.data.parseMs });
+                  return;
+                }
+
+                // Read same fields as other approaches: name, input.command, input.path
                 findField(docId, 1, keys.name);
                 const inputIdx = findField(docId, 1, keys.input);
                 findField(docId, inputIdx, keys.command);
+                findField(docId, inputIdx, keys.path);
 
-                if (docId >= 0) me.doc_free(docId);
+                me.doc_free(docId);
 
                 const mainBlock = performance.now() - t0;
                 resolve({ mainBlock, parseMs: e.data.parseMs });

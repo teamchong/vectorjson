@@ -1,6 +1,6 @@
 {
   "name": "vectorjson",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "O(n) WASM SIMD JSON parser for AI agents — stream fields instantly, abort errors early, offload parsing to Workers",
   "type": "module",
   "main": "dist/index.js",
