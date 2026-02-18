@@ -289,3 +289,200 @@ test.describe("Worker Transferable API", () => {
     expect(result.transferTokens).toBe(15);
   });
 });
+
+test.describe("Tape Transfer API", () => {
+  /** WASM helpers injected into page.evaluate — parse, export tape, import tape, find field, read string. */
+  const WASM_HELPERS = `
+    function wasmParse(engine, json) {
+      const encoded = new TextEncoder().encode(json);
+      const ptr = engine.alloc(encoded.length + 64) >>> 0;
+      new Uint8Array(engine.memory.buffer, ptr, encoded.length).set(encoded);
+      new Uint8Array(engine.memory.buffer, ptr + encoded.length, 64).fill(0x20);
+      const docId = engine.doc_parse(ptr, encoded.length);
+      engine.dealloc(ptr, encoded.length + 64);
+      return docId;
+    }
+    function wasmExportTape(engine, docId) {
+      const size = engine.doc_export_tape_size(docId);
+      const outPtr = engine.alloc(size) >>> 0;
+      engine.doc_export_tape(docId, outPtr, size);
+      const buf = new ArrayBuffer(size);
+      new Uint8Array(buf).set(new Uint8Array(engine.memory.buffer, outPtr, size));
+      engine.dealloc(outPtr, size);
+      return buf;
+    }
+    function wasmImportTape(engine, tapeBuf) {
+      const ptr = engine.alloc(tapeBuf.byteLength) >>> 0;
+      new Uint8Array(engine.memory.buffer, ptr, tapeBuf.byteLength).set(new Uint8Array(tapeBuf));
+      const docId = engine.doc_import_tape(ptr, tapeBuf.byteLength);
+      engine.dealloc(ptr, tapeBuf.byteLength);
+      return docId;
+    }
+    function wasmFindField(engine, docId, objIdx, key) {
+      const k = new TextEncoder().encode(key);
+      const ptr = engine.alloc(k.length) >>> 0;
+      new Uint8Array(engine.memory.buffer, ptr, k.length).set(k);
+      const idx = engine.doc_find_field(docId, objIdx, ptr, k.length);
+      engine.dealloc(ptr, k.length);
+      return idx;
+    }
+    function wasmReadString(engine, docId, idx) {
+      const rawLen = engine.doc_read_string_raw(docId, idx);
+      if (rawLen === 0) return "";
+      const batchPtr = engine.doc_batch_ptr() >>> 0;
+      const srcOffset = new Uint32Array(engine.memory.buffer, batchPtr, 1)[0];
+      const inputPtr = engine.doc_get_input_ptr(docId) >>> 0;
+      return new TextDecoder().decode(new Uint8Array(engine.memory.buffer, inputPtr + srcOffset, rawLen));
+    }
+  `;
+
+  test("doc_export_tape → doc_import_tape round-trip preserves values", async ({
+    page,
+  }) => {
+    await setupPage(page);
+
+    const result = await page.evaluate(new Function("return (async () => {" + WASM_HELPERS + `
+      const wasmBytes = await fetch("/dist/engine.wasm").then(r => r.arrayBuffer());
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      const engine = instance.exports;
+
+      const docId = wasmParse(engine, '{"name":"Alice","age":30,"nested":{"x":[1,2,3]}}');
+      if (docId < 0) return { error: "parse failed" };
+
+      const tapeBuf = wasmExportTape(engine, docId);
+      engine.doc_free(docId);
+
+      const newDocId = wasmImportTape(engine, tapeBuf);
+      if (newDocId < 0) return { error: "import failed" };
+
+      const result = {
+        rootTag: engine.doc_get_tag(newDocId, 1),
+        count: engine.doc_get_count(newDocId, 1),
+        nameStr: wasmReadString(engine, newDocId, wasmFindField(engine, newDocId, 1, "name")),
+        ageVal: engine.doc_get_number(newDocId, wasmFindField(engine, newDocId, 1, "age")),
+      };
+      engine.doc_free(newDocId);
+      return result;
+    })()`) as any);
+
+    expect(result).not.toHaveProperty("error");
+    expect((result as any).rootTag).toBe(5);
+    expect((result as any).count).toBe(3);
+    expect((result as any).nameStr).toBe("Alice");
+    expect((result as any).ageVal).toBe(30);
+  });
+
+  test("tape transfer via Worker produces correct values", async ({ page }) => {
+    await setupPage(page);
+
+    const result = await page.evaluate(new Function("return (async () => {" + WASM_HELPERS + `
+      const wasmBytes = await fetch("/dist/engine.wasm").then(r => r.arrayBuffer());
+      const wasmU8 = new Uint8Array(wasmBytes);
+      let wasmBin = "";
+      for (let i = 0; i < wasmU8.length; i += 8192)
+        wasmBin += String.fromCharCode(...wasmU8.subarray(i, i + 8192));
+      const wasmB64 = btoa(wasmBin);
+
+      const json = JSON.stringify({
+        type: "tool_use", name: "str_replace_editor",
+        input: { command: "create", path: "/src/app.tsx" },
+        flag: true, nothing: null,
+      });
+
+      const workerCode = \`
+        self.onmessage = async (e) => {
+          const { wasmB64, jsonStr } = e.data;
+          const wasmBytes = Uint8Array.from(atob(wasmB64), c => c.charCodeAt(0));
+          const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+          const engine = instance.exports;
+          const encoded = new TextEncoder().encode(jsonStr);
+          const ptr = engine.alloc(encoded.length + 64) >>> 0;
+          new Uint8Array(engine.memory.buffer, ptr, encoded.length).set(encoded);
+          new Uint8Array(engine.memory.buffer, ptr + encoded.length, 64).fill(0x20);
+          const docId = engine.doc_parse(ptr, encoded.length);
+          engine.dealloc(ptr, encoded.length + 64);
+          const size = engine.doc_export_tape_size(docId);
+          const outPtr = engine.alloc(size) >>> 0;
+          engine.doc_export_tape(docId, outPtr, size);
+          const tapeBuf = new ArrayBuffer(size);
+          new Uint8Array(tapeBuf).set(new Uint8Array(engine.memory.buffer, outPtr, size));
+          engine.dealloc(outPtr, size);
+          engine.doc_free(docId);
+          self.postMessage(tapeBuf, [tapeBuf]);
+        };
+      \`;
+
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const worker = new Worker(URL.createObjectURL(blob));
+      const tapeBuf = await new Promise(resolve => {
+        worker.onmessage = (e) => resolve(e.data);
+        worker.postMessage({ wasmB64, jsonStr: json });
+      });
+      worker.terminate();
+
+      // Import on main thread
+      const { instance: mainInst } = await WebAssembly.instantiate(
+        await fetch("/dist/engine.wasm").then(r => r.arrayBuffer()), {}
+      );
+      const me = mainInst.exports;
+      const docId = wasmImportTape(me, tapeBuf);
+      if (docId < 0) return { error: "import failed" };
+
+      const result = {
+        rootTag: me.doc_get_tag(docId, 1),
+        nameStr: wasmReadString(me, docId, wasmFindField(me, docId, 1, "name")),
+        flagTag: me.doc_get_tag(docId, wasmFindField(me, docId, 1, "flag")),
+        nothingTag: me.doc_get_tag(docId, wasmFindField(me, docId, 1, "nothing")),
+      };
+      me.doc_free(docId);
+      return result;
+    })()`) as any);
+
+    expect(result).not.toHaveProperty("error");
+    expect((result as any).rootTag).toBe(5);
+    expect((result as any).nameStr).toBe("str_replace_editor");
+    expect((result as any).flagTag).toBe(1);
+    expect((result as any).nothingTag).toBe(0);
+  });
+
+  test("export → import tape round-trip preserves nested structure", async ({
+    page,
+  }) => {
+    await setupPage(page);
+
+    const result = await page.evaluate(new Function("return (async () => {" + WASM_HELPERS + `
+      const wasmBytes = await fetch("/dist/engine.wasm").then(r => r.arrayBuffer());
+      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+      const engine = instance.exports;
+
+      const docId = wasmParse(engine, '{"name":"Bob","items":[10,20,30],"nested":{"x":"hello"}}');
+      if (docId < 0) return { error: "parse failed" };
+
+      const tapeBuf = wasmExportTape(engine, docId);
+      engine.doc_free(docId);
+      const newDocId = wasmImportTape(engine, tapeBuf);
+      if (newDocId < 0) return { error: "import failed" };
+
+      const batchPtr = engine.doc_batch_ptr() >>> 0;
+      const itemsIdx = wasmFindField(engine, newDocId, 1, "items");
+      engine.doc_array_elements(newDocId, itemsIdx, 0);
+      const elem0Idx = new Uint32Array(engine.memory.buffer, batchPtr, 1)[0];
+      const nestedIdx = wasmFindField(engine, newDocId, 1, "nested");
+
+      const result = {
+        nameStr: wasmReadString(engine, newDocId, wasmFindField(engine, newDocId, 1, "name")),
+        itemsCount: engine.doc_get_count(newDocId, itemsIdx),
+        item0: engine.doc_get_number(newDocId, elem0Idx),
+        xStr: wasmReadString(engine, newDocId, wasmFindField(engine, newDocId, nestedIdx, "x")),
+      };
+      engine.doc_free(newDocId);
+      return result;
+    })()`) as any);
+
+    expect(result).not.toHaveProperty("error");
+    expect((result as any).nameStr).toBe("Bob");
+    expect((result as any).itemsCount).toBe(3);
+    expect((result as any).item0).toBe(10);
+    expect((result as any).xStr).toBe("hello");
+  });
+});

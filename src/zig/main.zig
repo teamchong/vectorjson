@@ -1649,6 +1649,111 @@ export fn doc_deep_equal(doc_a: i32, idx_a: u32, doc_b: i32, idx_b: u32, ordered
     )) 1 else 0;
 }
 
+// ============================================================
+// Tape Export/Import — transfer parsed tape between contexts
+// ============================================================
+//
+// Packed buffer format:
+//   [0..4)   u32 LE  tape_count (number of u64 tape words)
+//   [4..8)   u32 LE  input_length (byte length of JSON source)
+//   [8..8+T) u64[]   tape words (T = tape_count * 8)
+//   [8+T..)  u8[]    JSON source bytes
+//
+// Total: 8 + tape_count * 8 + input_length
+
+/// Tape dimensions for a parsed document.
+const TapeDims = struct { tape_count: u32, input_len: u32 };
+
+fn docTapeDims(p: anytype) TapeDims {
+    const root_raw: u64 = p.tape.words.items().ptr[0];
+    const closing_root_idx: u32 = @truncate(root_raw >> 8);
+    // document_buffer contains input + SIMD padding (16 bytes)
+    const doc_buf_len: u32 = @intCast(p.document_buffer.items.len);
+    return .{
+        .tape_count = closing_root_idx + 1,
+        .input_len = if (doc_buf_len >= 16) doc_buf_len - 16 else doc_buf_len,
+    };
+}
+
+/// Returns the size needed for the packed tape buffer.
+export fn doc_export_tape_size(doc_id: i32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const d = docTapeDims(p);
+    return 8 + d.tape_count * 8 + d.input_len;
+}
+
+/// Write packed tape buffer to out_ptr. Returns bytes written, or 0 on error.
+export fn doc_export_tape(doc_id: i32, out_ptr: [*]u8, out_cap: u32) u32 {
+    const p = getDocParser(doc_id) orelse return 0;
+    const d = docTapeDims(p);
+    const tape_bytes = d.tape_count * 8;
+    const total: u32 = 8 + tape_bytes + d.input_len;
+    if (out_cap < total) return 0;
+
+    // Header: tape_count, input_len (WASM is always little-endian)
+    const header: [*]align(1) u32 = @ptrCast(out_ptr);
+    header[0] = d.tape_count;
+    header[1] = d.input_len;
+
+    // Tape words + input bytes (without SIMD padding)
+    const tape_src: [*]const u8 = @ptrCast(p.tape.words.items().ptr);
+    @memcpy(out_ptr[8..][0..tape_bytes], tape_src[0..tape_bytes]);
+    @memcpy(out_ptr[8 + tape_bytes ..][0..d.input_len], p.document_buffer.items.ptr[0..d.input_len]);
+
+    return total;
+}
+
+/// Import a packed tape buffer into a free document slot.
+/// Returns slot ID (0..127) on success, or -1 on error.
+export fn doc_import_tape(buf_ptr: [*]const u8, buf_len: u32) i32 {
+    if (buf_len < 8) return -1;
+
+    // Read header (WASM is always little-endian)
+    const header: [*]align(1) const u32 = @ptrCast(buf_ptr);
+    const tape_count = header[0];
+    const input_len = header[1];
+
+    // Overflow-safe size validation: check tape_bytes won't overflow u32
+    const tape_bytes: u64 = @as(u64, tape_count) * 8;
+    const expected: u64 = 8 + tape_bytes + @as(u64, input_len);
+    if (expected > buf_len) return -1;
+
+    // Find free slot
+    const uid: usize = for (doc_active, 0..) |active, i| {
+        if (!active) break i;
+    } else {
+        return -1;
+    };
+
+    const p = &doc_parsers[uid];
+    const tape_bytes_u32: u32 = @intCast(tape_bytes);
+
+    // Copy input into document_buffer (with 16-byte SIMD padding)
+    p.document_buffer.clearRetainingCapacity();
+    p.document_buffer.ensureTotalCapacity(gpa, input_len + 16) catch return -1;
+    p.document_buffer.appendSliceAssumeCapacity(buf_ptr[8 + tape_bytes_u32 ..][0..input_len]);
+    p.document_buffer.appendNTimesAssumeCapacity(' ', 16);
+
+    // Copy tape words
+    p.tape.words.ensureTotalCapacity(gpa, tape_count) catch return -1;
+    p.tape.words.list.clearRetainingCapacity();
+    const tape_dst: [*]u8 = @ptrCast(p.tape.words.list.items.ptr);
+    @memcpy(tape_dst[0..tape_bytes_u32], buf_ptr[8..][0..tape_bytes_u32]);
+    p.tape.words.list.items.len = tape_count;
+
+    // Fix input_base_addr to point to new document_buffer
+    p.tape.input_base_addr = @intFromPtr(p.document_buffer.items.ptr);
+
+    // Activate slot
+    doc_active[uid] = true;
+    doc_is_json5[uid] = false;
+    // Mark src positions as built (empty) — imported tapes lack token data
+    // needed by buildDocSrcPositions, so doc_get_src_pos returns 0xFFFFFFFF.
+    doc_src[uid] = .{ .positions = doc_src[uid].positions, .cap = doc_src[uid].cap, .len = 0, .built = true };
+
+    return @intCast(uid);
+}
+
 fn mapError(err: anytype) i32 {
     return switch (err) {
         error.ExceededDepth => 1,

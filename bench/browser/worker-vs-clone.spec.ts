@@ -88,7 +88,12 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
       const wasmBytes = await fetch("/dist/engine.wasm").then((r) =>
         r.arrayBuffer()
       );
-      const wasmB64 = btoa(String.fromCharCode(...new Uint8Array(wasmBytes)));
+      const wasmU8 = new Uint8Array(wasmBytes);
+      let wasmBin = '';
+      for (let i = 0; i < wasmU8.length; i += 8192) {
+        wasmBin += String.fromCharCode(...wasmU8.subarray(i, i + 8192));
+      }
+      const wasmB64 = btoa(wasmBin);
 
       console.log(
         "╔══════════════════════════════════════════════════════════════════════╗"
@@ -107,6 +112,9 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
       );
       console.log(
         "║   Approach B: Worker stream → getRawBuffer → transferable to main  ║"
+      );
+      console.log(
+        "║   Approach C: Worker parse → tape transfer → zero-parse on main   ║"
       );
       console.log(
         "╚══════════════════════════════════════════════════════════════════════╝"
@@ -276,7 +284,115 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
         }
 
         // ============================================================
-        // Approach C: Direct main-thread baseline (no Worker)
+        // Approach C: Tape transfer (zero-parse on main thread)
+        // ============================================================
+        let tapeMainBlock = 0;
+        let tapeWorkerParse = 0;
+        {
+          const workerCode = `
+            let engine = null;
+            self.onmessage = async (e) => {
+              if (e.data.type === 'init') {
+                const wasmBytes = Uint8Array.from(atob(e.data.wasmB64), c => c.charCodeAt(0));
+                const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+                engine = instance.exports;
+                self.postMessage({ type: 'ready' });
+                return;
+              }
+
+              const jsonStr = e.data;
+              const encoded = new TextEncoder().encode(jsonStr);
+
+              const t0 = performance.now();
+              // Parse
+              const ptr = engine.alloc(encoded.length + 64) >>> 0;
+              new Uint8Array(engine.memory.buffer, ptr, encoded.length).set(encoded);
+              new Uint8Array(engine.memory.buffer, ptr + encoded.length, 64).fill(0x20);
+              const docId = engine.doc_parse(ptr, encoded.length);
+              engine.dealloc(ptr, encoded.length + 64);
+
+              // Export tape
+              const exportSize = engine.doc_export_tape_size(docId);
+              const outPtr = engine.alloc(exportSize) >>> 0;
+              const written = engine.doc_export_tape(docId, outPtr, exportSize);
+              const tapeBuf = new ArrayBuffer(written);
+              new Uint8Array(tapeBuf).set(
+                new Uint8Array(engine.memory.buffer, outPtr, written)
+              );
+              engine.dealloc(outPtr, exportSize);
+              engine.doc_free(docId);
+
+              const parseMs = performance.now() - t0;
+              self.postMessage({ buf: tapeBuf, parseMs }, [tapeBuf]);
+            };
+          `;
+          const blob = new Blob([workerCode], {
+            type: "application/javascript",
+          });
+          const worker = new Worker(URL.createObjectURL(blob));
+
+          await new Promise<void>((resolve) => {
+            worker.onmessage = (e) => {
+              if (e.data.type === "ready") resolve();
+            };
+            worker.postMessage({ type: "init", wasmB64 });
+          });
+
+          // Init WASM on main thread for tape import
+          const { instance: mainInstance } = await WebAssembly.instantiate(
+            await fetch("/dist/engine.wasm").then((r) => r.arrayBuffer()),
+            {}
+          );
+          const me = mainInstance.exports as any;
+
+          // Pre-encode keys outside the hot loop
+          const enc = new TextEncoder();
+          const keys = { name: enc.encode("name"), input: enc.encode("input"), command: enc.encode("command") };
+
+          function findField(docId: number, objIdx: number, key: Uint8Array) {
+            const ptr = me.alloc(key.length) >>> 0;
+            new Uint8Array(me.memory.buffer, ptr, key.length).set(key);
+            const idx = me.doc_find_field(docId, objIdx, ptr, key.length);
+            me.dealloc(ptr, key.length);
+            return idx;
+          }
+
+          for (let i = 0; i < WARMUP + ITERS; i++) {
+            const result: any = await new Promise((resolve) => {
+              worker.onmessage = (e) => {
+                const t0 = performance.now();
+                const bytes = new Uint8Array(e.data.buf as ArrayBuffer);
+
+                // Import tape (zero parse — just memcpy)
+                const ptr = me.alloc(bytes.length) >>> 0;
+                new Uint8Array(me.memory.buffer, ptr, bytes.length).set(bytes);
+                const docId = me.doc_import_tape(ptr, bytes.length);
+                me.dealloc(ptr, bytes.length);
+
+                // Read fields via tape navigation
+                findField(docId, 1, keys.name);
+                const inputIdx = findField(docId, 1, keys.input);
+                findField(docId, inputIdx, keys.command);
+
+                if (docId >= 0) me.doc_free(docId);
+
+                const mainBlock = performance.now() - t0;
+                resolve({ mainBlock, parseMs: e.data.parseMs });
+              };
+              worker.postMessage(payload);
+            });
+            if (i >= WARMUP) {
+              tapeMainBlock += result.mainBlock;
+              tapeWorkerParse += result.parseMs;
+            }
+          }
+          worker.terminate();
+          tapeMainBlock /= ITERS;
+          tapeWorkerParse /= ITERS;
+        }
+
+        // ============================================================
+        // Approach D: Direct main-thread baseline (no Worker)
         // ============================================================
         let directTime = 0;
         {
@@ -302,10 +418,19 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
         console.log(
           `  VectorJSON + transferable:       worker-parse ${formatTime(transferWorkerParse).padStart(10)}  main-block ${formatTime(transferMainBlock).padStart(10)}`
         );
+        console.log(
+          `  VectorJSON + tape transfer:      worker-parse ${formatTime(tapeWorkerParse).padStart(10)}  main-block ${formatTime(tapeMainBlock).padStart(10)}`
+        );
         if (cloneWorkerParse > 0) {
           const workerSpeedup = cloneWorkerParse / transferWorkerParse;
           console.log(
             `  → Worker parse: VectorJSON ${workerSpeedup.toFixed(1)}× ${workerSpeedup > 1 ? "faster" : "slower"}`
+          );
+        }
+        if (transferMainBlock > 0) {
+          const tapeSpeedup = transferMainBlock / tapeMainBlock;
+          console.log(
+            `  → Main-block: tape ${tapeSpeedup.toFixed(1)}× ${tapeSpeedup > 1 ? "faster" : "slower"} than raw transfer`
           );
         }
         console.log("");
@@ -324,7 +449,10 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
         "  object size. With transferable ArrayBuffer, the main thread receives"
       );
       console.log(
-        "  the buffer in O(1) and can parse/access lazily."
+        "  the buffer in O(1) and can parse/access lazily. Tape transfer skips"
+      );
+      console.log(
+        "  re-parsing entirely — the main thread imports the pre-built tape."
       );
     }, sizes);
 
@@ -337,6 +465,9 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
       true
     );
     expect(logs.some((l) => l.includes("VectorJSON + transferable"))).toBe(
+      true
+    );
+    expect(logs.some((l) => l.includes("VectorJSON + tape transfer"))).toBe(
       true
     );
   });

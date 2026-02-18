@@ -59,6 +59,8 @@ export interface StreamingParser<T = unknown> {
   getStatus(): FeedStatus;
   /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
   getRawBuffer(): ArrayBuffer | null;
+  /** Export parsed tape + input as a packed ArrayBuffer for zero-parse transfer. */
+  getTapeBuffer(): ArrayBuffer | null;
   /** Reset for next value in JSONL mode. Shifts remaining bytes, resets state. Returns remaining byte count. */
   resetForNext(): number;
   /** Destroy the parser and free all resources. */
@@ -130,6 +132,8 @@ export interface EventParser {
   getStatus(): FeedStatus;
   /** Copy the accumulated stream buffer into a new ArrayBuffer (for Worker postMessage transfer). */
   getRawBuffer(): ArrayBuffer | null;
+  /** Export parsed tape + input as a packed ArrayBuffer for zero-parse transfer. */
+  getTapeBuffer(): ArrayBuffer | null;
   destroy(): void;
   /** Async iteration over partial values when a source was provided. */
   [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined>;
@@ -245,6 +249,12 @@ export interface VectorJSON {
     schema?: { safeParse: (v: unknown) => { success: boolean; data?: unknown } };
     format?: JsonFormat;
   }): EventParser;
+  /**
+   * Import a packed tape buffer (from `getTapeBuffer()`) into a lazy Proxy.
+   * Skips parsing entirely — the tape is copied directly into a document slot.
+   * Use this on the main thread after receiving a transferred ArrayBuffer from a Worker.
+   */
+  importTape(buf: ArrayBuffer): unknown;
 }
 
 // --- Error codes from Zig engine ---
@@ -303,6 +313,9 @@ interface EngineExports {
   get_value_end(): number;
   doc_parse_fmt(ptr: number, len: number, format: number): number;
   preprocess_json5(ptr: number, len: number): number;
+  doc_export_tape_size(docId: number): number;
+  doc_export_tape(docId: number, outPtr: number, outCap: number): number;
+  doc_import_tape(bufPtr: number, bufLen: number): number;
 }
 
 const utf8Decoder = new TextDecoder('utf-8');
@@ -700,6 +713,36 @@ export async function init(options?: {
     };
     // Root always gets Proxy so .free() is accessible; force objects to Proxy for isComplete()
     return resolveValue(docId, 1, keepAlive, generation, freeFn, rootTag === TAG_OBJECT || proxyObjects);
+  }
+
+  // --- Tape export/import helpers ---
+  /** Parse a stream's buffer, export packed tape, free the temp doc slot. */
+  function streamExportTape(streamId: number): ArrayBuffer | null {
+    const status = engine.stream_get_status(streamId);
+    if (status !== 1 /* complete */ && status !== 3 /* end_early */) return null;
+    const bufPtr = engine.stream_get_buffer_ptr(streamId) >>> 0;
+    const bufLen = engine.stream_get_buffer_len(streamId);
+    if (bufLen === 0) return null;
+    // Copy stream buffer with SIMD padding for doc_parse
+    const padPtr = engine.alloc(bufLen + 64) >>> 0;
+    if (padPtr === 0) return null;
+    new Uint8Array(engine.memory.buffer, padPtr, bufLen).set(
+      new Uint8Array(engine.memory.buffer, bufPtr, bufLen),
+    );
+    new Uint8Array(engine.memory.buffer, padPtr + bufLen, 64).fill(0x20);
+    const docId = engine.doc_parse(padPtr, bufLen);
+    engine.dealloc(padPtr, bufLen + 64);
+    if (docId < 0) return null;
+    // Export tape → JS ArrayBuffer, then free slot
+    const size = engine.doc_export_tape_size(docId);
+    const outPtr = size > 0 ? engine.alloc(size) >>> 0 : 0;
+    if (outPtr === 0) { engine.doc_free(docId); return null; }
+    engine.doc_export_tape(docId, outPtr, size);
+    engine.doc_free(docId);
+    const copy = new ArrayBuffer(size);
+    new Uint8Array(copy).set(new Uint8Array(engine.memory.buffer, outPtr, size));
+    engine.dealloc(outPtr, size);
+    return copy;
   }
 
   // --- Helper: retry doc_parse with GC on slot exhaustion ---
@@ -1715,6 +1758,10 @@ export async function init(options?: {
           return copy;
         },
 
+        getTapeBuffer(): ArrayBuffer | null {
+          return destroyed ? null : streamExportTape(streamId);
+        },
+
         destroy(): void {
           if (!destroyed) {
             engine.stream_destroy(streamId);
@@ -2292,6 +2339,10 @@ export async function init(options?: {
           return copy;
         },
 
+        getTapeBuffer(): ArrayBuffer | null {
+          return destroyed ? null : streamExportTape(streamId);
+        },
+
         destroy(): void {
           if (!destroyed) {
             engine.stream_destroy(streamId);
@@ -2391,6 +2442,17 @@ export async function init(options?: {
         },
       };
     },
+
+    importTape(buf: ArrayBuffer): unknown {
+      const bytes = new Uint8Array(buf);
+      const wasmPtr = engine.alloc(bytes.length) >>> 0;
+      if (wasmPtr === 0) throw new Error("VectorJSON: allocation failed for tape import");
+      new Uint8Array(engine.memory.buffer, wasmPtr, bytes.length).set(bytes);
+      const docId = engine.doc_import_tape(wasmPtr, bytes.length);
+      engine.dealloc(wasmPtr, bytes.length);
+      if (docId < 0) throw new Error("VectorJSON: tape import failed (invalid buffer or no free slots)");
+      return buildDocRoot(docId);
+    },
   };
 
   return _instance;
@@ -2416,3 +2478,6 @@ export const createEventParser = _vj.createEventParser;
 
 /** Eagerly materialize a lazy proxy into plain JS objects. */
 export const materialize = _vj.materialize;
+
+/** Import a packed tape buffer into a lazy Proxy (zero-parse transfer from Worker). */
+export const importTape = _vj.importTape;

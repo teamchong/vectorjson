@@ -124,22 +124,23 @@ for await (const chunk of llmStream({ signal: abort.signal })) {
 }
 ```
 
-**Worker offload** — parse 2-3× faster in a Worker, transfer results in O(1):
+**Worker offload** — parse in a Worker, transfer in O(1), skip re-parsing on main thread:
 
-VectorJSON's `getRawBuffer()` returns flat bytes — `postMessage(buf, [buf])` transfers the backing store pointer in O(1) instead of structured-cloning a full object graph. The main thread lazily accesses only the fields it needs:
+`getTapeBuffer()` exports the SIMD-parsed tape + input as a single packed ArrayBuffer. `postMessage(buf, [buf])` transfers it in O(1). The main thread imports it with `importTape()` — zero parsing, just memcpy into a document slot:
 
 ```js
 // In Worker:
 parser.feed(chunk);
-const buf = parser.getRawBuffer();
-postMessage(buf, [buf]); // O(1) transfer — moves pointer, no copy
+const tape = parser.getTapeBuffer();
+postMessage(tape, [tape]); // O(1) transfer — moves pointer, no copy
 
 // On Main thread:
-const result = parse(new Uint8Array(buf)); // lazy Proxy
-result.value.name; // only materializes what you touch
+import { importTape } from "vectorjson";
+const obj = importTape(tape); // zero parse — tape is already built
+obj.name; // lazy Proxy, same as parse()
 ```
 
-Worker-side parsing is 2-3× faster than `JSON.parse` at 50 KB+. The transferable ArrayBuffer avoids structured clone overhead, and the lazy Proxy on the main thread means you only pay for the fields you access.
+Worker-side parsing is 2-3× faster than `JSON.parse` at 50 KB+. The transferable ArrayBuffer avoids structured clone overhead. Tape transfer eliminates re-parsing on the main thread entirely — **~20× less main-thread blocking** than transferring raw bytes and re-parsing.
 
 ## Benchmarks
 
@@ -463,7 +464,7 @@ JSONL push-based: call `resetForNext()` after each value. JSON5 comments are str
 All functions are available as direct imports — no `init()` needed:
 
 ```js
-import { parse, parsePartialJson, deepCompare, createParser, createEventParser, materialize } from "vectorjson";
+import { parse, parsePartialJson, deepCompare, createParser, createEventParser, materialize, importTape } from "vectorjson";
 ```
 
 ### `init(options?): Promise<VectorJSON>`
@@ -528,6 +529,7 @@ interface StreamingParser<T = unknown> {
   getValue(): T | undefined;  // autocompleted partial while incomplete, final when complete
   getRemaining(): Uint8Array | null;
   getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
+  getTapeBuffer(): ArrayBuffer | null; // packed tape + input for zero-parse transfer
   getStatus(): FeedStatus;
   resetForNext(): number;  // JSONL: reset for next value, returns remaining byte count
   destroy(): void;
@@ -611,6 +613,7 @@ interface EventParser {
   getValue(): unknown | undefined;  // undefined while incomplete, throws on parse errors
   getRemaining(): Uint8Array | null;
   getRawBuffer(): ArrayBuffer | null;  // transferable buffer for Worker postMessage
+  getTapeBuffer(): ArrayBuffer | null; // packed tape + input for zero-parse transfer
   getStatus(): FeedStatus;
   destroy(): void;
   [Symbol.asyncIterator](): AsyncIterableIterator<unknown | undefined>;  // requires source
@@ -709,6 +712,10 @@ deepCompare(
 ### `materialize(value): unknown`
 
 Convert a lazy Proxy into a plain JS object tree. No-op on plain values.
+
+### `importTape(buf: ArrayBuffer): unknown`
+
+Import a packed tape buffer (from `getTapeBuffer()`) into a lazy Proxy. Skips parsing entirely — the pre-built tape is copied directly into a WASM document slot. Returns the same lazy Proxy as `parse()`.
 
 ## Runtime Support
 
