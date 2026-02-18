@@ -5,7 +5,7 @@
 [![gzip size](https://img.shields.io/badge/gzip-~47kB-blue)](https://www.npmjs.com/package/vectorjson)
 [![license](https://img.shields.io/npm/l/vectorjson)](https://github.com/teamchong/vectorjson/blob/main/LICENSE)
 
-O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens, and offload parsing to Workers with transferable ArrayBuffers.
+O(n) streaming JSON parser for LLM tool calls, built on WASM SIMD. Agents act faster with field-level streaming, detect wrong outputs early to abort and save tokens.
 
 ## The Problem
 
@@ -124,9 +124,7 @@ for await (const chunk of llmStream({ signal: abort.signal })) {
 }
 ```
 
-**Worker offload** — parse in a Worker, transfer in O(1), skip re-parsing on main thread:
-
-`getTapeBuffer()` exports the SIMD-parsed tape + input as a single packed ArrayBuffer. `postMessage(buf, [buf])` transfers it in O(1). The main thread imports it with `importTape()` — zero parsing, just memcpy into a document slot:
+**Worker offload** — `getTapeBuffer()` + `importTape()` for lazy access without re-parsing:
 
 ```js
 // In Worker:
@@ -136,11 +134,11 @@ postMessage(tape, [tape]); // O(1) transfer — moves pointer, no copy
 
 // On Main thread:
 import { importTape } from "vectorjson";
-const obj = importTape(tape); // zero parse — tape is already built
-obj.name; // lazy Proxy, same as parse()
+const obj = importTape(tape); // imports pre-built tape, no parse
+obj.name; // lazy Proxy — only materializes fields you access
 ```
 
-Worker-side parsing is 2-3× faster than `JSON.parse` at 50 KB+. The transferable ArrayBuffer avoids structured clone overhead. Tape transfer eliminates re-parsing on the main thread entirely — **~20× less main-thread blocking** than transferring raw bytes and re-parsing.
+**Note:** For full materialization, `JSON.parse` in Worker + structured clone is faster end-to-end — Chrome's C++ structured clone is highly optimized. Tape transfer wins when you only need a few fields on the main thread via lazy Proxy access, avoiding full object materialization.
 
 ## Benchmarks
 
@@ -185,7 +183,6 @@ bun --expose-gc bench/parse-stream.mjs   (one-shot section, CI results)
 VectorJSON is not a replacement for `JSON.parse`. It wins in different scenarios:
 - **Streaming**: O(n) incremental vs O(n²) re-parse on every chunk
 - **Partial access**: read 3 fields from a 100KB payload without materializing the other 97%
-- **Worker transfer**: tape transfer skips re-parsing on the main thread
 - **Deep compare**: WASM tape-level comparison with zero JS allocations
 
 ### Why this matters: main thread availability
@@ -205,11 +202,11 @@ Both approaches detect the tool name (`.name`) at the same chunk — the LLM has
 
 For even more control, use `createEventParser()` for field-level subscriptions or only call `getValue()` once when `feed()` returns `"complete"`.
 
-### Worker Transfer: parse faster, transfer in O(1)
+### Worker Transfer
 
 `bun run bench:worker` (requires Playwright + Chromium)
 
-Measures the full Worker→Main thread pipeline in a real browser. VectorJSON parses 2-3× faster in the Worker at 50 KB+, and `getRawBuffer()` produces a transferable ArrayBuffer — `postMessage(buf, [buf])` moves the backing store pointer in O(1) instead of structured-cloning the parsed object.
+Measures full round-trip time (postMessage → worker parse → transfer → main receive + field access) in a real browser. For full materialization, `JSON.parse` + structured clone wins — Chrome's C++ clone is faster than WASM parse + tape export/import. Tape transfer is useful when you only access a few fields via lazy Proxy on the main thread.
 
 <details>
 <summary>Which products use which parser</summary>

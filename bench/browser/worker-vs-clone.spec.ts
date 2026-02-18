@@ -134,7 +134,7 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
         // ============================================================
         // Approach A: JSON.parse in Worker + structured clone to main
         // ============================================================
-        let cloneMainBlock = 0;
+        let cloneRoundTrip = 0;
         let cloneWorkerParse = 0;
         {
           const workerCode = `
@@ -142,8 +142,8 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
               const t0 = performance.now();
               const obj = JSON.parse(e.data);
               const parseMs = performance.now() - t0;
-              // Structured clone happens here — main thread is blocked
-              // while Chrome deep-copies the entire object graph
+              // Structured clone happens during postMessage —
+              // browser deep-copies the entire object graph
               self.postMessage({ obj, parseMs });
             };
           `;
@@ -153,32 +153,33 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
           const worker = new Worker(URL.createObjectURL(blob));
 
           for (let i = 0; i < WARMUP + ITERS; i++) {
+            // Round-trip: start timing BEFORE postMessage to capture
+            // worker parse + structured clone deserialization + field access
+            const tSend = performance.now();
             const result: any = await new Promise((resolve) => {
               worker.onmessage = (e) => {
-                // Main thread: measure how long we're blocked receiving + reading
-                const t0 = performance.now();
                 const _name = e.data.obj.name;
                 const _cmd = e.data.obj.input.command;
                 const _path = e.data.obj.input.path;
-                const mainBlock = performance.now() - t0;
-                resolve({ mainBlock, parseMs: e.data.parseMs });
+                const roundTrip = performance.now() - tSend;
+                resolve({ roundTrip, parseMs: e.data.parseMs });
               };
               worker.postMessage(payload);
             });
             if (i >= WARMUP) {
-              cloneMainBlock += result.mainBlock;
+              cloneRoundTrip += result.roundTrip;
               cloneWorkerParse += result.parseMs;
             }
           }
           worker.terminate();
-          cloneMainBlock /= ITERS;
+          cloneRoundTrip /= ITERS;
           cloneWorkerParse /= ITERS;
         }
 
         // ============================================================
         // Approach B: VectorJSON stream in Worker + transferable to main
         // ============================================================
-        let transferMainBlock = 0;
+        let transferRoundTrip = 0;
         let transferWorkerParse = 0;
         {
           const workerCode = `
@@ -235,14 +236,13 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
           const mainEngine = mainInstance.exports as any;
 
           for (let i = 0; i < WARMUP + ITERS; i++) {
+            const tSend = performance.now();
             const result: any = await new Promise((resolve) => {
               worker.onmessage = (e) => {
-                // Main thread: measure blocking time for receive + parse + read
-                const t0 = performance.now();
                 const buf = e.data.buf as ArrayBuffer;
                 const bytes = new Uint8Array(buf);
 
-                // Parse on main thread (VectorJSON WASM parse)
+                // Re-parse on main thread
                 const ptr = mainEngine.alloc(bytes.length + 64) >>> 0;
                 new Uint8Array(
                   mainEngine.memory.buffer,
@@ -256,9 +256,6 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
                 ).fill(0x20);
                 const docId = mainEngine.doc_parse(ptr, bytes.length);
 
-                // Read fields via source span (fast path)
-                // In production you'd use the Proxy, but here we verify
-                // the bytes arrived correctly by JSON.parsing the transferred buffer
                 const decoded = new TextDecoder().decode(bytes);
                 const obj = JSON.parse(decoded);
                 const _name = obj.name;
@@ -268,25 +265,25 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
                 if (docId >= 0) mainEngine.doc_free(docId);
                 mainEngine.dealloc(ptr, bytes.length + 64);
 
-                const mainBlock = performance.now() - t0;
-                resolve({ mainBlock, parseMs: e.data.parseMs });
+                const roundTrip = performance.now() - tSend;
+                resolve({ roundTrip, parseMs: e.data.parseMs });
               };
               worker.postMessage(payload);
             });
             if (i >= WARMUP) {
-              transferMainBlock += result.mainBlock;
+              transferRoundTrip += result.roundTrip;
               transferWorkerParse += result.parseMs;
             }
           }
           worker.terminate();
-          transferMainBlock /= ITERS;
+          transferRoundTrip /= ITERS;
           transferWorkerParse /= ITERS;
         }
 
         // ============================================================
         // Approach C: Tape transfer (zero-parse on main thread)
         // ============================================================
-        let tapeMainBlock = 0;
+        let tapeRoundTrip = 0;
         let tapeWorkerParse = 0;
         {
           const workerCode = `
@@ -358,9 +355,9 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
           }
 
           for (let i = 0; i < WARMUP + ITERS; i++) {
+            const tSend = performance.now();
             const result: any = await new Promise((resolve) => {
               worker.onmessage = (e) => {
-                const t0 = performance.now();
                 const bytes = new Uint8Array(e.data.buf as ArrayBuffer);
 
                 // Import tape (zero parse — just memcpy)
@@ -370,7 +367,7 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
                 me.dealloc(ptr, bytes.length);
 
                 if (docId < 0) {
-                  resolve({ mainBlock: performance.now() - t0, parseMs: e.data.parseMs });
+                  resolve({ roundTrip: performance.now() - tSend, parseMs: e.data.parseMs });
                   return;
                 }
 
@@ -382,18 +379,18 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
 
                 me.doc_free(docId);
 
-                const mainBlock = performance.now() - t0;
-                resolve({ mainBlock, parseMs: e.data.parseMs });
+                const roundTrip = performance.now() - tSend;
+                resolve({ roundTrip, parseMs: e.data.parseMs });
               };
               worker.postMessage(payload);
             });
             if (i >= WARMUP) {
-              tapeMainBlock += result.mainBlock;
+              tapeRoundTrip += result.roundTrip;
               tapeWorkerParse += result.parseMs;
             }
           }
           worker.terminate();
-          tapeMainBlock /= ITERS;
+          tapeRoundTrip /= ITERS;
           tapeWorkerParse /= ITERS;
         }
 
@@ -415,50 +412,40 @@ test.describe("Worker Transfer vs Structured Clone Benchmark", () => {
         }
 
         // --- Print results ---
+        // Round-trip = postMessage → worker parse → transfer/clone → main receive + access
+        // This captures structured clone cost that main-block misses
         console.log(
-          `  Direct JSON.parse (no worker):   main-thread ${formatTime(directTime).padStart(10)}`
+          `  Direct JSON.parse (no worker):   total ${formatTime(directTime).padStart(10)}`
         );
         console.log(
-          `  JSON.parse + structured clone:   worker-parse ${formatTime(cloneWorkerParse).padStart(10)}  main-block ${formatTime(cloneMainBlock).padStart(10)}`
+          `  JSON.parse + structured clone:   round-trip ${formatTime(cloneRoundTrip).padStart(10)}  (worker-parse ${formatTime(cloneWorkerParse).padStart(10)})`
         );
         console.log(
-          `  VectorJSON + transferable:       worker-parse ${formatTime(transferWorkerParse).padStart(10)}  main-block ${formatTime(transferMainBlock).padStart(10)}`
+          `  VectorJSON + transferable:       round-trip ${formatTime(transferRoundTrip).padStart(10)}  (worker-parse ${formatTime(transferWorkerParse).padStart(10)})`
         );
         console.log(
-          `  VectorJSON + tape transfer:      worker-parse ${formatTime(tapeWorkerParse).padStart(10)}  main-block ${formatTime(tapeMainBlock).padStart(10)}`
+          `  VectorJSON + tape transfer:      round-trip ${formatTime(tapeRoundTrip).padStart(10)}  (worker-parse ${formatTime(tapeWorkerParse).padStart(10)})`
         );
-        if (cloneWorkerParse > 0) {
-          const workerSpeedup = cloneWorkerParse / transferWorkerParse;
+        if (cloneRoundTrip > 0 && tapeRoundTrip > 0) {
+          const speedup = cloneRoundTrip / tapeRoundTrip;
           console.log(
-            `  → Worker parse: VectorJSON ${workerSpeedup.toFixed(1)}× ${workerSpeedup > 1 ? "faster" : "slower"}`
-          );
-        }
-        if (transferMainBlock > 0) {
-          const tapeSpeedup = transferMainBlock / tapeMainBlock;
-          console.log(
-            `  → Main-block: tape ${tapeSpeedup.toFixed(1)}× ${tapeSpeedup > 1 ? "faster" : "slower"} than raw transfer`
+            `  → Tape transfer ${speedup.toFixed(1)}× ${speedup > 1 ? "faster" : "slower"} round-trip than structured clone`
           );
         }
         console.log("");
       }
 
       console.log(
-        "  Main-block = time the main thread spends receiving + accessing data."
+        "  Round-trip = postMessage → worker parse → transfer → main receive + access."
       );
       console.log(
-        "  With structured clone, the browser must deep-copy the entire object"
+        "  Captures structured clone deserialization that onmessage timing misses."
       );
       console.log(
-        "  graph during postMessage — blocking the main thread proportional to"
+        "  Structured clone deep-copies the entire object graph proportional to size."
       );
       console.log(
-        "  object size. With transferable ArrayBuffer, the main thread receives"
-      );
-      console.log(
-        "  the buffer in O(1) and can parse/access lazily. Tape transfer skips"
-      );
-      console.log(
-        "  re-parsing entirely — the main thread imports the pre-built tape."
+        "  Tape transfer moves a flat ArrayBuffer in O(1) and imports without parsing."
       );
     }, sizes);
 
