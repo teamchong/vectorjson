@@ -242,22 +242,6 @@ const result = parser.getValue(); // lazy Proxy — materializes on access
 parser.destroy();
 ```
 
-### Vercel AI SDK-compatible signature
-
-If you have code that calls `parsePartialJson`, VectorJSON provides a compatible function:
-
-```js
-// Before
-import { parsePartialJson } from "ai";
-const { value, state } = parsePartialJson(buffer);
-
-// After
-import { parsePartialJson } from "vectorjson";
-const { value, state } = parsePartialJson(buffer);
-```
-
-> **Note:** AI SDKs (Vercel, Anthropic, TanStack) parse JSON internally inside `streamObject()`, `MessageStream`, etc. — you don't get access to the raw chunks. To use VectorJSON today, work with the raw LLM stream directly (raw fetch, WebSocket, SSE).
-
 ### Event-driven: React to fields as they stream in
 
 When an LLM streams a tool call, you usually care about specific fields at specific times. `createEventParser` lets you subscribe to paths and get notified the moment a value completes or a string grows:
@@ -350,7 +334,7 @@ for await (const partial of createParser({ source: chunks() })) {
 
 Validate and auto-infer types with Zod, Valibot, ArkType, or any lib with `.safeParse()`. Works on all three APIs:
 
-**Streaming parser with typed partial objects** — like Vercel AI SDK's `output`, but O(n) instead of O(n²):
+**Streaming parser with typed partial objects:**
 
 ```ts
 import { z } from 'zod';
@@ -569,7 +553,7 @@ Works with Zod, Valibot, ArkType — any library with `{ safeParse(v) → { succ
 
 ### `parsePartialJson(input, schema?): PartialJsonResult<DeepPartial<T>>`
 
-Compatible with Vercel AI SDK's `parsePartialJson` signature. Returns a plain JS object (not a Proxy). Pass an optional schema for type-safe validation.
+One-shot partial JSON parse. Returns a plain JS object (not a Proxy). Pass an optional schema for type-safe validation.
 
 With a schema, returns `DeepPartial<T>` — all properties are optional because incomplete JSON will have missing fields. When `safeParse` succeeds, returns validated `data`. When `safeParse` fails on a repaired-parse (partial JSON), the raw parsed value is kept — the object is partial, that's expected.
 
@@ -764,7 +748,7 @@ ANTHROPIC_API_KEY=sk-ant-... bun examples/anthropic-tool-call.ts
 OPENAI_API_KEY=sk-...       bun examples/openai-function-call.ts
 ```
 
-See also `examples/ai-usage.ts` for additional patterns (MCP stdio, Vercel AI SDK `streamObject`, NDJSON embeddings).
+See also `examples/ai-usage.ts` for additional patterns (MCP stdio, NDJSON embeddings).
 
 ## Building from Source
 
