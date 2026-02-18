@@ -30,7 +30,7 @@ for await (const chunk of stream) {
 }
 ```
 
-A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n²). At 100KB, Vercel AI SDK spends 6.1 seconds just parsing. Anthropic SDK spends 13.4 seconds.
+A 50KB tool call streamed in ~12-char chunks means ~4,000 full re-parses — O(n²). At 100KB, Vercel AI SDK spends 6.1 seconds just parsing. Anthropic SDK spends 13.4 seconds. Each re-parse also allocates a new string (`buffer += chunk`) and a new object graph — all immediately discarded. That's ~100 MB of throwaway strings for a 50KB payload, plus thousands of intermediate objects, putting heavy pressure on the garbage collector and bloating memory.
 
 ## Quick Start
 
