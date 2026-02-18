@@ -286,6 +286,7 @@ export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
     var expecting_key: bool = false;
     var depth: i32 = 0;
     var last_non_ws: u8 = 0;
+    var last_comma_out_pos: u32 = 0; // track last comma position in output — avoids O(n²) backward scan
     var context_stack: [256]u8 = undefined; // '{' or '['
     var stack_depth: u32 = 0;
 
@@ -375,15 +376,8 @@ export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
         // Handle trailing commas: if last non-ws was ',' and current is '}' or ']'
         if (c == '}' or c == ']') {
             if (last_non_ws == ',') {
-                // Replace the last comma in output with space
-                var j: u32 = o;
-                while (j > 0) {
-                    j -= 1;
-                    if (out_buf[j] == ',') {
-                        out_buf[j] = ' ';
-                        break;
-                    }
-                }
+                // O(1) — replace tracked comma position instead of backward scan
+                out_buf[last_comma_out_pos] = ' ';
             }
             depth -= 1;
             if (stack_depth > 0) stack_depth -= 1;
@@ -425,6 +419,7 @@ export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
 
         if (c == ',') {
             expecting_key = if (stack_depth > 0) context_stack[stack_depth - 1] == '{' else false;
+            last_comma_out_pos = o;
             out_buf[o] = c;
             o += 1;
             last_non_ws = c;
@@ -534,6 +529,7 @@ export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
         }
 
         // Default: copy byte through
+        if (c == ',') last_comma_out_pos = o;
         out_buf[o] = c;
         o += 1;
         last_non_ws = c;
@@ -1476,13 +1472,19 @@ fn tapeDeepEqualIterative(
 
 // ── Unordered (key-order-insensitive) deep equality ──
 //
-// For objects: O(n²) key matching with a bitmask to track used keys in B.
+// For objects: O(n log n) key matching via sorted fingerprint + binary search.
 // Arrays: compared element-by-element in order (array order always matters).
 // Everything else: same as ordered.
 
-/// Max object keys supported by bitmask. Objects larger than this fall back
-/// to ordered comparison (extremely rare in practice — 256 key-value pairs).
-const MAX_UNORDERED_KEYS = 256;
+/// Sort entry for fingerprint-based key lookup.
+const FpEntry = struct { fp: u64, key_idx: u32 };
+
+fn fpLessThan(_: void, a: FpEntry, b: FpEntry) bool {
+    return a.fp < b.fp;
+}
+
+/// Stack buffer size for sorted key arrays. Larger objects heap-allocate.
+const SORT_STACK_MAX = 64;
 
 /// Compare two values recursively with order-insensitive object matching.
 fn tapeDeepEqualUnordered(
@@ -1527,16 +1529,7 @@ fn tapeDeepEqualUnordered(
             if (count_a != childCount(rb)) break :blk false;
             if (count_a == 0) break :blk true;
 
-            // Fall back to ordered comparison for very large objects
-            if (count_a > MAX_UNORDERED_KEYS)
-                break :blk tapeDeepEqualIterative(false, words_a, idx_a, base_a, words_b, idx_b, base_b);
-
-            // Bitmask: 4 × u64 = 256 bits, one per key slot in B
-            var used: [4]u64 = .{ 0, 0, 0, 0 };
-
             // Try ordered comparison first (fast path: keys already in same order).
-            // Compare values inline for primitives, recurse only for containers
-            // (which may have their own keys reordered).
             var all_ordered = true;
             {
                 var ca: u32 = idx_a + 1;
@@ -1547,20 +1540,17 @@ fn tapeDeepEqualUnordered(
                         all_ordered = false;
                         break;
                     }
-                    ca = nextEntryRaw(words_a, ca + 1); // skip past value
+                    ca = nextEntryRaw(words_a, ca + 1);
                     cb = nextEntryRaw(words_b, cb + 1);
                 }
             }
 
             if (all_ordered) {
-                // Keys in same order — compare values via hybrid iterative walk.
-                // For each value: arrays use iterative hybrid (fast), objects
-                // recurse with unordered, primitives compare inline.
                 var ca: u32 = idx_a + 1;
                 var cb: u32 = idx_b + 1;
                 var k: u32 = 0;
                 while (k < count_a) : (k += 1) {
-                    const va: u32 = ca + 1; // value follows key
+                    const va: u32 = ca + 1;
                     const vb: u32 = cb + 1;
                     if (!tapeDeepEqualIterative(true, words_a, va, base_a, words_b, vb, base_b))
                         break :blk false;
@@ -1570,22 +1560,26 @@ fn tapeDeepEqualUnordered(
                 break :blk true;
             }
 
-            // Pre-compute B key tape indices and fingerprints.
-            // This avoids re-walking B with nextEntryRaw on every outer iteration
-            // and enables fast rejection via fingerprint comparison (length + first 4 bytes).
-            var b_fps: [MAX_UNORDERED_KEYS]u64 = undefined;
-            var b_key_idx: [MAX_UNORDERED_KEYS]u32 = undefined;
+            // O(n log n) key matching: sort B keys by fingerprint, binary search for each A key.
+            var stack_buf: [SORT_STACK_MAX]FpEntry = undefined;
+            const heap_buf = if (count_a > SORT_STACK_MAX)
+                gpa.alloc(FpEntry, count_a) catch break :blk false
+            else
+                null;
+            defer if (heap_buf) |h| gpa.free(h);
+            const b_entries: []FpEntry = if (heap_buf) |h| h else stack_buf[0..count_a];
+
             {
                 var kb: u32 = idx_b + 1;
                 var j: u32 = 0;
                 while (j < count_a) : (j += 1) {
-                    b_key_idx[j] = kb;
-                    b_fps[j] = strFingerprint(words_b[kb], base_b);
-                    kb = nextEntryRaw(words_b, kb + 1); // skip past value
+                    b_entries[j] = .{ .fp = strFingerprint(words_b[kb], base_b), .key_idx = kb };
+                    kb = nextEntryRaw(words_b, kb + 1);
                 }
             }
+            std.sort.pdq(FpEntry, b_entries, {}, fpLessThan);
 
-            // Match each key in A against pre-computed B keys.
+            // Match each key in A via binary search into sorted B entries.
             var ka: u32 = idx_a + 1;
             var i: u32 = 0;
             while (i < count_a) : (i += 1) {
@@ -1593,24 +1587,26 @@ fn tapeDeepEqualUnordered(
                 const fp_a = strFingerprint(words_a[ka], base_a);
                 var found = false;
 
-                var j: u32 = 0;
-                while (j < count_a) : (j += 1) {
-                    const bit_word = j >> 6;
-                    const bit_pos: u6 = @truncate(j);
-                    const bit_mask: u64 = @as(u64, 1) << bit_pos;
-
-                    if (used[bit_word] & bit_mask == 0 and b_fps[j] == fp_a) {
-                        // Fingerprint match — verify with full string comparison
-                        if (strEql(words_a[ka], base_a, words_b[b_key_idx[j]], base_b)) {
-                            if (!tapeDeepEqualIterative(
-                                true,
-                                words_a, val_a_idx, base_a,
-                                words_b, b_key_idx[j] + 1, base_b,
-                            )) break :blk false;
-                            used[bit_word] |= bit_mask;
-                            found = true;
-                            break;
-                        }
+                // Binary search for first entry with matching fingerprint
+                const n: u32 = @intCast(b_entries.len);
+                var lo: u32 = 0;
+                var hi: u32 = n;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (b_entries[mid].fp < fp_a) lo = mid + 1 else hi = mid;
+                }
+                // Scan all entries with matching fingerprint (handles collisions)
+                var idx = lo;
+                while (idx < n and b_entries[idx].fp == fp_a) : (idx += 1) {
+                    const bk = b_entries[idx].key_idx;
+                    if (strEql(words_a[ka], base_a, words_b[bk], base_b)) {
+                        if (!tapeDeepEqualIterative(
+                            true,
+                            words_a, val_a_idx, base_a,
+                            words_b, bk + 1, base_b,
+                        )) break :blk false;
+                        found = true;
+                        break;
                     }
                 }
 
