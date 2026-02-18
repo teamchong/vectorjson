@@ -169,6 +169,25 @@ Apple-to-apple: both sides produce a materialized partial object on every chunk.
 
 Stock parsers re-parse the full buffer on every chunk — O(n²). VectorJSON maintains a **live JS object** that grows incrementally on each `feed()`, so `getValue()` is O(1). Total work: O(n).
 
+### What about single-shot JSON.parse?
+
+For one-shot full materialization, `JSON.parse` is faster — it's highly optimized C++ running inside V8. On small payloads it's orders of magnitude faster. On large payloads (500KB+) VectorJSON approaches parity but never beats it for full access:
+
+```
+bun --expose-gc bench/parse-stream.mjs   (one-shot section, CI results)
+
+  1 KB     JSON.parse 2.16M ops/s    VectorJSON 1.37K ops/s    JSON.parse wins
+  10 KB    JSON.parse 9.64K ops/s    VectorJSON 1.37K ops/s    JSON.parse wins
+  500 KB   JSON.parse  490  ops/s    VectorJSON  466  ops/s    ~equal (0.95×)
+  2 MB     JSON.parse  183  ops/s    VectorJSON  172  ops/s    ~equal (0.94×)
+```
+
+VectorJSON is not a replacement for `JSON.parse`. It wins in different scenarios:
+- **Streaming**: O(n) incremental vs O(n²) re-parse on every chunk
+- **Partial access**: read 3 fields from a 100KB payload without materializing the other 97%
+- **Worker transfer**: tape transfer skips re-parsing on the main thread
+- **Deep compare**: WASM tape-level comparison with zero JS allocations
+
 ### Why this matters: main thread availability
 
 The real cost isn't just CPU time — it's blocking the agent's main thread. Simulating an Anthropic `tool_use` content block (`str_replace_editor`) streamed in ~12-char chunks:
