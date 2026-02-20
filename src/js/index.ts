@@ -85,16 +85,22 @@ export interface CreateParserOptions<T = unknown> {
   format?: JsonFormat;
 }
 
-export interface ParseResult {
-  status: ParseStatus;
-  value?: unknown;
-  remaining?: Uint8Array;
-  error?: string;
+/** Base fields shared by all ParseResult variants. */
+interface ParseResultBase {
   /** Check if a value (object/array) from an incomplete parse is fully present in the original input. */
   isComplete(value: unknown): boolean;
   /** Full materialization via JSON.parse — fastest way to get a plain JS object tree. */
   toJSON(): unknown;
+  /** Release WASM resources immediately. Only present on object/array results. */
+  free?: () => void;
 }
+
+/** Discriminated union — narrows `value`/`error`/`remaining` when you check `status`. */
+export type ParseResult =
+  | (ParseResultBase & { status: "complete"; value: unknown })
+  | (ParseResultBase & { status: "complete_early"; value: unknown; remaining: Uint8Array })
+  | (ParseResultBase & { status: "incomplete"; value: unknown | undefined })
+  | (ParseResultBase & { status: "invalid"; value: undefined; error: string });
 
 // --- EventParser Types ---
 
@@ -432,6 +438,14 @@ export async function init(options?: {
       docGenerations.delete(docId);
       docInputs.delete(docId);
       engine.doc_free(docId);
+    },
+  );
+
+  // --- FinalizationRegistry for auto-cleanup of stream parser slots ---
+  // Prevents stream slot leaks when users forget to call .destroy()
+  const streamRegistry = new FinalizationRegistry(
+    (streamId: number) => {
+      engine.stream_destroy(streamId);
     },
   );
 
@@ -774,10 +788,18 @@ export async function init(options?: {
     let state = SEEKING;
     let buf = '';
     let fenceBacktickCount = 0;
+    let thinkPending = ''; // buffered tail that might be a partial </think>
+    const CLOSE_THINK = '</think>';
 
     return {
       feed(text: string): string | null {
         if (state === FEEDING) return text;
+
+        // Prepend any pending buffer from a split </think> tag
+        if (thinkPending) {
+          text = thinkPending + text;
+          thinkPending = '';
+        }
 
         const cbs = textCallbacks ?? [];
         let result = '';
@@ -790,15 +812,29 @@ export async function init(options?: {
           }
 
           if (state === IN_THINK) {
-            const closeIdx = text.indexOf('</think>', i);
+            const closeIdx = text.indexOf(CLOSE_THINK, i);
             if (closeIdx === -1) {
-              const captured = text.slice(i);
-              for (const cb of cbs) cb(captured);
+              // Check if the tail could be a partial </think> tag
+              const remaining = text.slice(i);
+              let holdBack = 0;
+              for (let k = Math.min(remaining.length, CLOSE_THINK.length - 1); k > 0; k--) {
+                if (CLOSE_THINK.startsWith(remaining.slice(remaining.length - k))) {
+                  holdBack = k;
+                  break;
+                }
+              }
+              if (holdBack > 0) {
+                const emitPart = remaining.slice(0, remaining.length - holdBack);
+                if (emitPart) for (const cb of cbs) cb(emitPart);
+                thinkPending = remaining.slice(remaining.length - holdBack);
+              } else {
+                if (remaining) for (const cb of cbs) cb(remaining);
+              }
               i = text.length;
             } else {
               const captured = text.slice(i, closeIdx);
               if (captured) for (const cb of cbs) cb(captured);
-              i = closeIdx + '</think>'.length;
+              i = closeIdx + CLOSE_THINK.length;
               state = SEEKING;
               buf = '';
             }
@@ -953,11 +989,9 @@ export async function init(options?: {
         error?: string,
       ): ParseResult => {
         let _toJSONCache: unknown = UNCACHED;
-        return {
+        const base: any = {
           status,
           value,
-          remaining,
-          error,
           isComplete(val: unknown): boolean {
             if (autocompleteBoundary === Infinity) return true;
             if (val === null || val === undefined || typeof val !== "object") return true;
@@ -980,6 +1014,14 @@ export async function init(options?: {
             return (_toJSONCache = toJSONStr !== undefined ? JSON.parse(toJSONStr) : value);
           },
         };
+        if (remaining !== undefined) base.remaining = remaining;
+        if (error !== undefined) base.error = error;
+        // Expose .free() from root proxy value if present
+        if (value !== null && typeof value === "object") {
+          const freeFn = (value as any).free;
+          if (typeof freeFn === "function") base.free = freeFn;
+        }
+        return base as ParseResult;
       };
 
       // Helper: build an invalid ParseResult from the last engine error code
@@ -1085,7 +1127,7 @@ export async function init(options?: {
           if (schema) {
             const validated = schema.safeParse(value);
             if (validated.success) return { value: validated.data, state: "successful-parse" as const };
-            return { value: undefined, state: "successful-parse" as const };
+            return { value: undefined, state: "failed-parse" as const };
           }
           return { value, state: "successful-parse" as const };
         }
@@ -1126,6 +1168,8 @@ export async function init(options?: {
       }
 
       let destroyed = false;
+      const sentinel = {};
+      streamRegistry.register(sentinel, streamId, sentinel);
 
       // --- Subscription storage ---
       type Sub = { segments: PathSegment[]; callback: Function; schema?: { safeParse: Function } };
@@ -1768,6 +1812,7 @@ export async function init(options?: {
         destroy(): void {
           if (!destroyed) {
             engine.stream_destroy(streamId);
+            streamRegistry.unregister(sentinel);
             destroyed = true;
           }
         },
@@ -1887,6 +1932,8 @@ export async function init(options?: {
       let destroyed = false;
       let cachedValue: unknown = UNCACHED;
       let cachedRemaining: Uint8Array | null | undefined; // undefined = not yet cached
+      const sentinel = {};
+      streamRegistry.register(sentinel, streamId, sentinel);
 
       // --- Live document builder state (same approach as EventParser) ---
       let ldRoot: unknown = undefined;
@@ -2349,6 +2396,7 @@ export async function init(options?: {
         destroy(): void {
           if (!destroyed) {
             engine.stream_destroy(streamId);
+            streamRegistry.unregister(sentinel);
             destroyed = true;
             cachedValue = UNCACHED;
           }

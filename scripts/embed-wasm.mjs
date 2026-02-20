@@ -2,7 +2,7 @@
  * Embed WASM binary as base64 string in a TypeScript module.
  * Reads dist/engine.wasm → writes src/js/engine-wasm.generated.ts
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,7 +10,29 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const wasmPath = join(root, "dist", "engine.wasm");
 const outPath = join(root, "src", "js", "engine-wasm.generated.ts");
 
+if (!existsSync(wasmPath)) {
+  console.error(`❌ WASM file not found: ${wasmPath}`);
+  console.error("   Run 'bun run build:zig && bun run build:opt' first.");
+  process.exit(1);
+}
+
 const wasmBytes = readFileSync(wasmPath);
+
+// Validate WASM magic number: \0asm (0x00 0x61 0x73 0x6d)
+if (
+  wasmBytes.length < 4 ||
+  wasmBytes[0] !== 0x00 ||
+  wasmBytes[1] !== 0x61 ||
+  wasmBytes[2] !== 0x73 ||
+  wasmBytes[3] !== 0x6d
+) {
+  console.error(`❌ Invalid WASM file: ${wasmPath}`);
+  console.error(
+    `   Expected magic bytes \\0asm, got: ${wasmBytes.slice(0, 4).toString("hex")}`,
+  );
+  process.exit(1);
+}
+
 const b64 = wasmBytes.toString("base64");
 
 writeFileSync(

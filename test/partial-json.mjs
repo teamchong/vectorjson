@@ -510,9 +510,9 @@ test("schema: complete valid JSON passes validation", () => {
   assertEqual(r.value, { name: "Alice", age: 30 });
 });
 
-test("schema: complete JSON fails validation → value undefined, state preserved", () => {
+test("schema: complete JSON fails validation → value undefined, failed-parse", () => {
   const r = parsePartialJson('{"name":"Alice"}', userSchema); // missing age
-  assertEqual(r.state, "successful-parse");
+  assertEqual(r.state, "failed-parse");
   assertEqual(r.value, undefined);
 });
 
@@ -547,9 +547,9 @@ test("schema: transformation applied (data differs from raw parse)", () => {
   assertEqual(r.value, { name: "ALICE" });
 });
 
-test("schema: complete_early JSON fails validation → value undefined", () => {
+test("schema: complete_early JSON fails validation → value undefined, failed-parse", () => {
   const r = parsePartialJson('{"name":"Alice"}{"b":2}', userSchema); // complete_early, missing age
-  assertEqual(r.state, "successful-parse");
+  assertEqual(r.state, "failed-parse");
   assertEqual(r.value, undefined);
 });
 
