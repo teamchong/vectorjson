@@ -368,5 +368,31 @@ await test("createParser: schema pick fields filter correctly", async () => {
   p.destroy();
 });
 
+// --- doc_find_field: escaped keys should still be accessible via parse() ---
+
+await test("parse: object with escaped key accessible via property access", async () => {
+  // Keys containing backslash escapes have the escape flag set in bit 23.
+  // doc_find_field must mask this bit when comparing lengths.
+  const result = parse('{"key\\nwith\\nnewlines":"found","normal":"ok"}');
+  const val = result.value;
+  assertEqual(val.normal, "ok");
+  // The escaped key should be accessible (either via fast path or ownKeys fallback)
+  assertEqual(val["key\nwith\nnewlines"], "found");
+  result.value.free();
+});
+
+// --- JSONL resetForNext clears scanner state between values ---
+
+await test("createParser: JSONL resetForNext iterates multiple values correctly", async () => {
+  const p = createParser(undefined, { format: "jsonl" });
+  p.feed('{"a":1}\n{"b":2}\n');
+  const val1 = p.getValue();
+  assertEqual(val1.a, 1);
+  p.resetForNext();
+  const val2 = p.getValue();
+  assertEqual(val2.b, 2);
+  p.destroy();
+});
+
 console.log(`\n\uD83D\uDD12 Security Tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

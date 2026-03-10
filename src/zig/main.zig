@@ -746,7 +746,7 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
 
         // Compare raw source bytes against the search key
         const src_ptr: [*]const u8 = @ptrFromInt(p.tape.input_base_addr + w.data.ptr);
-        const raw_len = w.data.len;
+        const raw_len: u32 = @as(u32, w.data.len) & 0x7FFFFF; // mask escape flag (bit 23)
         if (raw_len == key_len and simd.eql(src_ptr, key_ptr, key_len)) {
             return curr + 1; // value is immediately after the key
         }

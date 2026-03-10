@@ -1277,6 +1277,8 @@ export async function init(options?: {
         ptStringValueStart = -1; ptInStringValue = false;
         ptDeltaAccum = ''; ptDeltaByteStart = 0;
         ptInScalar = false; ptScalarStart = -1;
+        ptUnicodeRemaining = 0; ptUnicodeAccum = 0; ptHighSurrogate = 0;
+        ptUtf8Remaining = 0; ptUtf8Accum = 0; ptUtf8Ctx = '';
         ldReset();
       }
 
