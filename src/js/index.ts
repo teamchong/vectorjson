@@ -520,6 +520,7 @@ export async function init(options?: {
   // For containers (objects/arrays), slices the source span from WASM memory
   // and delegates to native JSON.parse — faster than recursive tape walking.
   // For primitives, reads directly from the tape.
+  // Falls back to recursive tape walking when JSON.parse fails (e.g., JSON5 Infinity).
   function deepMaterializeDoc(docId: number, index: number): unknown {
     const tag = engine.doc_get_tag(docId, index);
     if (tag === TAG_NULL) return null;
@@ -538,9 +539,25 @@ export async function init(options?: {
       const raw = new Uint8Array(
         engine.memory.buffer, inputPtr + startPos, closePos + 1 - startPos,
       );
-      return JSON.parse(utf8Decoder.decode(raw));
+      try { return JSON.parse(utf8Decoder.decode(raw)); }
+      catch { return tapeMaterialize(docId, index, tag); }
     }
     return null;
+  }
+
+  /** Recursive tape walker — fallback when JSON.parse fails (JSON5 Infinity, etc.). */
+  function tapeMaterialize(docId: number, index: number, tag: number): unknown {
+    if (tag === TAG_ARRAY) {
+      const indices = readBatchPaginated(engine.doc_array_elements, docId, index);
+      return Array.from(indices, idx => deepMaterializeDoc(docId, idx));
+    }
+    // TAG_OBJECT
+    const keyIndices = readBatchPaginated(engine.doc_object_keys, docId, index);
+    const obj: Record<string, unknown> = {};
+    for (const ki of keyIndices) {
+      obj[docReadString(docId, ki)] = deepMaterializeDoc(docId, ki + 1);
+    }
+    return obj;
   }
 
   /** Batch-read all element tape indices for an array (cached). */
@@ -1866,11 +1883,17 @@ export async function init(options?: {
               ? engine.doc_parse_fmt(bufPtr, valueLen, 2)
               : engine.doc_parse(bufPtr, valueLen);
             if (docId < 0) {
-              const errorCode = engine.get_error_code();
-              const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
-              throw new SyntaxError(`VectorJSON: ${msg}`);
+              // JSON5 values like Infinity can't be represented in WASM tape —
+              // fall back to the live document which was built correctly by ptScan.
+              if (FORMAT_CODE === 2) { value = ldRoot; }
+              else {
+                const errorCode = engine.get_error_code();
+                const msg = ERROR_MESSAGES[errorCode] || `Parse error (code ${errorCode})`;
+                throw new SyntaxError(`VectorJSON: ${msg}`);
+              }
+            } else {
+              value = buildDocRoot(docId);
             }
-            value = buildDocRoot(docId);
           }
           // Schema validation on complete
           if (epSchema) {

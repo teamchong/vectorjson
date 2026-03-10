@@ -3,7 +3,7 @@
  * Covers: tape bounds checking, importTape validation, \uXXXX escapes,
  * UTF-8 multi-byte, stream overflow guard, parsePartialJson schema state.
  */
-import { parse, createParser, createEventParser, importTape, parsePartialJson } from "../dist/index.js";
+import { parse, createParser, createEventParser, importTape, parsePartialJson, materialize } from "../dist/index.js";
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -412,6 +412,19 @@ await test("createEventParser: JSON5 Infinity in live doc via getValue", async (
   const val = ep.getValue();
   assertEqual(val.val, Infinity);
   ep.destroy();
+});
+
+await test("createParser: JSON5 Infinity tape export returns null (inherent limitation)", async () => {
+  const p = createParser(undefined, { format: "json5" });
+  p.feed('{"val": Infinity}');
+  // Infinity can't be represented in zimdjson tape (strict JSON numbers only)
+  // getTapeBuffer gracefully returns null instead of crashing
+  const tape = p.getTapeBuffer();
+  assertEqual(tape, null);
+  // But getValue still works via the live document
+  const val = p.getValue();
+  assertEqual(val.val, Infinity);
+  p.destroy();
 });
 
 await test("createParser: JSON5 Infinity spanning chunk boundary", async () => {
