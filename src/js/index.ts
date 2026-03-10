@@ -1446,7 +1446,19 @@ export async function init(options?: {
                 ptUnicodeAccum = 0;
                 continue;
               }
-              ptKeyAccum += B2C[c];
+              let keyDecoded: string;
+              switch (c) {
+                case 0x6E: keyDecoded = '\n'; break;
+                case 0x72: keyDecoded = '\r'; break;
+                case 0x74: keyDecoded = '\t'; break;
+                case 0x22: keyDecoded = '"'; break;
+                case 0x5C: keyDecoded = '\\'; break;
+                case 0x2F: keyDecoded = '/'; break;
+                case 0x62: keyDecoded = '\b'; break;
+                case 0x66: keyDecoded = '\f'; break;
+                default: keyDecoded = B2C[c]; break;
+              }
+              ptKeyAccum += keyDecoded;
             }
             continue;
           }

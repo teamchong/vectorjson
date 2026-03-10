@@ -342,6 +342,17 @@ await test("parse: isComplete on last nested container", async () => {
   result.value.free();
 });
 
+// --- Event parser: escaped chars in keys decoded in live doc ---
+
+await test("createEventParser: escaped chars in keys appear correctly in getValue", async () => {
+  const ep = createEventParser();
+  ep.feed('{"key\\nname":"hello","key\\ttab":"world"}');
+  const val = ep.getValue();
+  assertEqual(val["key\nname"], "hello");
+  assertEqual(val["key\ttab"], "world");
+  ep.destroy();
+});
+
 // --- createParser with schema-driven pick fields ---
 
 await test("createParser: schema pick fields filter correctly", async () => {
