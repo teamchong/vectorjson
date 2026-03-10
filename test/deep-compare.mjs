@@ -409,6 +409,16 @@ await test("fallback: primitive numbers", () =>
   eq(42, 42, true));
 await test("fallback: primitive strings", () =>
   eq("hello", "hello", true));
+await test("fallback: plain JS objects different key order (ignoreKeyOrder default)", () =>
+  eq({ a: 1, b: 2 }, { b: 2, a: 1 }, true));
+await test("fallback: plain JS nested different key order", () =>
+  eq({ x: { a: 1, b: 2 }, y: 3 }, { y: 3, x: { b: 2, a: 1 } }, true));
+await test("fallback: plain JS different key order with ignoreKeyOrder:false", () =>
+  eqOpts({ a: 1, b: 2 }, { b: 2, a: 1 }, { ignoreKeyOrder: false }, false));
+await test("fallback: mixed proxy and plain object different key order", () => {
+  const proxy = p('{"a":1,"b":2}');
+  eq(proxy, { b: 2, a: 1 }, true);
+});
 
 // ═══════════════════════════════════════════════
 // Summary

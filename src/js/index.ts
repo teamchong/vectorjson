@@ -1168,7 +1168,13 @@ export async function init(options?: {
       }
 
       // Fallback: materialize and compare with JSON round-trip
-      return JSON.stringify(a) === JSON.stringify(b);
+      if (ordered === 1) return JSON.stringify(a) === JSON.stringify(b);
+      // ignoreKeyOrder (default): sort object keys recursively before comparing
+      const sortReplacer = (_k: string, v: unknown) =>
+        v !== null && typeof v === "object" && !Array.isArray(v)
+          ? Object.keys(v as Record<string, unknown>).sort().reduce((o, k) => { (o as any)[k] = (v as any)[k]; return o; }, {})
+          : v;
+      return JSON.stringify(a, sortReplacer) === JSON.stringify(b, sortReplacer);
     },
 
     materialize(value: unknown): unknown {
