@@ -996,6 +996,34 @@ export async function init(options?: {
     return JSON.parse(s);
   }
 
+  /** Parse a JSON5 value from raw source text (scalars + single-quoted strings). */
+  function parseJson5Value(s: string): unknown {
+    try { return JSON.parse(s); } catch { /* fall through for JSON5-specific syntax */ }
+    if (s.length >= 2 && s[0] === "'" && s[s.length - 1] === "'") {
+      // Single-quoted string: convert to double-quoted for JSON.parse
+      let out = '"';
+      const inner = s.slice(1, -1);
+      for (let k = 0; k < inner.length; k++) {
+        const ch = inner[k];
+        if (ch === '\\' && k + 1 < inner.length) {
+          const next = inner[k + 1];
+          if (next === "'") {
+            out += "'"; k++; // \' → ' (unescape; not valid in JSON double-quoted)
+          } else {
+            out += ch; out += next; k++; // preserve all other escape sequences as-is
+          }
+        } else if (ch === '"') {
+          out += '\\"'; // unescaped " inside single-quoted → must escape for JSON
+        } else {
+          out += ch;
+        }
+      }
+      out += '"';
+      return JSON.parse(out);
+    }
+    return parseJson5Scalar(s);
+  }
+
   // --- Public API ---
   _instance = {
     parse(input: string | Uint8Array): ParseResult {
@@ -1351,7 +1379,8 @@ export async function init(options?: {
           const matches = matchPath(sub.segments, true);
           if (!matches) continue;
           let value: unknown;
-          try { value = JSON.parse(utf8Decoder.decode(valueBytes)); } catch { continue; }
+          const str = utf8Decoder.decode(valueBytes);
+          try { value = format === "json5" ? parseJson5Value(str) : JSON.parse(str); } catch { continue; }
           if (sub.schema) {
             const result = sub.schema.safeParse(value);
             if (!result.success) continue;

@@ -379,12 +379,52 @@ await test("json5: eventParser on() with Infinity value", () => {
   const ep = createEventParser({ format: "json5" });
   const values = [];
   ep.on("timeout", (e) => values.push(e.value));
-  // eventParser uses live doc builder, Infinity handled by parseJson5Scalar
   ep.feed('{timeout: Infinity}');
-  // The on() callback may or may not fire depending on ptScan detecting the scalar
-  // At minimum, getValue() should work
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assert(values[0] === Infinity, `Expected Infinity, got ${values[0]}`);
   const v = ep.getValue();
-  assertEqual(v.timeout, Infinity);
+  assert(v.timeout === Infinity, `getValue().timeout should be Infinity, got ${v.timeout}`);
+  ep.destroy();
+});
+
+await test("json5: eventParser on() with hex number value", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("color", (e) => values.push(e.value));
+  ep.feed('{color: 0xFF}');
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], 255);
+  assertEqual(ep.getValue().color, 255);
+  ep.destroy();
+});
+
+await test("json5: eventParser on() with NaN value", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("v", (e) => values.push(e.value));
+  ep.feed('{v: NaN}');
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], null); // NaN → null (same as preprocess_json5)
+  ep.destroy();
+});
+
+await test("json5: eventParser on() with single-quoted string value", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("msg", (e) => values.push(e.value));
+  ep.feed("{msg: 'hello world'}");
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], "hello world");
+  ep.destroy();
+});
+
+await test("json5: eventParser on() single-quoted string with escapes", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("msg", (e) => values.push(e.value));
+  ep.feed("{msg: 'it\\'s a \\\"test\\\"'}");
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], "it's a \"test\"");
   ep.destroy();
 });
 
