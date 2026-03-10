@@ -276,5 +276,39 @@ await test("jsonl: string values with newlines inside", () => {
   p.destroy();
 });
 
+await test("jsonl: eventParser for-await with incomplete remainder across chunks", async () => {
+  // Bug regression: after JSONL reset, incomplete remaining bytes must be scanned
+  // so that ptScan state (depth, keys, etc.) is correct for the next feed().
+  // Chunk 1: complete value + start of next value
+  // Chunk 2: rest of next value
+  async function* chunks() {
+    yield '{"a":1}\n{"b":';
+    yield '2}\n';
+  }
+  const values = [];
+  const ep = createEventParser({ format: "jsonl", source: chunks() });
+  for await (const v of ep) {
+    if (v !== undefined) values.push(JSON.parse(JSON.stringify(v)));
+  }
+  assert(values.length === 2, `Expected 2 values, got ${values.length}`);
+  assert(values.some(v => v.a === 1), "Should contain {a:1}");
+  assert(values.some(v => v.b === 2), "Should contain {b:2}");
+});
+
+await test("jsonl: eventParser for-await path events fire across JSONL boundaries", async () => {
+  // Verify path subscriptions work correctly when values span JSONL resets
+  async function* chunks() {
+    yield '{"key":"val1"}\n{"ke';
+    yield 'y":"val2"}\n';
+  }
+  const values = [];
+  const ep = createEventParser({ format: "jsonl", source: chunks() });
+  ep.on("key", (e) => values.push(e.value));
+  for await (const v of ep) { /* drain */ }
+  assert(values.length === 2, `Expected 2 path events, got ${values.length}: ${JSON.stringify(values)}`);
+  assert(values[0] === "val1", `Expected val1, got ${values[0]}`);
+  assert(values[1] === "val2", `Expected val2, got ${values[1]}`);
+});
+
 console.log(`\n✨ JSONL Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

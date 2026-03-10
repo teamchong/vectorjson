@@ -2051,25 +2051,29 @@ export async function init(options?: {
 
               if (format === "jsonl" && (status === "complete" || status === "end_early")) {
                 const value = ep.getValue();
-                // Reset for next value
-                engine.stream_reset_for_next(streamId);
-                ptReset();
-                seeker.reset();
-                // Check if remaining bytes already contain complete values
-                let nextStatus = engine.stream_get_status(streamId);
-                while (nextStatus === 1 || nextStatus === 3) { // complete or end_early
-                  const bufPtr2 = (engine.stream_get_buffer_ptr(streamId) >>> 0);
-                  const newLen2 = engine.stream_get_buffer_len(streamId);
-                  const scanEnd2 = Math.min(newLen2, engine.stream_get_value_len(streamId));
-                  if (scanEnd2 > 0) {
-                    const wasmBuf2 = new Uint8Array(engine.memory.buffer, bufPtr2, scanEnd2);
-                    ptScan(wasmBuf2, 0, scanEnd2);
-                  }
-                  const nextVal = ep.getValue();
-                  jsonlQueue.push(nextVal);
+
+                // Helper: reset stream for next JSONL value and scan remaining bytes.
+                // Do NOT reset the seeker — it must stay in FEEDING mode so that
+                // subsequent chunks pass through to the stream (JSONL is pure JSON lines).
+                const resetAndScan = () => {
                   engine.stream_reset_for_next(streamId);
                   ptReset();
-                  seeker.reset();
+                  const rl = engine.stream_get_buffer_len(streamId);
+                  if (rl > 0) {
+                    const bp = (engine.stream_get_buffer_ptr(streamId) >>> 0);
+                    const st = engine.stream_get_status(streamId);
+                    const se = (st === 1 || st === 3)
+                      ? Math.min(rl, engine.stream_get_value_len(streamId)) : rl;
+                    if (se > 0) ptScan(new Uint8Array(engine.memory.buffer, bp, se), 0, se);
+                  }
+                };
+
+                resetAndScan();
+                let nextStatus = engine.stream_get_status(streamId);
+                while (nextStatus === 1 || nextStatus === 3) {
+                  const nextVal = ep.getValue();
+                  jsonlQueue.push(nextVal);
+                  resetAndScan();
                   nextStatus = engine.stream_get_status(streamId);
                 }
                 return { done: false, value };
