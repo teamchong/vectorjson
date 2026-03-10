@@ -262,7 +262,7 @@ pub const StreamState = struct {
                         self.root_state = .scalar;
                     }
                 },
-                'I', 'N', '+' => {
+                'I', 'N', '+', '.' => {
                     if (is_json5) {
                         if (self.depth == 0 and self.root_state == .none) {
                             self.root_state = .scalar;

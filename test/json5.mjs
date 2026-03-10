@@ -506,5 +506,20 @@ await test("json5: eventParser on() with unary plus and signed hex values", () =
   ep.destroy();
 });
 
+await test("json5: root-level leading-dot number", () => {
+  const p = createParser({ format: "json5" });
+  const status = p.feed('.5');
+  assertEqual(status, "complete", `Expected complete, got ${status}`);
+  assertEqual(p.getValue(), 0.5, `Expected 0.5, got ${p.getValue()}`);
+  p.destroy();
+});
+
+await test("json5: root-level leading-dot number in JSONL", () => {
+  const p = createParser({ format: "json5" });
+  p.feed('.5\n');
+  assertEqual(p.getValue(), 0.5, `Expected 0.5, got ${p.getValue()}`);
+  p.destroy();
+});
+
 console.log(`\n✨ JSON5 Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);
