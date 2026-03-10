@@ -15,8 +15,12 @@
 import { wasmBase64 } from "./engine-wasm.generated.js";
 
 function decodeBase64(b64: string): Uint8Array {
-  if (typeof Buffer !== "undefined")
-    return new Uint8Array(Buffer.from(b64, "base64").buffer);
+  if (typeof Buffer !== "undefined") {
+    const buf = Buffer.from(b64, "base64");
+    // Buffer.buffer may reference the Node.js pool ArrayBuffer — use
+    // byteOffset/byteLength to view only the decoded slice.
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -356,11 +360,11 @@ export async function init(options?: {
     const path = typeof wasmOpt === "string" ? wasmOpt : fileURLToPath(wasmOpt);
     engineBytes = await readFile(path);
   } else {
-    engineBytes = decodeBase64(wasmBase64).buffer as ArrayBuffer;
+    engineBytes = decodeBase64(wasmBase64) as unknown as BufferSource;
   }
 
   // --- Instantiate Zig engine ---
-  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes as ArrayBuffer, {});
+  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes, {});
   const engine = engineInstance.exports as unknown as EngineExports;
 
   const encoder = new TextEncoder();
