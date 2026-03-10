@@ -1369,7 +1369,7 @@ export async function init(options?: {
               const scalarLen = i - ptScalarStart;
               fireValueComplete(buf.subarray(ptScalarStart, i), ptScalarStart, scalarLen);
               // Live doc: finalize scalar
-              try { ldSetValue(JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
+              try { ldSetValue(format === "json5" ? parseJson5Scalar(ldScalarAccum) : JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
               ldScalarAccum = '';
               ptInScalar = false;
               ptScalarStart = -1;
@@ -1810,7 +1810,7 @@ export async function init(options?: {
             }
             // Finalize pending scalar on complete/end_early
             if ((status === 1 || status === 3) && ptInScalar && ldScalarAccum) {
-              try { ldSetValue(JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
+              try { ldSetValue(format === "json5" ? parseJson5Scalar(ldScalarAccum) : JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
               ldScalarAccum = '';
               ptInScalar = false;
               ptScalarStart = -1;
@@ -1839,7 +1839,7 @@ export async function init(options?: {
                 : partial.startsWith('n') ? 'null'
                 : partial;
               try {
-                const parsed = JSON.parse(completed);
+                const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;
               } catch { /* leave as-is */ }
             } else if (ldInStringValue && ldStack.length === 0) {
@@ -2157,7 +2157,7 @@ export async function init(options?: {
           if (scanInScalar) {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
               if (spSkipDepth < 0) {
-                try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+                try { spSetValue(format === "json5" ? parseJson5Scalar(ldScalarAccum) : JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
               }
               ldScalarAccum = '';
               scanInScalar = false;
@@ -2456,7 +2456,7 @@ export async function init(options?: {
             const completed = s.startsWith('t') ? 'true'
               : s.startsWith('f') ? 'false'
               : s.startsWith('n') ? 'null' : s;
-            try { spSetValue(JSON.parse(completed)); } catch { spSetValue(null); }
+            try { spSetValue(format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed)); } catch { spSetValue(null); }
             ldScalarAccum = '';
             scanInScalar = false;
           }
@@ -2525,7 +2525,7 @@ export async function init(options?: {
                 : partial.startsWith('n') ? 'null'
                 : partial;
               try {
-                const parsed = JSON.parse(completed);
+                const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;
               } catch { /* partial number like "1." — leave as-is */ }
             } else if (ldInStringValue && ldStack.length === 0) {
@@ -2541,7 +2541,7 @@ export async function init(options?: {
 
           // complete or end_early — finalize any pending scalar
           if (scanInScalar && ldScalarAccum) {
-            try { spSetValue(JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
+            try { spSetValue(format === "json5" ? parseJson5Scalar(ldScalarAccum) : JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
             ldScalarAccum = '';
             scanInScalar = false;
           }

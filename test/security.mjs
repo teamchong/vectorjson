@@ -394,5 +394,35 @@ await test("createParser: JSONL resetForNext iterates multiple values correctly"
   p.destroy();
 });
 
+// --- JSON5 Infinity/NaN in streaming live document ---
+
+await test("createParser: JSON5 Infinity value in streaming live doc", async () => {
+  const p = createParser(undefined, { format: "json5" });
+  // Feed Infinity as a value — in JSON5 streaming, scalar may span chunks
+  p.feed('{"val": Infinity, "neg": -Infinity}');
+  const val = p.getValue();
+  assertEqual(val.val, Infinity);
+  assertEqual(val.neg, -Infinity);
+  p.destroy();
+});
+
+await test("createEventParser: JSON5 Infinity in live doc via getValue", async () => {
+  const ep = createEventParser({ format: "json5" });
+  ep.feed('{"val": Infinity}');
+  const val = ep.getValue();
+  assertEqual(val.val, Infinity);
+  ep.destroy();
+});
+
+await test("createParser: JSON5 Infinity spanning chunk boundary", async () => {
+  const p = createParser(undefined, { format: "json5" });
+  // Split "Infinity" across two chunks: "Infi" + "nity}"
+  p.feed('{"val": Infi');
+  p.feed('nity}');
+  const val = p.getValue();
+  assertEqual(val.val, Infinity);
+  p.destroy();
+});
+
 console.log(`\n\uD83D\uDD12 Security Tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);
