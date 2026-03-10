@@ -1468,6 +1468,8 @@ export async function init(options?: {
                   // Low surrogate — combine with pending high surrogate
                   cp = 0x10000 + ((ptHighSurrogate - 0xD800) << 10) + (cp - 0xDC00);
                   ptHighSurrogate = 0;
+                } else if (ptHighSurrogate) {
+                  ptHighSurrogate = 0; // orphan high surrogate — discard
                 }
                 const decoded = String.fromCodePoint(cp);
                 if (ptInStringValue && ptSkipDepth < 0) {
@@ -2291,6 +2293,8 @@ export async function init(options?: {
                 if (cp >= 0xDC00 && cp <= 0xDFFF && spHighSurrogate) {
                   cp = 0x10000 + ((spHighSurrogate - 0xD800) << 10) + (cp - 0xDC00);
                   spHighSurrogate = 0;
+                } else if (spHighSurrogate) {
+                  spHighSurrogate = 0; // orphan high surrogate — discard
                 }
                 const decoded = String.fromCodePoint(cp);
                 if (ldInStringValue && spSkipDepth < 0) ldStringAccum += decoded;
