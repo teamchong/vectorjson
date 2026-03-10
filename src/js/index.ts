@@ -1375,15 +1375,21 @@ export async function init(options?: {
       function fireValueComplete(valueBytes: Uint8Array, offset: number, length: number, ldValue?: unknown) {
         if (pathSubs.length === 0) return;
         const resolvedPath = buildResolvedPath(ptKeyStack, ptIndexStack, ptDepth);
+        // Lazy-parse once: decode + JSON.parse on first matching subscriber, reuse for rest
+        let parsed: unknown = UNCACHED;
+        let parseFailed = false;
         for (const sub of pathSubs) {
           const matches = matchPath(sub.segments, true);
           if (!matches) continue;
-          let value: unknown;
-          const str = utf8Decoder.decode(valueBytes);
-          try { value = format === "json5" ? parseJson5Value(str) : JSON.parse(str); } catch {
-            if (ldValue !== undefined) value = ldValue;
-            else continue;
+          if (parsed === UNCACHED) {
+            const str = utf8Decoder.decode(valueBytes);
+            try { parsed = format === "json5" ? parseJson5Value(str) : JSON.parse(str); } catch {
+              if (ldValue !== undefined) parsed = ldValue;
+              else { parseFailed = true; }
+            }
           }
+          if (parseFailed) continue;
+          let value: unknown = parsed;
           if (sub.schema) {
             const result = sub.schema.safeParse(value);
             if (!result.success) continue;
