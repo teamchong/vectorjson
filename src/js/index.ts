@@ -1028,6 +1028,26 @@ export async function init(options?: {
     return parseJson5Scalar(s);
   }
 
+  /** Autocomplete a partial scalar keyword for getValue() display.
+   *  Matches partial prefixes of true/false/null (all formats) and
+   *  Infinity/NaN with optional sign (JSON5 only). */
+  function completeScalarKeyword(partial: string, fmt: JsonFormat): string {
+    const keywords = ['true', 'false', 'null'];
+    if (fmt === 'json5') keywords.push('Infinity', 'NaN');
+    // Check unsigned keywords
+    for (const kw of keywords) {
+      if (partial.length < kw.length && kw.startsWith(partial)) return kw;
+    }
+    // JSON5 signed variants: +Infinity, -Infinity, +NaN, -NaN
+    if (fmt === 'json5' && partial.length > 1 && (partial[0] === '+' || partial[0] === '-')) {
+      const rest = partial.slice(1);
+      for (const kw of ['Infinity', 'NaN']) {
+        if (rest.length < kw.length && kw.startsWith(rest)) return partial[0] + kw;
+      }
+    }
+    return partial;
+  }
+
   // --- Public API ---
   _instance = {
     parse(input: string | Uint8Array): ParseResult {
@@ -1940,10 +1960,7 @@ export async function init(options?: {
             // Handle pending values not yet committed to ldRoot
             if (ptInScalar && ldScalarAccum) {
               let partial = ldScalarAccum;
-              const completed = partial.startsWith('t') ? 'true'
-                : partial.startsWith('f') ? 'false'
-                : partial.startsWith('n') ? 'null'
-                : partial;
+              const completed = completeScalarKeyword(partial, format);
               try {
                 const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;
@@ -2632,9 +2649,7 @@ export async function init(options?: {
           if (status === 1 || status === 3) { // complete or end_early
             // Autocomplete partial keywords (e.g., "tr" → "true")
             const s = ldScalarAccum;
-            const completed = s.startsWith('t') ? 'true'
-              : s.startsWith('f') ? 'false'
-              : s.startsWith('n') ? 'null' : s;
+            const completed = completeScalarKeyword(s, format);
             try { spSetValue(format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed)); } catch { spSetValue(null); }
             ldScalarAccum = '';
             scanInScalar = false;
@@ -2699,10 +2714,7 @@ export async function init(options?: {
             if (scanInScalar && ldScalarAccum) {
               // Pending scalar: try to autocomplete (e.g., "tr" → true, "1." → 1)
               let partial = ldScalarAccum;
-              const completed = partial.startsWith('t') ? 'true'
-                : partial.startsWith('f') ? 'false'
-                : partial.startsWith('n') ? 'null'
-                : partial;
+              const completed = completeScalarKeyword(partial, format);
               try {
                 const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;

@@ -530,5 +530,82 @@ await test("json5: root-level leading-dot number in JSONL", () => {
   p.destroy();
 });
 
+// --- JSON5 partial keyword streaming edge cases ---
+
+await test("json5: partial 'Inf' stays incomplete", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Inf"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  assertEqual(p.getValue(), Infinity);
+  p.destroy();
+});
+
+await test("json5: partial 'Infini' stays incomplete", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Infini"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  p.destroy();
+});
+
+await test("json5: full 'Infinity' completes", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Infinity"), "complete");
+  assertEqual(p.getValue(), Infinity);
+  p.destroy();
+});
+
+await test("json5: 'Infinity ' with trailing space completes", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Infinity "), "complete");
+  assertEqual(p.getValue(), Infinity);
+  p.destroy();
+});
+
+await test("json5: partial 'Na' stays incomplete", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Na"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  // NaN autocompletes to null via parseJson5Scalar
+  assertEqual(p.getValue(), null);
+  p.destroy();
+});
+
+await test("json5: full 'NaN' completes", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("NaN"), "complete");
+  assertEqual(p.getValue(), null);
+  p.destroy();
+});
+
+await test("json5: partial '-Inf' stays incomplete", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("-Inf"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  assertEqual(p.getValue(), -Infinity);
+  p.destroy();
+});
+
+await test("json5: full '-Infinity' completes", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("-Infinity"), "complete");
+  assertEqual(p.getValue(), -Infinity);
+  p.destroy();
+});
+
+await test("json5: partial '+Na' stays incomplete", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("+Na"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  p.destroy();
+});
+
+await test("json5: 'Inf' + 'inity' across chunks completes", () => {
+  const p = createParser({ format: "json5" });
+  assertEqual(p.feed("Inf"), "incomplete");
+  assertEqual(p.feed("inity"), "complete");
+  assertEqual(p.getValue(), Infinity);
+  p.destroy();
+});
+
 console.log(`\n✨ JSON5 Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

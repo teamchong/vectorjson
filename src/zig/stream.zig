@@ -313,10 +313,22 @@ pub const StreamState = struct {
         for ([_][]const u8{ "true", "false", "null" }) |kw| {
             if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) return false;
         }
+        // JSON5: check Infinity/NaN partial prefixes (unsigned and signed variants)
+        if (self.format == .json5) {
+            const check = if (scalar.len > 0 and (scalar[0] == '+' or scalar[0] == '-'))
+                scalar[1..]
+            else
+                scalar;
+            for ([_][]const u8{ "Infinity", "NaN" }) |kw| {
+                if (check.len > 0 and check.len < kw.len and std.mem.eql(u8, check, kw[0..check.len])) return false;
+            }
+        }
         // Trailing incomplete number char → not complete
         if (scalar.len > 0) {
             const first_ch = scalar[0];
-            if (first_ch == '-' or (first_ch >= '0' and first_ch <= '9')) {
+            if (first_ch == '-' or (first_ch >= '0' and first_ch <= '9') or
+                (self.format == .json5 and (first_ch == '+' or first_ch == '.')))
+            {
                 const last_ch = scalar[scalar.len - 1];
                 if (last_ch == '.' or last_ch == '-' or last_ch == '+' or last_ch == 'e' or last_ch == 'E') return false;
             }
