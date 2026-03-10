@@ -2103,6 +2103,7 @@ export async function init(options?: {
               finished = true;
               ep.destroy();
               if (reader) reader.cancel();
+              else if (iter) iter.return?.();
               return { done: true as const, value: undefined };
             },
             [Symbol.asyncIterator]() { return this; },
@@ -2811,6 +2812,7 @@ export async function init(options?: {
               finished = true;
               self.destroy();
               if (reader) reader.cancel();
+              else if (iter) iter.return?.();
               return { done: true as const, value: undefined };
             },
             [Symbol.asyncIterator]() { return this; },

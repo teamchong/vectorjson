@@ -234,6 +234,28 @@ await testAsync("for-await auto-destroy on break", async () => {
   assertEqual(p.getStatus(), "error");
 });
 
+await testAsync("for-await break calls return() on async generator source", async () => {
+  let cleaned = false;
+  async function* makeSource() {
+    try { while (true) yield '{"i":1}'; }
+    finally { cleaned = true; }
+  }
+  const p = createParser({ source: makeSource() });
+  for await (const partial of p) { break; }
+  assert(cleaned, "async generator finally block should have run");
+});
+
+await testAsync("createEventParser for-await break calls return() on async generator source", async () => {
+  let cleaned = false;
+  async function* makeSource() {
+    try { while (true) yield '{"i":1}'; }
+    finally { cleaned = true; }
+  }
+  const p = createEventParser({ source: makeSource() });
+  for await (const partial of p) { break; }
+  assert(cleaned, "async generator finally block should have run");
+});
+
 test("no source: Symbol.asyncIterator throws", () => {
   const p = createParser();
   parsersToClean.push(p);
