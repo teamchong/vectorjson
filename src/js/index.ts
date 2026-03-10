@@ -364,7 +364,7 @@ export async function init(options?: {
   }
 
   // --- Instantiate Zig engine ---
-  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes, {});
+  const { instance: engineInstance } = await WebAssembly.instantiate(engineBytes as BufferSource, {}) as unknown as WebAssembly.WebAssemblyInstantiatedSource;
   const engine = engineInstance.exports as unknown as EngineExports;
 
   const encoder = new TextEncoder();
@@ -993,7 +993,7 @@ export async function init(options?: {
 
   /** Parse a JSON5 scalar value (handles Infinity, NaN, hex, unary +, leading-dot numbers). */
   function parseJson5Scalar(s: string): unknown {
-    if (s === "NaN") return null; // NaN → null (same as preprocess_json5)
+    if (s === "NaN" || s === "-NaN" || s === "+NaN") return null;
     // Signed hex: parseInt handles +/- and 0x prefix natively
     if (s.length > 2 && (s[0] === '+' || s[0] === '-') && s[1] === '0' && (s[2] === 'x' || s[2] === 'X'))
       return parseInt(s, 16);
@@ -1268,7 +1268,7 @@ export async function init(options?: {
       // UTF-8 multi-byte state
       let ptUtf8Remaining = 0;                       // continuation bytes still needed
       let ptUtf8Accum = 0;                           // accumulated codepoint
-      let ptUtf8Ctx: 'delta' | 'key' | 'both' | '' = ''; // which accumulator gets the decoded char
+      let ptUtf8Ctx: 'delta' | 'key' | '' = '';
 
       // --- Live document builder ---
       // Incrementally builds a JS object/array as bytes are scanned.
@@ -1519,11 +1519,9 @@ export async function init(options?: {
                 default: decoded = B2C[c]; break;
               }
               ptDeltaAccum += decoded;
-              // Live doc: accumulate decoded escape char (batched — flushed at string close or chunk end)
               if (ldInStringValue) {
                 ldStringAccum += decoded;
               }
-              if (ptAccumulatingKey) ptKeyAccum += decoded;
             } else if (ptAccumulatingKey) {
               if (c === 0x75) { // u → \uXXXX in key
                 ptUnicodeRemaining = 4;
@@ -1590,7 +1588,6 @@ export async function init(options?: {
               if (ptInStringValue && ptSkipDepth < 0) {
                 ptDeltaAccum += B2C[c];
                 if (ldInStringValue) ldStringAccum += B2C[c];
-                if (ptAccumulatingKey) ptKeyAccum += B2C[c];
               } else if (ptAccumulatingKey) {
                 ptKeyAccum += B2C[c];
               }
@@ -1598,28 +1595,27 @@ export async function init(options?: {
               // 2-byte UTF-8 leading byte
               ptUtf8Accum = c & 0x1F;
               ptUtf8Remaining = 1;
-              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? 'delta' : (ptAccumulatingKey ? 'key' : '');
             } else if ((c & 0xF0) === 0xE0) {
               // 3-byte UTF-8 leading byte
               ptUtf8Accum = c & 0x0F;
               ptUtf8Remaining = 2;
-              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? 'delta' : (ptAccumulatingKey ? 'key' : '');
             } else if ((c & 0xF8) === 0xF0) {
               // 4-byte UTF-8 leading byte
               ptUtf8Accum = c & 0x07;
               ptUtf8Remaining = 3;
-              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? 'delta' : (ptAccumulatingKey ? 'key' : '');
             } else if ((c & 0xC0) === 0x80 && ptUtf8Remaining > 0) {
               // UTF-8 continuation byte
               ptUtf8Accum = (ptUtf8Accum << 6) | (c & 0x3F);
               ptUtf8Remaining--;
               if (ptUtf8Remaining === 0) {
                 const ch = String.fromCodePoint(ptUtf8Accum);
-                if (ptUtf8Ctx === 'delta' || ptUtf8Ctx === 'both') {
+                if (ptUtf8Ctx === 'delta') {
                   ptDeltaAccum += ch;
                   if (ldInStringValue) ldStringAccum += ch;
-                }
-                if (ptUtf8Ctx === 'key' || ptUtf8Ctx === 'both') {
+                } else if (ptUtf8Ctx === 'key') {
                   ptKeyAccum += ch;
                 }
               }
@@ -2167,7 +2163,7 @@ export async function init(options?: {
       // UTF-8 multi-byte state
       let spUtf8Remaining = 0;
       let spUtf8Accum = 0;
-      let spUtf8Ctx: 'ld' | 'key' | 'both' | '' = '';
+      let spUtf8Ctx: 'ld' | 'key' | '' = '';
       let scanContext: ('o' | 'a')[] = [];
       let scanExpectingKey = false;
       let scanAfterColon = false;
@@ -2396,20 +2392,20 @@ export async function init(options?: {
               if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             } else if ((c & 0xE0) === 0xC0) {
               spUtf8Accum = c & 0x1F; spUtf8Remaining = 1;
-              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? 'ld' : (scanAccumulatingKey ? 'key' : '');
             } else if ((c & 0xF0) === 0xE0) {
               spUtf8Accum = c & 0x0F; spUtf8Remaining = 2;
-              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? 'ld' : (scanAccumulatingKey ? 'key' : '');
             } else if ((c & 0xF8) === 0xF0) {
               spUtf8Accum = c & 0x07; spUtf8Remaining = 3;
-              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? 'ld' : (scanAccumulatingKey ? 'key' : '');
             } else if ((c & 0xC0) === 0x80 && spUtf8Remaining > 0) {
               spUtf8Accum = (spUtf8Accum << 6) | (c & 0x3F);
               spUtf8Remaining--;
               if (spUtf8Remaining === 0) {
                 const ch = String.fromCodePoint(spUtf8Accum);
-                if (spUtf8Ctx === 'ld' || spUtf8Ctx === 'both') ldStringAccum += ch;
-                if (spUtf8Ctx === 'key' || spUtf8Ctx === 'both') scanKeyAccum += ch;
+                if (spUtf8Ctx === 'ld') ldStringAccum += ch;
+                else if (spUtf8Ctx === 'key') scanKeyAccum += ch;
               }
             }
             continue;

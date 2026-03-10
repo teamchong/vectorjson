@@ -506,6 +506,22 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
             continue;
         }
 
+        // +NaN or -NaN → null (consume sign so output isn't "+null" / "-null")
+        if ((c == '+' or c == '-') and i + 3 < len and ptr[i + 1] == 'N' and ptr[i + 2] == 'a' and ptr[i + 3] == 'N') {
+            out_buf[o] = 'n';
+            o += 1;
+            out_buf[o] = 'u';
+            o += 1;
+            out_buf[o] = 'l';
+            o += 1;
+            out_buf[o] = 'l';
+            o += 1;
+            last_non_ws = 'l';
+            i += 4;
+            expecting_key = false;
+            continue;
+        }
+
         // NaN → null
         if (c == 'N' and i + 2 < len and ptr[i + 1] == 'a' and ptr[i + 2] == 'N') {
             out_buf[o] = 'n';

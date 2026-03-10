@@ -152,6 +152,15 @@ await test("json5: NaN becomes null", () => {
   p.destroy();
 });
 
+await test("json5: -NaN and +NaN become null", () => {
+  const p = createParser({ format: "json5" });
+  p.feed('{"a": -NaN, "b": +NaN}');
+  const v = p.getValue();
+  assertEqual(v.a, null, "Expected -NaN → null");
+  assertEqual(v.b, null, "Expected +NaN → null");
+  p.destroy();
+});
+
 // --- Nested JSON5 features combined ---
 
 await test("json5: combined features", () => {
