@@ -303,5 +303,50 @@ await test("schema: createParser(schema) feeds in chunks then validates", () => 
   p.destroy();
 });
 
+// --- Root scalar streaming edge cases ---
+await test("stream: root partial keyword 'tru' stays incomplete", () => {
+  const p = createParser();
+  assertEqual(p.feed("tru"), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  assertEqual(p.getValue(), true);
+  p.destroy();
+});
+
+await test("stream: root 'tru ' with trailing space stays incomplete", () => {
+  const p = createParser();
+  assertEqual(p.feed("tru "), "incomplete");
+  assertEqual(p.getStatus(), "incomplete");
+  assertEqual(p.getValue(), true);
+  p.destroy();
+});
+
+await test("stream: root 'true ' completes", () => {
+  const p = createParser();
+  assertEqual(p.feed("true "), "complete");
+  assertEqual(p.getValue(), true);
+  p.destroy();
+});
+
+await test("stream: root 'fal ' stays incomplete", () => {
+  const p = createParser();
+  assertEqual(p.feed("fal "), "incomplete");
+  assertEqual(p.getValue(), false);
+  p.destroy();
+});
+
+await test("stream: root '1. ' stays incomplete", () => {
+  const p = createParser();
+  assertEqual(p.feed("1. "), "incomplete");
+  assertEqual(p.getValue(), 1);
+  p.destroy();
+});
+
+await test("stream: root '42 ' completes", () => {
+  const p = createParser();
+  assertEqual(p.feed("42 "), "complete");
+  assertEqual(p.getValue(), 42);
+  p.destroy();
+});
+
 console.log(`\n✨ Phase 2 Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exitCode = 1;

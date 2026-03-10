@@ -45,6 +45,7 @@ pub const StreamState = struct {
 
     // Root value tracking — state machine: none → container/string/scalar → completed
     root_state: enum { none, container, string, scalar, completed } = .none,
+    scalar_start: u32 = 0,
 
     // --- Format ---
     format: Format = .json,
@@ -260,18 +261,22 @@ pub const StreamState = struct {
                 't', 'f', 'n', '-', '0'...'9' => {
                     if (self.depth == 0 and self.root_state == .none) {
                         self.root_state = .scalar;
+                        self.scalar_start = i;
                     }
                 },
                 'I', 'N', '+', '.' => {
                     if (is_json5) {
                         if (self.depth == 0 and self.root_state == .none) {
                             self.root_state = .scalar;
+                            self.scalar_start = i;
                         }
                     }
                 },
                 ' ', '\t', '\n', '\r' => {
                     if (self.depth == 0 and self.root_state == .scalar) {
-                        self.markRootComplete(i);
+                        if (self.isScalarComplete(buf, i)) {
+                            self.markRootComplete(i);
+                        }
                     }
                 },
                 else => {},
@@ -282,9 +287,41 @@ pub const StreamState = struct {
         self.scan_offset = i;
 
         // End of buffer: if we have a pending scalar at root, mark complete
+        // (only if the scalar is actually a valid complete value, not a partial keyword).
+        // Strip trailing whitespace to find true scalar end — whitespace may have
+        // been scanned without terminating the scalar when isScalarComplete was false.
         if (self.root_state == .scalar and self.depth == 0 and !self.in_string) {
-            self.markRootComplete(self.buffer_len);
+            var scalar_end = self.buffer_len;
+            while (scalar_end > self.scalar_start) {
+                const ch = buf[scalar_end - 1];
+                if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+                    scalar_end -= 1;
+                } else break;
+            }
+            if (self.isScalarComplete(buf, scalar_end)) {
+                self.markRootComplete(scalar_end);
+            }
         }
+    }
+
+    /// Check if a root scalar (from scalar_start to end) is a complete value.
+    /// Returns false for partial keyword prefixes (e.g. "tru", "fal", "nu")
+    /// and trailing incomplete number chars (e.g. "1.", "1e", "1e-").
+    fn isScalarComplete(self: *const StreamState, buf: [*]const u8, end: u32) bool {
+        const scalar = buf[self.scalar_start..end];
+        // Partial keyword prefix → not complete
+        for ([_][]const u8{ "true", "false", "null" }) |kw| {
+            if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) return false;
+        }
+        // Trailing incomplete number char → not complete
+        if (scalar.len > 0) {
+            const first_ch = scalar[0];
+            if (first_ch == '-' or (first_ch >= '0' and first_ch <= '9')) {
+                const last_ch = scalar[scalar.len - 1];
+                if (last_ch == '.' or last_ch == '-' or last_ch == '+' or last_ch == 'e' or last_ch == 'E') return false;
+            }
+        }
+        return true;
     }
 
     fn markRootComplete(self: *StreamState, end_offset: u32) void {
@@ -338,6 +375,7 @@ pub const StreamState = struct {
         self.status = .incomplete;
         self.remaining_offset = 0;
         self.root_state = .none;
+        self.scalar_start = 0;
         self.comment_state = .none;
         self.quote_char = '"';
 

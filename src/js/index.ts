@@ -1448,6 +1448,11 @@ export async function init(options?: {
           // Check if we're continuing a scalar from a previous chunk
           if (ptInScalar) {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
+              // Root-level scalars terminated by whitespace: keep as pending
+              const isWsTerm = c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09;
+              if (isWsTerm && ptDepth === 0) {
+                continue; // skip whitespace, leave scalar pending
+              }
               // Scalar ended — fire value complete for the whole span
               const scalarLen = i - ptScalarStart;
               fireValueComplete(buf.subarray(ptScalarStart, i), ptScalarStart, scalarLen);
@@ -1790,10 +1795,20 @@ export async function init(options?: {
                       j++;
                     }
                     if (j < to) {
-                      fireValueComplete(buf.subarray(i, j), i, j - i);
-                      const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
-                      try { ldSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { ldSetValue(null); }
-                      i = j - 1;
+                      const terminator = buf[j];
+                      const isWsTerm = terminator === 0x20 || terminator === 0x0A || terminator === 0x0D || terminator === 0x09;
+                      if (isWsTerm && ptDepth === 0) {
+                        // Root-level scalar terminated by whitespace: keep as pending
+                        ptInScalar = true;
+                        ptScalarStart = i;
+                        ldScalarAccum = utf8Decoder.decode(buf.subarray(i, j));
+                        i = j;
+                      } else {
+                        fireValueComplete(buf.subarray(i, j), i, j - i);
+                        const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
+                        try { ldSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { ldSetValue(null); }
+                        i = j - 1;
+                      }
                     } else {
                       ptInScalar = true;
                       ptScalarStart = i;
@@ -1924,7 +1939,7 @@ export async function init(options?: {
 
             // Handle pending values not yet committed to ldRoot
             if (ptInScalar && ldScalarAccum) {
-              const partial = ldScalarAccum;
+              let partial = ldScalarAccum;
               const completed = partial.startsWith('t') ? 'true'
                 : partial.startsWith('f') ? 'false'
                 : partial.startsWith('n') ? 'null'
@@ -1932,7 +1947,17 @@ export async function init(options?: {
               try {
                 const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;
-              } catch { /* leave as-is */ }
+              } catch {
+                // Strip trailing incomplete number chars: "1." → "1", "1e-" → "1"
+                let stripped = partial;
+                while (stripped.length > 0 && /[.eE+\-]$/.test(stripped)) stripped = stripped.slice(0, -1);
+                if (stripped.length > 0 && stripped !== partial) {
+                  try {
+                    const parsed = JSON.parse(stripped);
+                    if (ldStack.length === 0) value = parsed;
+                  } catch { /* truly unparseable */ }
+                }
+              }
             } else if (ldInStringValue && ldStack.length === 0) {
               value = ldStringAccum;
             }
@@ -2282,6 +2307,14 @@ export async function init(options?: {
 
           if (scanInScalar) {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
+              // Root-level scalars terminated by whitespace: keep as pending
+              // so getValue() can autocomplete if the stream is still incomplete.
+              // Only structural delimiters (,}]) definitively end a scalar.
+              const isWhitespace = c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09;
+              if (isWhitespace && scanDepth === 0) {
+                // Don't finalize — leave in ldScalarAccum for getValue() autocomplete
+                continue;
+              }
               if (spSkipDepth < 0) {
                 try { spSetValue(format === "json5" ? parseJson5Scalar(ldScalarAccum) : JSON.parse(ldScalarAccum)); } catch { spSetValue(null); }
               }
@@ -2561,9 +2594,19 @@ export async function init(options?: {
                     j++;
                   }
                   if (j < to) {
-                    const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
-                    try { spSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { spSetValue(null); }
-                    i = j - 1;
+                    const terminator = buf[j];
+                    const isWsTerm = terminator === 0x20 || terminator === 0x0A || terminator === 0x0D || terminator === 0x09;
+                    if (isWsTerm && scanDepth === 0) {
+                      // Root-level scalar terminated by whitespace: keep as pending
+                      // so getValue() can autocomplete partial keywords on incomplete.
+                      scanInScalar = true;
+                      ldScalarAccum = utf8Decoder.decode(buf.subarray(i, j));
+                      i = j; // skip past scalar content, continue scanning whitespace
+                    } else {
+                      const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
+                      try { spSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { spSetValue(null); }
+                      i = j - 1;
+                    }
                   } else {
                     scanInScalar = true;
                     ldScalarAccum = utf8Decoder.decode(buf.subarray(i, to));
@@ -2654,8 +2697,8 @@ export async function init(options?: {
 
             // Handle pending partial values that haven't been committed to ldRoot yet:
             if (scanInScalar && ldScalarAccum) {
-              // Pending scalar: try to autocomplete (e.g., "tr" → true)
-              const partial = ldScalarAccum;
+              // Pending scalar: try to autocomplete (e.g., "tr" → true, "1." → 1)
+              let partial = ldScalarAccum;
               const completed = partial.startsWith('t') ? 'true'
                 : partial.startsWith('f') ? 'false'
                 : partial.startsWith('n') ? 'null'
@@ -2663,7 +2706,17 @@ export async function init(options?: {
               try {
                 const parsed = format === "json5" ? parseJson5Scalar(completed) : JSON.parse(completed);
                 if (ldStack.length === 0) value = parsed;
-              } catch { /* partial number like "1." — leave as-is */ }
+              } catch {
+                // Strip trailing incomplete number chars: "1." → "1", "1e-" → "1"
+                let stripped = partial;
+                while (stripped.length > 0 && /[.eE+\-]$/.test(stripped)) stripped = stripped.slice(0, -1);
+                if (stripped.length > 0 && stripped !== partial) {
+                  try {
+                    const parsed = JSON.parse(stripped);
+                    if (ldStack.length === 0) value = parsed;
+                  } catch { /* truly unparseable */ }
+                }
+              }
             } else if (ldInStringValue && ldStack.length === 0) {
               // Root-level string still being accumulated
               value = ldStringAccum;
