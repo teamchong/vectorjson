@@ -1570,27 +1570,17 @@ fn tapeDeepEqualUnordered(
             if (count_a != childCount(rb)) break :blk false;
             if (count_a == 0) break :blk true;
 
-            // Try ordered comparison first (fast path: keys already in same order).
-            var all_ordered = true;
+            // Try ordered comparison: fused key+value check in single pass.
             {
                 var ca: u32 = idx_a + 1;
                 var cb: u32 = idx_b + 1;
                 var i: u32 = 0;
+                var all_ordered = true;
                 while (i < count_a) : (i += 1) {
                     if (!strEql(words_a[ca], base_a, words_b[cb], base_b)) {
                         all_ordered = false;
                         break;
                     }
-                    ca = nextEntryRaw(words_a, ca + 1);
-                    cb = nextEntryRaw(words_b, cb + 1);
-                }
-            }
-
-            if (all_ordered) {
-                var ca: u32 = idx_a + 1;
-                var cb: u32 = idx_b + 1;
-                var k: u32 = 0;
-                while (k < count_a) : (k += 1) {
                     const va: u32 = ca + 1;
                     const vb: u32 = cb + 1;
                     if (!tapeDeepEqualIterative(true, words_a, va, base_a, words_b, vb, base_b))
@@ -1598,7 +1588,7 @@ fn tapeDeepEqualUnordered(
                     ca = nextEntryRaw(words_a, va);
                     cb = nextEntryRaw(words_b, vb);
                 }
-                break :blk true;
+                if (all_ordered) break :blk true;
             }
 
             // O(n log n) key matching: sort B keys by fingerprint, binary search for each A key.

@@ -503,7 +503,8 @@ export async function init(options?: {
     const asciiInput = docInputs.get(docId);
     if (asciiInput !== undefined) {
       const raw = asciiInput.slice(srcOffset, srcOffset + rawLen);
-      return hasEscapes ? JSON.parse('"' + raw + '"') : raw;
+      if (!hasEscapes) return raw;
+      try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
     }
 
     const inputPtr = engine.doc_get_input_ptr(docId) >>> 0;
@@ -511,7 +512,8 @@ export async function init(options?: {
       new Uint8Array(engine.memory.buffer, inputPtr + srcOffset, rawLen),
     );
     // has_escapes flag from SIMD skipString — no need for includes('\\')
-    return hasEscapes ? JSON.parse('"' + raw + '"') : raw;
+    if (!hasEscapes) return raw;
+    try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
   }
 
   // --- Deep materialize from document tape ---
