@@ -315,14 +315,11 @@ interface EngineExports {
   stream_get_remaining_ptr(id: number): number;
   stream_get_remaining_len(id: number): number;
   stream_get_buffer_len(id: number): number;
-  stream_get_buffer_cap(id: number): number;
   stream_reset_for_next(id: number): number;
   classify_input(ptr: number, len: number): number;
   autocomplete_input(ptr: number, len: number, buf_cap: number): number;
-  autocomplete_input_json5(ptr: number, len: number, buf_cap: number): number;
   get_value_end(): number;
   doc_parse_fmt(ptr: number, len: number, format: number): number;
-  preprocess_json5(ptr: number, len: number): number;
   doc_export_tape_size(docId: number): number;
   doc_export_tape(docId: number, outPtr: number, outCap: number): number;
   doc_import_tape(bufPtr: number, bufLen: number): number;
