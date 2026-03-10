@@ -739,6 +739,60 @@ await test("onDelta: offset with escape sequence accounts for raw bytes", () => 
 });
 
 // =============================================================
+// Cross-chunk unicode escape sequences
+// =============================================================
+
+await test("unicode escape split across chunks — BMP character", () => {
+  const ep = createEventParser();
+  const deltas = [];
+  ep.onDelta("msg", (e) => deltas.push(e.value));
+  // Split \u0041 (A) across chunk boundary
+  ep.feed('{"msg":"hello \\u00');
+  ep.feed('41 world"}');
+  const v = ep.getValue();
+  assertEqual(v.msg, "hello A world");
+  const combined = deltas.join('');
+  assert(combined === "hello A world", `Delta combined: ${JSON.stringify(combined)}`);
+  ep.destroy();
+});
+
+await test("surrogate pair split across chunks", () => {
+  const ep = createEventParser();
+  const deltas = [];
+  ep.onDelta("msg", (e) => deltas.push(e.value));
+  // Split surrogate pair \uD83D\uDE00 (😀) across chunk boundary
+  ep.feed('{"msg":"hi \\uD83D');
+  ep.feed('\\uDE00 bye"}');
+  const v = ep.getValue();
+  assertEqual(v.msg, "hi 😀 bye");
+  ep.destroy();
+});
+
+await test("surrogate pair split mid-low-surrogate across chunks", () => {
+  const ep = createEventParser();
+  // Split in the middle of the low surrogate hex digits
+  ep.feed('{"msg":"\\uD83D\\uDE');
+  ep.feed('00"}');
+  const v = ep.getValue();
+  assertEqual(v.msg, "😀");
+  ep.destroy();
+});
+
+await test("unicode escape in key split across chunks", () => {
+  const ep = createEventParser();
+  const values = [];
+  // Path pattern uses decoded key name "key"
+  ep.on("key", (e) => values.push(e.value));
+  // Key "key" encoded as k\u0065y with \u0065 (e) split across chunks
+  ep.feed('{"k\\u006');
+  ep.feed('5y": 42}');
+  // The key should decode as "key" and match the path
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], 42);
+  ep.destroy();
+});
+
+// =============================================================
 // Summary
 // =============================================================
 
