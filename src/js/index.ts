@@ -1223,6 +1223,7 @@ export async function init(options?: {
       let ptInStringValue = false;
       let ptDeltaAccum = '';
       let ptDeltaByteStart = 0;                      // byte offset where current delta accumulation started
+      let ptInUnquotedKey = false;                    // JSON5 unquoted key spanning chunks
       let ptInScalar = false;                        // tracking a scalar that may span chunks
       let ptScalarStart = -1;                        // byte offset where current scalar started
       // Unicode escape state: \uXXXX decoding (with surrogate pair support)
@@ -1290,7 +1291,7 @@ export async function init(options?: {
         ptContextStack.length = 0; ptKeyStack.length = 0;
         ptIndexStack.length = 0; ptValueStartStack.length = 0;
         ptSkipDepth = -1; ptExpectingKey = false; ptAfterColon = false;
-        ptKeyAccum = ''; ptAccumulatingKey = false;
+        ptKeyAccum = ''; ptAccumulatingKey = false; ptInUnquotedKey = false;
         ptStringValueStart = -1; ptInStringValue = false;
         ptDeltaAccum = ''; ptDeltaByteStart = 0;
         ptInScalar = false; ptScalarStart = -1;
@@ -1378,6 +1379,23 @@ export async function init(options?: {
       function ptScan(buf: Uint8Array, from: number, to: number) {
         for (let i = from; i < to; i++) {
           const c = buf[i];
+
+          // Check if we're continuing a JSON5 unquoted key from a previous chunk
+          if (ptInUnquotedKey) {
+            if (isJson5IdentPart(c)) {
+              ptKeyAccum += B2C[c];
+              continue;
+            }
+            // Key ended — finalize
+            ptInUnquotedKey = false;
+            if (ptDepth > 0) ptKeyStack[ptDepth - 1] = ptKeyAccum;
+            ldCurrentKey = ptKeyAccum;
+            ptKeyAccum = '';
+            ptExpectingKey = false;
+            // Re-process this char (colon, whitespace, etc.)
+            i--;
+            continue;
+          }
 
           // Check if we're continuing a scalar from a previous chunk
           if (ptInScalar) {
@@ -1696,11 +1714,19 @@ export async function init(options?: {
               if (format === "json5" && ptExpectingKey && isJson5IdentStart(c)) {
                 let j = i + 1;
                 while (j < to && isJson5IdentPart(buf[j])) j++;
-                const key = utf8Decoder.decode(buf.subarray(i, j));
-                if (ptDepth > 0) ptKeyStack[ptDepth - 1] = key;
-                ldCurrentKey = key;
-                ptExpectingKey = false;
-                i = j - 1;
+                if (j < to) {
+                  // Key completed within this chunk
+                  const key = utf8Decoder.decode(buf.subarray(i, j));
+                  if (ptDepth > 0) ptKeyStack[ptDepth - 1] = key;
+                  ldCurrentKey = key;
+                  ptExpectingKey = false;
+                  i = j - 1;
+                } else {
+                  // Key spans chunk boundary — accumulate and continue in next chunk
+                  ptKeyAccum = utf8Decoder.decode(buf.subarray(i, to));
+                  ptInUnquotedKey = true;
+                  i = to;
+                }
                 break;
               }
               // Scalar values (numbers, true, false, null, JSON5: Infinity, NaN, hex)
@@ -2088,6 +2114,7 @@ export async function init(options?: {
       let scanAfterColon = false;
       let scanKeyAccum = '';
       let scanAccumulatingKey = false;
+      let scanInUnquotedKey = false;
       let scanInScalar = false;
 
       // --- Pick state ---
@@ -2114,6 +2141,7 @@ export async function init(options?: {
         scanAfterColon = false;
         scanKeyAccum = '';
         scanAccumulatingKey = false;
+        scanInUnquotedKey = false;
         scanInScalar = false;
         spUnicodeRemaining = 0;
         spUnicodeAccum = 0;
@@ -2176,6 +2204,23 @@ export async function init(options?: {
         const picking = pickPaths !== null;
         for (let i = from; i < to; i++) {
           const c = buf[i];
+
+          // Check if we're continuing a JSON5 unquoted key from a previous chunk
+          if (scanInUnquotedKey) {
+            if (isJson5IdentPart(c)) {
+              scanKeyAccum += B2C[c];
+              continue;
+            }
+            // Key ended — finalize
+            scanInUnquotedKey = false;
+            ldCurrentKey = scanKeyAccum;
+            if (picking && scanDepth > 0) spKeyStack[scanDepth - 1] = scanKeyAccum;
+            scanKeyAccum = '';
+            scanExpectingKey = false;
+            // Re-process this char (colon, whitespace, etc.)
+            i--;
+            continue;
+          }
 
           if (scanInScalar) {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
@@ -2408,11 +2453,19 @@ export async function init(options?: {
               if (format === "json5" && scanExpectingKey && isJson5IdentStart(c)) {
                 let j = i + 1;
                 while (j < to && isJson5IdentPart(buf[j])) j++;
-                const key = utf8Decoder.decode(buf.subarray(i, j));
-                ldCurrentKey = key;
-                if (picking && scanDepth > 0) spKeyStack[scanDepth - 1] = key;
-                scanExpectingKey = false;
-                i = j - 1; // -1 because loop increments
+                if (j < to) {
+                  // Key completed within this chunk
+                  const key = utf8Decoder.decode(buf.subarray(i, j));
+                  ldCurrentKey = key;
+                  if (picking && scanDepth > 0) spKeyStack[scanDepth - 1] = key;
+                  scanExpectingKey = false;
+                  i = j - 1;
+                } else {
+                  // Key spans chunk boundary — accumulate and continue in next chunk
+                  scanKeyAccum = utf8Decoder.decode(buf.subarray(i, to));
+                  scanInUnquotedKey = true;
+                  i = to;
+                }
                 break;
               }
               if (spSkipDepth >= 0) break;

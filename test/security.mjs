@@ -384,7 +384,7 @@ await test("parse: object with escaped key accessible via property access", asyn
 // --- JSONL resetForNext clears scanner state between values ---
 
 await test("createParser: JSONL resetForNext iterates multiple values correctly", async () => {
-  const p = createParser(undefined, { format: "jsonl" });
+  const p = createParser({ format: "jsonl" });
   p.feed('{"a":1}\n{"b":2}\n');
   const val1 = p.getValue();
   assertEqual(val1.a, 1);
@@ -397,12 +397,12 @@ await test("createParser: JSONL resetForNext iterates multiple values correctly"
 // --- JSON5 Infinity/NaN in streaming live document ---
 
 await test("createParser: JSON5 Infinity value in streaming live doc", async () => {
-  const p = createParser(undefined, { format: "json5" });
+  const p = createParser({ format: "json5" });
   // Feed Infinity as a value — in JSON5 streaming, scalar may span chunks
   p.feed('{"val": Infinity, "neg": -Infinity}');
   const val = p.getValue();
-  assertEqual(val.val, Infinity);
-  assertEqual(val.neg, -Infinity);
+  assert(val.val === Infinity, `Expected Infinity, got ${val.val}`);
+  assert(val.neg === -Infinity, `Expected -Infinity, got ${val.neg}`);
   p.destroy();
 });
 
@@ -410,31 +410,53 @@ await test("createEventParser: JSON5 Infinity in live doc via getValue", async (
   const ep = createEventParser({ format: "json5" });
   ep.feed('{"val": Infinity}');
   const val = ep.getValue();
-  assertEqual(val.val, Infinity);
+  assert(val.val === Infinity, `Expected Infinity, got ${val.val}`);
   ep.destroy();
 });
 
-await test("createParser: JSON5 Infinity tape export returns null (inherent limitation)", async () => {
-  const p = createParser(undefined, { format: "json5" });
+await test("createParser: JSON5 Infinity tape export preserves Infinity", async () => {
+  const p = createParser({ format: "json5" });
   p.feed('{"val": Infinity}');
-  // Infinity can't be represented in zimdjson tape (strict JSON numbers only)
-  // getTapeBuffer gracefully returns null instead of crashing
+  // With correct JSON5 format, Infinity is preprocessed and stored in tape as Float64
   const tape = p.getTapeBuffer();
-  assertEqual(tape, null);
-  // But getValue still works via the live document
+  assert(tape instanceof ArrayBuffer, "Expected tape to be ArrayBuffer");
+  // getValue also works via the live document
   const val = p.getValue();
-  assertEqual(val.val, Infinity);
+  assert(val.val === Infinity, `Expected Infinity, got ${val.val}`);
   p.destroy();
 });
 
 await test("createParser: JSON5 Infinity spanning chunk boundary", async () => {
-  const p = createParser(undefined, { format: "json5" });
+  const p = createParser({ format: "json5" });
   // Split "Infinity" across two chunks: "Infi" + "nity}"
   p.feed('{"val": Infi');
   p.feed('nity}');
   const val = p.getValue();
-  assertEqual(val.val, Infinity);
+  assert(val.val === Infinity, `Expected Infinity, got ${val.val}`);
   p.destroy();
+});
+
+await test("createParser: JSON5 unquoted key spanning chunk boundary", async () => {
+  const p = createParser({ format: "json5" });
+  // Split unquoted key "myKey" across two chunks
+  p.feed('{ my');
+  p.feed('Key: 42 }');
+  const val = p.getValue();
+  assertEqual(val.myKey, 42);
+  p.destroy();
+});
+
+await test("createEventParser: JSON5 unquoted key spanning chunk boundary", async () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("*", ({ value }) => values.push(value));
+  // Split unquoted key "longName" across two chunks
+  ep.feed('{ long');
+  ep.feed('Name: "hello" }');
+  assertEqual(values, ["hello"]);
+  const val = ep.getValue();
+  assertEqual(val.longName, "hello");
+  ep.destroy();
 });
 
 console.log(`\n\uD83D\uDD12 Security Tests: ${passed} passed, ${failed} failed\n`);
