@@ -330,6 +330,9 @@ const utf8Decoder = new TextDecoder('utf-8');
 // Pre-computed byte→char table — avoids String.fromCharCode() calls in hot loops
 const B2C: string[] = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i));
 
+// Hoisted regex for stripping trailing incomplete number chars in getValue()
+const TRAILING_NUM_RE = /[.eE+\-]$/;
+
 let _instance: VectorJSON | null = null;
 let _initPromise: Promise<VectorJSON> | null = null;
 
@@ -1028,12 +1031,16 @@ export async function init(options?: {
     return parseJson5Scalar(s);
   }
 
+  // Pre-allocated keyword arrays for completeScalarKeyword (avoid per-call allocation)
+  const SCALAR_KEYWORDS = ['true', 'false', 'null'];
+  const SCALAR_KEYWORDS_JSON5 = ['true', 'false', 'null', 'Infinity', 'NaN'];
+  const JSON5_SIGN_KEYWORDS = ['Infinity', 'NaN'];
+
   /** Autocomplete a partial scalar keyword for getValue() display.
    *  Matches partial prefixes of true/false/null (all formats) and
    *  Infinity/NaN with optional sign (JSON5 only). */
   function completeScalarKeyword(partial: string, fmt: JsonFormat): string {
-    const keywords = ['true', 'false', 'null'];
-    if (fmt === 'json5') keywords.push('Infinity', 'NaN');
+    const keywords = fmt === 'json5' ? SCALAR_KEYWORDS_JSON5 : SCALAR_KEYWORDS;
     // Check unsigned keywords
     for (const kw of keywords) {
       if (partial.length < kw.length && kw.startsWith(partial)) return kw;
@@ -1041,7 +1048,7 @@ export async function init(options?: {
     // JSON5 signed variants: +Infinity, -Infinity, +NaN, -NaN
     if (fmt === 'json5' && partial.length > 1 && (partial[0] === '+' || partial[0] === '-')) {
       const rest = partial.slice(1);
-      for (const kw of ['Infinity', 'NaN']) {
+      for (const kw of JSON5_SIGN_KEYWORDS) {
         if (rest.length < kw.length && kw.startsWith(rest)) return partial[0] + kw;
       }
     }
@@ -1967,7 +1974,7 @@ export async function init(options?: {
               } catch {
                 // Strip trailing incomplete number chars: "1." → "1", "1e-" → "1"
                 let stripped = partial;
-                while (stripped.length > 0 && /[.eE+\-]$/.test(stripped)) stripped = stripped.slice(0, -1);
+                while (stripped.length > 0 && TRAILING_NUM_RE.test(stripped)) stripped = stripped.slice(0, -1);
                 if (stripped.length > 0 && stripped !== partial) {
                   try {
                     const parsed = JSON.parse(stripped);
@@ -2721,7 +2728,7 @@ export async function init(options?: {
               } catch {
                 // Strip trailing incomplete number chars: "1." → "1", "1e-" → "1"
                 let stripped = partial;
-                while (stripped.length > 0 && /[.eE+\-]$/.test(stripped)) stripped = stripped.slice(0, -1);
+                while (stripped.length > 0 && TRAILING_NUM_RE.test(stripped)) stripped = stripped.slice(0, -1);
                 if (stripped.length > 0 && stripped !== partial) {
                   try {
                     const parsed = JSON.parse(stripped);
