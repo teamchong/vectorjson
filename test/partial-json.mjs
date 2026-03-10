@@ -510,7 +510,7 @@ test("schema: complete valid JSON passes validation", () => {
   assertEqual(r.value, { name: "Alice", age: 30 });
 });
 
-test("schema: complete JSON fails validation → value undefined, failed-parse", () => {
+test("schema: complete JSON fails validation → value undefined, state failed-parse", () => {
   const r = parsePartialJson('{"name":"Alice"}', userSchema); // missing age
   assertEqual(r.state, "failed-parse");
   assertEqual(r.value, undefined);

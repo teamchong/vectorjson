@@ -150,10 +150,9 @@ fn buildDocSrcPositions(uid: usize) void {
     const sp = &doc_src[uid];
 
     // Compute tape length from root word (non-streaming mode uses pointer arithmetic,
-    // so words.items().len is 0; the root word stores the closing root index).
+    // so words.items().len is 0; the root word stores the total tape word count).
     const root_raw: u64 = p.tape.words.items().ptr[0];
-    const closing_root_idx: u32 = @truncate(root_raw >> 8);
-    const tape_count: u32 = closing_root_idx + 1;
+    const tape_count: u32 = @truncate(root_raw >> 8);
 
     // Reuse existing allocation if large enough, else grow
     if (sp.cap < tape_count) {
@@ -232,6 +231,12 @@ fn getDocParser(doc_id: i32) ?*DomParser {
     return &doc_parsers[uid];
 }
 
+/// Get the tape count for a parsed document (root word's data.ptr = total word count).
+inline fn docTapeCount(p: *DomParser) u32 {
+    const root_raw: u64 = p.tape.words.items().ptr[0];
+    return @truncate(root_raw >> 8);
+}
+
 /// Parse JSON bytes and store the result in a document slot.
 /// Returns slot ID (0..127) on success, or -1 on error.
 /// The error code is available via get_error_code().
@@ -269,14 +274,16 @@ var doc_parsers_json5: [MAX_DOC_SLOTS]DomParserJson5 = .{DomParserJson5.init} **
 /// 5. Convert hex 0xFF → decimal
 /// 6. Convert NaN → null (Infinity/+Infinity/-Infinity handled by DomParserJson5)
 ///
-/// Uses an intermediate output buffer, then copies back. Returns new length.
-export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
-    if (len == 0) return 0;
+/// Preprocesses JSON5 into an allocated output buffer. Returns the buffer and length.
+/// Caller must free the returned buffer. Returns null on error.
+fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: u32 } {
+    if (len == 0) return null;
 
-    // Allocate output buffer (worst case: unquoted keys need wrapping → ~2x)
-    const out_cap = len * 2 + 64;
-    const out_buf = gpa.alloc(u8, out_cap) catch return 0;
-    defer gpa.free(out_buf);
+    // Allocate output buffer (worst case: unquoted keys + escape expansion → 3x)
+    const out_cap_u64: u64 = @as(u64, len) * 3 + 64;
+    if (out_cap_u64 > std.math.maxInt(u32)) return null;
+    const out_cap: u32 = @intCast(out_cap_u64);
+    const out_buf = gpa.alloc(u8, out_cap) catch return null;
 
     var i: u32 = 0;
     var o: u32 = 0;
@@ -537,9 +544,18 @@ export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
         i += 1;
     }
 
-    // Copy output back to input buffer
-    @memcpy(ptr[0..o], out_buf[0..o]);
-    return o;
+    return .{ .buf = out_buf, .len = o };
+}
+
+/// Public export for preprocess_json5 (copies back to input buffer).
+/// IMPORTANT: caller must allocate ptr with capacity >= len * 3 + 64 to avoid truncation.
+/// Returns new length. If output exceeds input buffer capacity (len), it is truncated.
+export fn preprocess_json5(ptr: [*]u8, len: u32) u32 {
+    const result = preprocess_json5_alloc(ptr, len) orelse return 0;
+    defer gpa.free(result.buf);
+    const copy_len = @min(result.len, len);
+    @memcpy(ptr[0..copy_len], result.buf[0..copy_len]);
+    return copy_len;
 }
 
 fn isIdentStart(c: u8) bool {
@@ -556,12 +572,12 @@ fn isIdentPart(c: u8) bool {
 export fn doc_parse_fmt(ptr: [*]u8, len: u32, format: i32) i32 {
     if (format != 2) return doc_parse(ptr, len);
 
-    // JSON5 mode: preprocess, then parse with json5-aware parser
-    const new_len = preprocess_json5(ptr, len);
-    if (new_len == 0 and len > 0) {
+    // JSON5 mode: preprocess into allocated buffer, then parse
+    const prep = preprocess_json5_alloc(ptr, len) orelse {
         last_error_code = 99;
         return -1;
-    }
+    };
+    defer gpa.free(prep.buf);
 
     last_error_code = 0;
 
@@ -572,12 +588,9 @@ export fn doc_parse_fmt(ptr: [*]u8, len: u32, format: i32) i32 {
         return -1;
     };
 
-    // Pad for SIMD safety
-    if (new_len + 64 <= len * 2 + 64) {
-        @memset(ptr[new_len..][0..64], ' ');
-    }
-
-    _ = doc_parsers_json5[uid].parseFromSlice(gpa, ptr[0..new_len]) catch |err| {
+    // parseFromSlice copies input into its own padded document_buffer,
+    // so no external SIMD padding is needed.
+    _ = doc_parsers_json5[uid].parseFromSlice(gpa, prep.buf[0..prep.len]) catch |err| {
         last_error_code = mapError(err);
         return -1;
     };
@@ -605,6 +618,7 @@ export fn doc_free(doc_id: i32) void {
 /// Returns: 0=null, 1=true, 2=false, 3=number, 4=string, 5=object, 6=array, -1=error
 export fn doc_get_tag(doc_id: i32, index: u32) i32 {
     const p = getDocParser(doc_id) orelse return -1;
+    if (index >= docTapeCount(p)) return -1;
     const word = p.tape.get(index);
     return switch (word.tag) {
         .null => 0,
@@ -621,6 +635,8 @@ export fn doc_get_tag(doc_id: i32, index: u32) i32 {
 /// Get the numeric value at the given tape index as f64.
 export fn doc_get_number(doc_id: i32, index: u32) f64 {
     const p = getDocParser(doc_id) orelse return 0;
+    const tc = docTapeCount(p);
+    if (index >= tc or index + 1 >= tc) return 0;
     const word = p.tape.get(index);
     const next_raw: u64 = @bitCast(p.tape.get(index + 1));
     return switch (word.tag) {
@@ -637,6 +653,7 @@ export fn doc_get_number(doc_id: i32, index: u32) f64 {
 /// Returns raw_len (0 = empty string). JS reads raw bytes from input at offset.
 export fn doc_read_string_raw(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    if (index >= docTapeCount(p)) return 0;
     const word = p.tape.get(index);
     const raw_len_with_flag: u24 = word.data.len;
     const raw_len: u32 = raw_len_with_flag & 0x7FFFFF;
@@ -657,6 +674,7 @@ export fn doc_get_input_ptr(doc_id: i32) u32 {
 /// Get the child count of a container (object or array) at the given tape index.
 export fn doc_get_count(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    if (index >= docTapeCount(p)) return 0;
     const word = p.tape.get(index);
     return switch (word.tag) {
         .object_opening, .array_opening => word.data.len,
@@ -685,6 +703,7 @@ export fn doc_get_src_pos(doc_id: i32, idx: u32) u32 {
 /// Returns 0 for non-container tags.
 export fn doc_get_close_index(doc_id: i32, index: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    if (index >= docTapeCount(p)) return 0;
     const word = p.tape.get(index);
     return switch (word.tag) {
         .object_opening, .array_opening => word.data.ptr,
@@ -709,11 +728,13 @@ inline fn nextTapeEntry(tape: anytype, val_idx: u32) u32 {
 /// (e.g. \n, \uXXXX), raw comparison may fail — JS falls back to ownKeys iteration.
 export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_len: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    const tc = docTapeCount(p);
+    if (obj_index >= tc) return 0;
     const word = p.tape.get(obj_index);
     if (word.tag != .object_opening) return 0;
 
     var curr: u32 = obj_index + 1; // first key position
-    while (true) {
+    while (curr < tc) {
         const w = p.tape.get(curr);
         if (w.tag == .object_closing) return 0; // not found
 
@@ -727,6 +748,7 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
         // Skip to next key: advance past key + value
         curr = nextTapeEntry(p.tape, curr + 1);
     }
+    return 0;
 }
 
 // --- Batch iteration exports ---
@@ -736,7 +758,7 @@ export fn doc_find_field(doc_id: i32, obj_index: u32, key_ptr: [*]const u8, key_
 /// Static batch buffer: 16384 u32 indices + 1 continuation token.
 /// When a container has more than 16384 elements, batch_buffer[count] holds
 /// the tape index to resume from on the next call.
-var batch_buffer: [16385]u32 = undefined;
+var batch_buffer: [16385]u32 = .{0} ** 16385;
 
 /// Get a pointer to the batch buffer (for JS to read results).
 export fn doc_batch_ptr() [*]u32 {
@@ -750,12 +772,14 @@ export fn doc_batch_ptr() [*]u32 {
 /// the next tape index for resumption.
 export fn doc_array_elements(doc_id: i32, arr_index: u32, resume_at: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    const tc = docTapeCount(p);
+    if (arr_index >= tc) return 0;
     const word = p.tape.get(arr_index);
     if (word.tag != .array_opening) return 0;
 
     var curr: u32 = if (resume_at != 0) resume_at else arr_index + 1;
     var count: u32 = 0;
-    while (count < 16384) {
+    while (count < 16384 and curr < tc) {
         const w = p.tape.get(curr);
         if (w.tag == .array_closing) break;
         batch_buffer[count] = curr;
@@ -777,12 +801,14 @@ export fn doc_array_elements(doc_id: i32, arr_index: u32, resume_at: u32) u32 {
 /// the next tape index for resumption.
 export fn doc_object_keys(doc_id: i32, obj_index: u32, resume_at: u32) u32 {
     const p = getDocParser(doc_id) orelse return 0;
+    const tc = docTapeCount(p);
+    if (obj_index >= tc) return 0;
     const word = p.tape.get(obj_index);
     if (word.tag != .object_opening) return 0;
 
     var curr: u32 = if (resume_at != 0) resume_at else obj_index + 1;
     var count: u32 = 0;
-    while (count < 16384) {
+    while (count < 16384 and curr < tc) {
         const w = p.tape.get(curr);
         if (w.tag == .object_closing) break;
         batch_buffer[count] = curr; // key index
@@ -1665,12 +1691,14 @@ export fn doc_deep_equal(doc_a: i32, idx_a: u32, doc_b: i32, idx_b: u32, ordered
 const TapeDims = struct { tape_count: u32, input_len: u32 };
 
 fn docTapeDims(p: anytype) TapeDims {
+    // Root word's data.ptr stores the total number of tape words
+    // (set to currentWord() after appending the closing root).
     const root_raw: u64 = p.tape.words.items().ptr[0];
-    const closing_root_idx: u32 = @truncate(root_raw >> 8);
+    const tape_count: u32 = @truncate(root_raw >> 8);
     // document_buffer contains input + SIMD padding (16 bytes)
     const doc_buf_len: u32 = @intCast(p.document_buffer.items.len);
     return .{
-        .tape_count = closing_root_idx + 1,
+        .tape_count = tape_count,
         .input_len = if (doc_buf_len >= 16) doc_buf_len - 16 else doc_buf_len,
     };
 }
@@ -1753,6 +1781,54 @@ export fn doc_import_tape(buf_ptr: [*]const u8, buf_len: u32) i32 {
 
     // Fix input_base_addr to point to new document_buffer
     p.tape.input_base_addr = @intFromPtr(p.document_buffer.items.ptr);
+
+    // Validate tape word contents — reject crafted tapes with out-of-bounds pointers
+    var ti: u32 = 0;
+    while (ti < tape_count) : (ti += 1) {
+        const w = p.tape.get(ti);
+        switch (w.tag) {
+            .string => {
+                // data.ptr is source offset, data.len (low 23 bits) is byte length
+                const str_len: u32 = w.data.len & 0x7FFFFF;
+                if (w.data.ptr > input_len or str_len > input_len or w.data.ptr + str_len > input_len) {
+                    doc_active[uid] = false;
+                    return -1;
+                }
+            },
+            .object_opening, .array_opening => {
+                // data.ptr is closing bracket tape index
+                if (w.data.ptr >= tape_count) {
+                    doc_active[uid] = false;
+                    return -1;
+                }
+            },
+            .object_closing, .array_closing => {
+                // data.ptr is opening bracket tape index
+                if (w.data.ptr >= tape_count) {
+                    doc_active[uid] = false;
+                    return -1;
+                }
+            },
+            .root => {
+                // Opening root's data.ptr = total tape count (past-the-end).
+                // Closing root's data.ptr = opening root index (always 0).
+                // Allow data.ptr <= tape_count to cover both cases.
+                if (w.data.ptr > tape_count) {
+                    doc_active[uid] = false;
+                    return -1;
+                }
+            },
+            .null, .true, .false => {},
+            .unsigned, .signed, .double => {
+                // Number types have a data word at ti+1 (raw value, not a tagged word)
+                if (ti + 1 >= tape_count) {
+                    doc_active[uid] = false;
+                    return -1;
+                }
+                ti += 1; // skip the data word
+            },
+        }
+    }
 
     // Activate slot
     doc_active[uid] = true;

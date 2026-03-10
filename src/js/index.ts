@@ -1200,6 +1200,14 @@ export async function init(options?: {
       let ptDeltaByteStart = 0;                      // byte offset where current delta accumulation started
       let ptInScalar = false;                        // tracking a scalar that may span chunks
       let ptScalarStart = -1;                        // byte offset where current scalar started
+      // Unicode escape state: \uXXXX decoding (with surrogate pair support)
+      let ptUnicodeRemaining = 0;                    // hex digits still needed (0-4)
+      let ptUnicodeAccum = 0;                        // accumulated codepoint
+      let ptHighSurrogate = 0;                       // pending high surrogate (0xD800-0xDBFF)
+      // UTF-8 multi-byte state
+      let ptUtf8Remaining = 0;                       // continuation bytes still needed
+      let ptUtf8Accum = 0;                           // accumulated codepoint
+      let ptUtf8Ctx: 'delta' | 'key' | 'both' | '' = ''; // which accumulator gets the decoded char
 
       // --- Live document builder ---
       // Incrementally builds a JS object/array as bytes are scanned.
@@ -1364,6 +1372,40 @@ export async function init(options?: {
             continue;
           }
 
+          // Handle \uXXXX hex digit accumulation (spans multiple bytes after \u)
+          if (ptUnicodeRemaining > 0) {
+            const hex = c >= 0x30 && c <= 0x39 ? c - 0x30
+              : c >= 0x41 && c <= 0x46 ? c - 0x41 + 10
+              : c >= 0x61 && c <= 0x66 ? c - 0x61 + 10 : -1;
+            if (hex >= 0) {
+              ptUnicodeAccum = (ptUnicodeAccum << 4) | hex;
+              ptUnicodeRemaining--;
+              if (ptUnicodeRemaining === 0) {
+                let cp = ptUnicodeAccum;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                  // High surrogate — hold it, expect \uXXXX low surrogate next
+                  ptHighSurrogate = cp;
+                  continue;
+                }
+                if (cp >= 0xDC00 && cp <= 0xDFFF && ptHighSurrogate) {
+                  // Low surrogate — combine with pending high surrogate
+                  cp = 0x10000 + ((ptHighSurrogate - 0xD800) << 10) + (cp - 0xDC00);
+                  ptHighSurrogate = 0;
+                }
+                const decoded = String.fromCodePoint(cp);
+                if (ptInStringValue && ptSkipDepth < 0) {
+                  ptDeltaAccum += decoded;
+                  if (ldInStringValue) ldStringAccum += decoded;
+                }
+                if (ptAccumulatingKey) ptKeyAccum += decoded;
+              }
+            } else {
+              ptUnicodeRemaining = 0; // malformed escape, skip
+              ptHighSurrogate = 0;
+            }
+            continue;
+          }
+
           if (ptEscapeNext) {
             ptEscapeNext = false;
             if (ptInStringValue && ptSkipDepth < 0) {
@@ -1378,6 +1420,10 @@ export async function init(options?: {
                 case 0x2F: decoded = '/'; break;     // /
                 case 0x62: decoded = '\b'; break;    // b
                 case 0x66: decoded = '\f'; break;    // f
+                case 0x75:                           // u → \uXXXX
+                  ptUnicodeRemaining = 4;
+                  ptUnicodeAccum = 0;
+                  continue;
                 default: decoded = B2C[c]; break;
               }
               ptDeltaAccum += decoded;
@@ -1387,6 +1433,11 @@ export async function init(options?: {
               }
               if (ptAccumulatingKey) ptKeyAccum += decoded;
             } else if (ptAccumulatingKey) {
+              if (c === 0x75) { // u → \uXXXX in key
+                ptUnicodeRemaining = 4;
+                ptUnicodeAccum = 0;
+                continue;
+              }
               ptKeyAccum += B2C[c];
             }
             continue;
@@ -1429,15 +1480,45 @@ export async function init(options?: {
               ptStringValueStart = -1;
               continue;
             }
-            // Regular string character
-            if (ptInStringValue && ptSkipDepth < 0) {
-              const ch = B2C[c];
-              ptDeltaAccum += ch;
-              // Live doc: accumulate string char (batched — flushed at string close or chunk end)
-              if (ldInStringValue) ldStringAccum += ch;
-              if (ptAccumulatingKey) ptKeyAccum += ch;
-            } else if (ptAccumulatingKey) {
-              ptKeyAccum += B2C[c];
+            // Regular string character — handle UTF-8 multi-byte sequences
+            if (c < 0x80) {
+              // ASCII fast path
+              if (ptInStringValue && ptSkipDepth < 0) {
+                ptDeltaAccum += B2C[c];
+                if (ldInStringValue) ldStringAccum += B2C[c];
+                if (ptAccumulatingKey) ptKeyAccum += B2C[c];
+              } else if (ptAccumulatingKey) {
+                ptKeyAccum += B2C[c];
+              }
+            } else if ((c & 0xE0) === 0xC0) {
+              // 2-byte UTF-8 leading byte
+              ptUtf8Accum = c & 0x1F;
+              ptUtf8Remaining = 1;
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xF0) === 0xE0) {
+              // 3-byte UTF-8 leading byte
+              ptUtf8Accum = c & 0x0F;
+              ptUtf8Remaining = 2;
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xF8) === 0xF0) {
+              // 4-byte UTF-8 leading byte
+              ptUtf8Accum = c & 0x07;
+              ptUtf8Remaining = 3;
+              ptUtf8Ctx = (ptInStringValue && ptSkipDepth < 0) ? (ptAccumulatingKey ? 'both' : 'delta') : (ptAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xC0) === 0x80 && ptUtf8Remaining > 0) {
+              // UTF-8 continuation byte
+              ptUtf8Accum = (ptUtf8Accum << 6) | (c & 0x3F);
+              ptUtf8Remaining--;
+              if (ptUtf8Remaining === 0) {
+                const ch = String.fromCodePoint(ptUtf8Accum);
+                if (ptUtf8Ctx === 'delta' || ptUtf8Ctx === 'both') {
+                  ptDeltaAccum += ch;
+                  if (ldInStringValue) ldStringAccum += ch;
+                }
+                if (ptUtf8Ctx === 'key' || ptUtf8Ctx === 'both') {
+                  ptKeyAccum += ch;
+                }
+              }
             }
             continue;
           }
@@ -1949,6 +2030,14 @@ export async function init(options?: {
       let scanQuoteChar = 0x22; // tracks which quote (" or ') opened the current string
       let scanEscapeNext = false;
       let scanDepth = 0;
+      // Unicode escape state: \uXXXX decoding (with surrogate pair support)
+      let spUnicodeRemaining = 0;
+      let spUnicodeAccum = 0;
+      let spHighSurrogate = 0;
+      // UTF-8 multi-byte state
+      let spUtf8Remaining = 0;
+      let spUtf8Accum = 0;
+      let spUtf8Ctx: 'ld' | 'key' | 'both' | '' = '';
       let scanContext: ('o' | 'a')[] = [];
       let scanExpectingKey = false;
       let scanAfterColon = false;
@@ -1981,6 +2070,12 @@ export async function init(options?: {
         scanKeyAccum = '';
         scanAccumulatingKey = false;
         scanInScalar = false;
+        spUnicodeRemaining = 0;
+        spUnicodeAccum = 0;
+        spHighSurrogate = 0;
+        spUtf8Remaining = 0;
+        spUtf8Accum = 0;
+        spUtf8Ctx = '';
         spKeyStack.length = 0;
         spSkipDepth = -1;
         prevLen = 0;
@@ -2050,6 +2145,35 @@ export async function init(options?: {
             continue;
           }
 
+          // Handle \uXXXX hex digit accumulation (with surrogate pair support)
+          if (spUnicodeRemaining > 0) {
+            const hex = c >= 0x30 && c <= 0x39 ? c - 0x30
+              : c >= 0x41 && c <= 0x46 ? c - 0x41 + 10
+              : c >= 0x61 && c <= 0x66 ? c - 0x61 + 10 : -1;
+            if (hex >= 0) {
+              spUnicodeAccum = (spUnicodeAccum << 4) | hex;
+              spUnicodeRemaining--;
+              if (spUnicodeRemaining === 0) {
+                let cp = spUnicodeAccum;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                  spHighSurrogate = cp;
+                  continue;
+                }
+                if (cp >= 0xDC00 && cp <= 0xDFFF && spHighSurrogate) {
+                  cp = 0x10000 + ((spHighSurrogate - 0xD800) << 10) + (cp - 0xDC00);
+                  spHighSurrogate = 0;
+                }
+                const decoded = String.fromCodePoint(cp);
+                if (ldInStringValue && spSkipDepth < 0) ldStringAccum += decoded;
+                if (scanAccumulatingKey) scanKeyAccum += decoded;
+              }
+            } else {
+              spUnicodeRemaining = 0;
+              spHighSurrogate = 0;
+            }
+            continue;
+          }
+
           if (scanEscapeNext) {
             scanEscapeNext = false;
             if (ldInStringValue && spSkipDepth < 0) {
@@ -2063,9 +2187,17 @@ export async function init(options?: {
                 case 0x2F: decoded = '/'; break;
                 case 0x62: decoded = '\b'; break;
                 case 0x66: decoded = '\f'; break;
+                case 0x75:                           // u → \uXXXX
+                  spUnicodeRemaining = 4;
+                  spUnicodeAccum = 0;
+                  continue;
                 default: decoded = B2C[c]; break;
               }
               ldStringAccum += decoded;
+            } else if (scanAccumulatingKey && c === 0x75) {
+              spUnicodeRemaining = 4;
+              spUnicodeAccum = 0;
+              continue;
             }
             if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             continue;
@@ -2092,8 +2224,29 @@ export async function init(options?: {
               }
               continue;
             }
-            if (ldInStringValue && spSkipDepth < 0) ldStringAccum += B2C[c];
-            if (scanAccumulatingKey) scanKeyAccum += B2C[c];
+            // Regular string character — handle UTF-8 multi-byte sequences
+            if (c < 0x80) {
+              // ASCII fast path
+              if (ldInStringValue && spSkipDepth < 0) ldStringAccum += B2C[c];
+              if (scanAccumulatingKey) scanKeyAccum += B2C[c];
+            } else if ((c & 0xE0) === 0xC0) {
+              spUtf8Accum = c & 0x1F; spUtf8Remaining = 1;
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xF0) === 0xE0) {
+              spUtf8Accum = c & 0x0F; spUtf8Remaining = 2;
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xF8) === 0xF0) {
+              spUtf8Accum = c & 0x07; spUtf8Remaining = 3;
+              spUtf8Ctx = (ldInStringValue && spSkipDepth < 0) ? (scanAccumulatingKey ? 'both' : 'ld') : (scanAccumulatingKey ? 'key' : '');
+            } else if ((c & 0xC0) === 0x80 && spUtf8Remaining > 0) {
+              spUtf8Accum = (spUtf8Accum << 6) | (c & 0x3F);
+              spUtf8Remaining--;
+              if (spUtf8Remaining === 0) {
+                const ch = String.fromCodePoint(spUtf8Accum);
+                if (spUtf8Ctx === 'ld' || spUtf8Ctx === 'both') ldStringAccum += ch;
+                if (spUtf8Ctx === 'key' || spUtf8Ctx === 'both') scanKeyAccum += ch;
+              }
+            }
             continue;
           }
 

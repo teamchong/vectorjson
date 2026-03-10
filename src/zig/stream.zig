@@ -85,7 +85,7 @@ pub const StreamState = struct {
             return self.status;
         }
 
-        const new_len = self.buffer_len + len;
+        const new_len = self.buffer_len +| len; // saturating to prevent u32 overflow
         if (new_len > MAX_BUFFER_SIZE) {
             self.status = .err;
             return .err;
