@@ -211,7 +211,7 @@ export interface VectorJSON {
    * Falls back to JSON.stringify comparison for plain JS objects.
    *
    * By default, object key order does not matter (`{"a":1,"b":2}` equals `{"b":2,"a":1}`).
-   * Pass `{ ordered: true }` for faster key-order-sensitive comparison.
+   * Pass `{ ignoreKeyOrder: false }` for faster key-order-sensitive comparison.
    */
   deepCompare(a: unknown, b: unknown, options?: { ignoreKeyOrder?: boolean }): boolean;
   /**
