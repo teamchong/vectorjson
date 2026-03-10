@@ -428,6 +428,38 @@ await test("json5: eventParser on() single-quoted string with escapes", () => {
   ep.destroy();
 });
 
+await test("json5: eventParser on() container with unquoted keys fires path event", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("data", (e) => values.push(e.value));
+  ep.feed('{data: {name: "Alice", age: 30}}');
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0].name, "Alice");
+  assertEqual(values[0].age, 30);
+  ep.destroy();
+});
+
+await test("json5: eventParser on() array with trailing commas fires path event", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("items", (e) => values.push(e.value));
+  ep.feed('{items: [1, 2, 3,]}');
+  assertEqual(values.length, 1, `Expected 1 event, got ${values.length}`);
+  assertEqual(values[0], [1, 2, 3]);
+  ep.destroy();
+});
+
+await test("json5: eventParser on() wildcard with single-quoted container values", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("items[*]", (e) => values.push(e.value));
+  ep.feed("{items: [{name: 'Alice'}, {name: 'Bob'}]}");
+  assertEqual(values.length, 2, `Expected 2 events, got ${values.length}`);
+  assertEqual(values[0].name, "Alice");
+  assertEqual(values[1].name, "Bob");
+  ep.destroy();
+});
+
 await test("json5: line comment at end of input", () => {
   const p = createParser({ format: "json5" });
   const status = p.feed('{"a": 1} // trailing comment');

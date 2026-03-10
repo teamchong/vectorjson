@@ -1372,7 +1372,7 @@ export async function init(options?: {
         return false;
       }
 
-      function fireValueComplete(valueBytes: Uint8Array, offset: number, length: number) {
+      function fireValueComplete(valueBytes: Uint8Array, offset: number, length: number, ldValue?: unknown) {
         if (pathSubs.length === 0) return;
         const resolvedPath = buildResolvedPath(ptKeyStack, ptIndexStack, ptDepth);
         for (const sub of pathSubs) {
@@ -1380,7 +1380,10 @@ export async function init(options?: {
           if (!matches) continue;
           let value: unknown;
           const str = utf8Decoder.decode(valueBytes);
-          try { value = format === "json5" ? parseJson5Value(str) : JSON.parse(str); } catch { continue; }
+          try { value = format === "json5" ? parseJson5Value(str) : JSON.parse(str); } catch {
+            if (ldValue !== undefined) value = ldValue;
+            else continue;
+          }
           if (sub.schema) {
             const result = sub.schema.safeParse(value);
             if (!result.success) continue;
@@ -1661,7 +1664,9 @@ export async function init(options?: {
               if (ptDepth >= 0 && ptSkipDepth < 0 && !wasSkipped) {
                 const start = ptValueStartStack[ptDepth];
                 const len = i + 1 - start;
-                fireValueComplete(buf.subarray(start, i + 1), start, len);
+                // Pass live doc container as fallback for JSON5 containers with unquoted keys, etc.
+                const containerVal = ldStack.length > 0 ? ldStack[ldStack.length - 1] : undefined;
+                fireValueComplete(buf.subarray(start, i + 1), start, len, containerVal);
               }
               // Restore parent context
               if (ptDepth > 0) {
