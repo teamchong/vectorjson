@@ -534,6 +534,54 @@ testBoth("complete object returns correct value", (create) => {
   p.destroy();
 });
 
+// ── Unicode escapes in live doc ──
+console.log("--- Unicode escapes ---");
+
+testBoth("\\uXXXX escape in string value", (create) => {
+  const p = create();
+  p.feed('{"v":"\\u0048\\u0069"}');
+  assertEqual(p.getValue(), { v: "Hi" });
+  p.destroy();
+});
+
+testBoth("\\uXXXX escape split across chunks", (create) => {
+  const p = create();
+  p.feed('{"v":"\\u00');
+  p.feed('48"}');
+  assertEqual(p.getValue(), { v: "H" });
+  p.destroy();
+});
+
+testBoth("surrogate pair \\uD83D\\uDE00 in value", (create) => {
+  const p = create();
+  p.feed('{"emoji":"\\uD83D\\uDE00"}');
+  assertEqual(p.getValue(), { emoji: "\uD83D\uDE00" });
+  p.destroy();
+});
+
+testBoth("multibyte UTF-8 characters in value", (create) => {
+  const p = create();
+  const input = '{"text":"caf\u00e9"}';
+  p.feed(input);
+  assertEqual(p.getValue(), { text: "caf\u00e9" });
+  p.destroy();
+});
+
+testBoth("unicode escape in key", (create) => {
+  const p = create();
+  p.feed('{"\\u006bey":1}');
+  assertEqual(p.getValue(), { key: 1 });
+  p.destroy();
+});
+
+testBoth("all escape sequences \\r \\b \\f \\/", (create) => {
+  const p = create();
+  p.feed('{"v":"a\\rb\\bc\\fd\\/e"}');
+  const v = p.getValue();
+  assertEqual(v, { v: "a\rb\bc\fd/e" });
+  p.destroy();
+});
+
 // ── Summary ──
 console.log(`\n\u2728 Live Document Builder Tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exitCode = 1;
