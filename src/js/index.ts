@@ -987,13 +987,16 @@ export async function init(options?: {
     return isJson5IdentStart(c) || (c >= 0x30 && c <= 0x39);
   }
 
-  /** Parse a JSON5 scalar value (handles Infinity, -Infinity, +Infinity, NaN, hex numbers). */
+  /** Parse a JSON5 scalar value (handles Infinity, NaN, hex, unary +, leading-dot numbers). */
   function parseJson5Scalar(s: string): unknown {
-    if (s === "Infinity" || s === "+Infinity") return Infinity;
-    if (s === "-Infinity") return -Infinity;
     if (s === "NaN") return null; // NaN → null (same as preprocess_json5)
-    if (s.startsWith("0x") || s.startsWith("0X")) return parseInt(s, 16);
-    return JSON.parse(s);
+    // Signed hex: parseInt handles +/- and 0x prefix natively
+    if (s.length > 2 && (s[0] === '+' || s[0] === '-') && s[1] === '0' && (s[2] === 'x' || s[2] === 'X'))
+      return parseInt(s, 16);
+    // Number() handles: Infinity, +Infinity, -Infinity, +123, .5, +.5, 0xFF, etc.
+    const n = Number(s);
+    if (s.length > 0 && !isNaN(n)) return n;
+    return JSON.parse(s); // true, false, null, standard numbers
   }
 
   /** Parse a JSON5 value from raw source text (scalars + single-quoted strings). */
@@ -1774,7 +1777,7 @@ export async function init(options?: {
               // Scalar values (numbers, true, false, null, JSON5: Infinity, NaN, hex)
               if (ptAfterColon || ptDepth === 0 || (ptDepth > 0 && ptContextStack[ptDepth - 1] === 'a')) {
                 const isScalarStart = (c >= 0x30 && c <= 0x39) || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E
-                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B));
+                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B || c === 0x2E));
                 if (isScalarStart) {
                   if (ptSkipDepth < 0 && !isPathSkipped()) {
                     let j = i + 1;
@@ -2545,7 +2548,7 @@ export async function init(options?: {
                   break;
                 }
                 const isScalarStart = (c >= 0x30 && c <= 0x39) || c === 0x2D || c === 0x74 || c === 0x66 || c === 0x6E
-                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B));
+                  || (format === "json5" && (c === 0x49 || c === 0x4E || c === 0x2B || c === 0x2E));
                 if (isScalarStart) {
                   let j = i + 1;
                   while (j < to) {

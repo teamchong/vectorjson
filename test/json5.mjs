@@ -469,5 +469,42 @@ await test("json5: line comment at end of input", () => {
   p.destroy();
 });
 
+await test("json5: unary plus number in streaming parser", () => {
+  const p = createParser({ format: "json5" });
+  p.feed('{"val": +123}');
+  const v = p.getValue();
+  assertEqual(v.val, 123, `Expected 123, got ${v.val}`);
+  p.destroy();
+});
+
+await test("json5: signed hex number in streaming parser", () => {
+  const p = createParser({ format: "json5" });
+  p.feed('{"neg": -0xFF, "pos": +0xFF}');
+  const v = p.getValue();
+  assertEqual(v.neg, -255, `Expected -255, got ${v.neg}`);
+  assertEqual(v.pos, 255, `Expected 255, got ${v.pos}`);
+  p.destroy();
+});
+
+await test("json5: leading-dot number in streaming parser", () => {
+  const p = createParser({ format: "json5" });
+  p.feed('{"a": .5, "b": +.25}');
+  const v = p.getValue();
+  assertEqual(v.a, 0.5, `Expected 0.5, got ${v.a}`);
+  assertEqual(v.b, 0.25, `Expected 0.25, got ${v.b}`);
+  p.destroy();
+});
+
+await test("json5: eventParser on() with unary plus and signed hex values", () => {
+  const ep = createEventParser({ format: "json5" });
+  const values = [];
+  ep.on("*", (e) => values.push(e.value));
+  ep.feed('{"a": +42, "b": -0xA}');
+  assertEqual(values.length, 2, `Expected 2 events, got ${values.length}`);
+  assertEqual(values[0], 42, `Expected 42, got ${values[0]}`);
+  assertEqual(values[1], -10, `Expected -10, got ${values[1]}`);
+  ep.destroy();
+});
+
 console.log(`\n✨ JSON5 Results: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);
