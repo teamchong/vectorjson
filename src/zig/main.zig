@@ -542,7 +542,6 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
         }
 
         // Default: copy byte through
-        if (c == ',') last_comma_out_pos = o;
         out_buf[o] = c;
         o += 1;
         last_non_ws = c;
