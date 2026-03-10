@@ -69,6 +69,10 @@ pub fn build(b: *std.Build) void {
         "stream_get_remaining_len",
         "stream_get_buffer_len",
         "stream_reset_for_next",
+        // Tape export/import
+        "doc_export_tape_size",
+        "doc_export_tape",
+        "doc_import_tape",
         // Deep comparison
         "doc_deep_equal",
         // Input classification & autocomplete

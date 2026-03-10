@@ -107,11 +107,6 @@ export fn stream_get_buffer_len(id: i32) u32 {
     return s.buffer_len;
 }
 
-export fn stream_get_buffer_cap(id: i32) u32 {
-    const s = getStream(id) orelse return 0;
-    return s.buffer_cap;
-}
-
 export fn stream_reset_for_next(id: i32) u32 {
     const s = getStream(id) orelse return 0;
     return s.resetForNext();
@@ -294,7 +289,6 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
     var quote_char: u8 = '"';
     var escape_next: bool = false;
     var expecting_key: bool = false;
-    var depth: i32 = 0;
     var last_non_ws: u8 = 0;
     var last_comma_out_pos: u32 = 0; // track last comma position in output — avoids O(n²) backward scan
     var context_stack: [256]u8 = undefined; // '{' or '['
@@ -389,7 +383,6 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
                 // O(1) — replace tracked comma position instead of backward scan
                 out_buf[last_comma_out_pos] = ' ';
             }
-            depth -= 1;
             if (stack_depth > 0) stack_depth -= 1;
             out_buf[o] = c;
             o += 1;
@@ -404,7 +397,6 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
                 context_stack[stack_depth] = '{';
                 stack_depth += 1;
             } else return null; // too deeply nested for JSON5 preprocessing
-            depth += 1;
             expecting_key = true;
             out_buf[o] = c;
             o += 1;
@@ -418,7 +410,6 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
                 context_stack[stack_depth] = '[';
                 stack_depth += 1;
             } else return null; // too deeply nested for JSON5 preprocessing
-            depth += 1;
             expecting_key = false;
             out_buf[o] = c;
             o += 1;
