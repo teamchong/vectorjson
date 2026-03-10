@@ -1899,15 +1899,19 @@ export async function init(options?: {
             // Pick active — return the filtered live doc
             value = ldRoot;
           } else {
-            // Full WASM parse for correctness
+            // Full WASM parse for correctness — copy to padded buffer for SIMD safety
             const bufPtr = (engine.stream_get_buffer_ptr(streamId) >>> 0);
             const valueLen = engine.stream_get_value_len(streamId);
-            // Pad after the full buffer (not after valueLen) to preserve remaining data for JSONL
-            const fullLen = engine.stream_get_buffer_len(streamId);
-            new Uint8Array(engine.memory.buffer, bufPtr + fullLen, 64).fill(0x20);
+            const padPtr = engine.alloc(valueLen + 64) >>> 0;
+            if (padPtr === 0) { value = ldRoot; } else {
+            new Uint8Array(engine.memory.buffer, padPtr, valueLen).set(
+              new Uint8Array(engine.memory.buffer, bufPtr, valueLen),
+            );
+            new Uint8Array(engine.memory.buffer, padPtr + valueLen, 64).fill(0x20);
             const docId = FORMAT_CODE === 2
-              ? engine.doc_parse_fmt(bufPtr, valueLen, 2)
-              : engine.doc_parse(bufPtr, valueLen);
+              ? engine.doc_parse_fmt(padPtr, valueLen, 2)
+              : engine.doc_parse(padPtr, valueLen);
+            engine.dealloc(padPtr, valueLen + 64);
             if (docId < 0) {
               // JSON5 values like Infinity can't be represented in WASM tape —
               // fall back to the live document which was built correctly by ptScan.
@@ -1919,6 +1923,7 @@ export async function init(options?: {
               }
             } else {
               value = buildDocRoot(docId);
+            }
             }
           }
           // Schema validation on complete
