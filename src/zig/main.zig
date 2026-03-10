@@ -898,7 +898,29 @@ export fn classify_input(ptr: [*]const u8, len: u32) FeedStatus {
         if (depth_val == 0 and root_state == .scalar) {
             switch (c) {
                 'a'...'z', '0'...'9', '-', '.', '+', 'E' => {},
-                else => { root_state = .completed; classify_value_end = i; },
+                else => {
+                    // Check if the scalar so far is a partial keyword prefix
+                    // like "tru" — if so, it's incomplete (not a complete value).
+                    const scalar = ptr[scalar_start..i];
+                    for ([_][]const u8{ "true", "false", "null" }) |kw| {
+                        if (scalar.len < kw.len and std.mem.eql(u8, scalar, kw[0..scalar.len])) {
+                            return .incomplete;
+                        }
+                    }
+                    // Trailing incomplete number char → incomplete (e.g. "1. ")
+                    // Only applies to numeric scalars (start with digit or minus)
+                    if (scalar.len > 0) {
+                        const first_ch = scalar[0];
+                        if (first_ch == '-' or (first_ch >= '0' and first_ch <= '9')) {
+                            const last_ch = scalar[scalar.len - 1];
+                            if (last_ch == '.' or last_ch == '-' or last_ch == '+' or last_ch == 'e' or last_ch == 'E') {
+                                return .incomplete;
+                            }
+                        }
+                    }
+                    root_state = .completed;
+                    classify_value_end = i;
+                },
             }
         }
 

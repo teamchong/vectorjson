@@ -289,6 +289,50 @@ test("root '-' → invalid (not meaningful partial JSON)", () => {
   assertEqual(r.status, "invalid");
 });
 
+console.log("\n--- Partial atoms: root level with trailing whitespace ---");
+
+test("root 'tru ' with trailing space → incomplete", () => {
+  const r = parse("tru ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), true);
+});
+
+test("root 'fal ' with trailing space → incomplete", () => {
+  const r = parse("fal ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), false);
+});
+
+test("root 'nu ' with trailing space → incomplete", () => {
+  const r = parse("nu ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), null);
+});
+
+test("root 'true ' (complete keyword + space) → complete", () => {
+  const r = parse("true ");
+  assertEqual(r.status, "complete");
+  assertEqual(r.toJSON(), true);
+});
+
+test("root '42 ' (complete number + space) → complete", () => {
+  const r = parse("42 ");
+  assertEqual(r.status, "complete");
+  assertEqual(r.toJSON(), 42);
+});
+
+test("root '1. ' (trailing dot + space) → incomplete", () => {
+  const r = parse("1. ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), 1);
+});
+
+test("root '1e ' (trailing e + space) → incomplete", () => {
+  const r = parse("1e ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), 1);
+});
+
 // ── Partial atoms in arrays ──
 
 console.log("\n--- Partial atoms: in arrays ---");
