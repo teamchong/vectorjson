@@ -187,8 +187,12 @@ pub const StreamState = struct {
                         i += 16;
                     }
                 } else {
-                    // JSON5 single-quoted string: byte-by-byte (SIMD can't distinguish ' from other chars efficiently)
-                    // Fall through to byte-by-byte processing below
+                    // JSON5 single-quoted string: SIMD fast-skip for '\'' or '\\'
+                    while (i + 16 <= self.buffer_len) {
+                        const chunk: @Vector(16, u8) = (buf + i)[0..16].*;
+                        if (simd.anyMatch(&.{ '\'', '\\' }, chunk)) break;
+                        i += 16;
+                    }
                 }
                 if (i >= self.buffer_len) break;
             }
@@ -239,13 +243,13 @@ pub const StreamState = struct {
                 },
                 '}', ']' => {
                     self.depth -= 1;
-                    if (self.depth == 0) {
-                        self.markRootComplete(i + 1);
-                    }
                     if (self.depth < 0) {
                         self.status = .err;
                         self.scan_offset = i + 1;
                         return;
+                    }
+                    if (self.depth == 0) {
+                        self.markRootComplete(i + 1);
                     }
                 },
                 '/' => {
@@ -366,7 +370,7 @@ pub const StreamState = struct {
     }
 
     fn growBuffer(self: *StreamState, needed: u32) !void {
-        var new_cap = self.buffer_cap;
+        var new_cap = @max(self.buffer_cap, 4096);
         while (new_cap < needed) {
             new_cap = new_cap *| 2;
             if (new_cap > MAX_BUFFER_SIZE) new_cap = MAX_BUFFER_SIZE;
@@ -380,6 +384,10 @@ pub const StreamState = struct {
             const new_buf = try self.allocator.alloc(u8, new_cap);
             @memcpy(new_buf[0..self.buffer_len], old_buf[0..self.buffer_len]);
             self.allocator.free(old_slice);
+            self.buffer = new_buf.ptr;
+            self.buffer_cap = new_cap;
+        } else {
+            const new_buf = try self.allocator.alloc(u8, new_cap);
             self.buffer = new_buf.ptr;
             self.buffer_cap = new_cap;
         }

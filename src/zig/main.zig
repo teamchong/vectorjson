@@ -146,7 +146,10 @@ var doc_src: [MAX_DOC_SLOTS]DocSrcPos = .{DocSrcPos{}} ** MAX_DOC_SLOTS;
 /// Tape words correspond to value-producing tokens. We skip `:` and `,` tokens that don't
 /// produce tape entries.
 fn buildDocSrcPositions(uid: usize) void {
-    const p = &doc_parsers[uid];
+    const p = if (doc_is_json5[uid])
+        @as(*DomParser, @ptrCast(&doc_parsers_json5[uid]))
+    else
+        &doc_parsers[uid];
     const sp = &doc_src[uid];
 
     // Compute tape length from root word (non-streaming mode uses pointer arithmetic,
@@ -400,7 +403,7 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
             if (stack_depth < context_stack.len) {
                 context_stack[stack_depth] = '{';
                 stack_depth += 1;
-            }
+            } else return null; // too deeply nested for JSON5 preprocessing
             depth += 1;
             expecting_key = true;
             out_buf[o] = c;
@@ -414,7 +417,7 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
             if (stack_depth < context_stack.len) {
                 context_stack[stack_depth] = '[';
                 stack_depth += 1;
-            }
+            } else return null; // too deeply nested for JSON5 preprocessing
             depth += 1;
             expecting_key = false;
             out_buf[o] = c;
@@ -477,15 +480,18 @@ fn preprocess_json5_alloc(ptr: [*]const u8, len: u32) ?struct { buf: []u8, len: 
         if (c == '0' and i + 1 < len and (ptr[i + 1] == 'x' or ptr[i + 1] == 'X')) {
             i += 2;
             var hex_val: u64 = 0;
+            var hex_digits: u32 = 0;
             while (i < len) {
                 const h = ptr[i];
                 if (h >= '0' and h <= '9') {
-                    hex_val = hex_val * 16 + (h - '0');
+                    hex_val = hex_val *| 16 +| (h - '0');
                 } else if (h >= 'a' and h <= 'f') {
-                    hex_val = hex_val * 16 + (h - 'a' + 10);
+                    hex_val = hex_val *| 16 +| (h - 'a' + 10);
                 } else if (h >= 'A' and h <= 'F') {
-                    hex_val = hex_val * 16 + (h - 'A' + 10);
+                    hex_val = hex_val *| 16 +| (h - 'A' + 10);
                 } else break;
+                hex_digits += 1;
+                if (hex_digits > 16) break; // cap at 16 hex digits to avoid degenerate inputs
                 i += 1;
             }
             // Write decimal number
@@ -1406,10 +1412,18 @@ fn tapeDeepEqualIterative(
         else => start_a + 1,
     };
 
+    const raw0b: u64 = words_b[start_b];
+    const tag0b: u8 = @truncate(raw0b);
+    const end_b: u32 = switch (tag0b) {
+        T_ARR, T_OBJ => dataPtr(raw0b),
+        T_UINT, T_INT, T_DBL => start_b + 2,
+        else => start_b + 1,
+    };
+
     var ia: u32 = start_a;
     var ib: u32 = start_b;
 
-    while (ia < end_a) {
+    while (ia < end_a and ib < end_b) {
         const ra: u64 = words_a[ia];
         const rb: u64 = words_b[ib];
         const tag_a: u8 = @truncate(ra);
@@ -1493,7 +1507,8 @@ fn tapeDeepEqualIterative(
         }
     }
 
-    return true;
+    // Both iterators must have reached their respective ends
+    return (ia >= end_a and ib >= end_b);
 }
 
 // ── Unordered (key-order-insensitive) deep equality ──

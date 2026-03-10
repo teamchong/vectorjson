@@ -330,6 +330,7 @@ const utf8Decoder = new TextDecoder('utf-8');
 const B2C: string[] = Array.from({ length: 256 }, (_, i) => String.fromCharCode(i));
 
 let _instance: VectorJSON | null = null;
+let _initPromise: Promise<VectorJSON> | null = null;
 
 /**
  * Initialize VectorJSON by loading and linking the WASM module.
@@ -339,6 +340,9 @@ export async function init(options?: {
   engineWasm?: string | URL | BufferSource;
 }): Promise<VectorJSON> {
   if (_instance) return _instance;
+  if (_initPromise) return _initPromise;
+
+  _initPromise = (async () => {
 
   // Load WASM bytes — embedded base64 by default, filesystem/URL/buffer when explicit
   let engineBytes: BufferSource;
@@ -464,16 +468,17 @@ export async function init(options?: {
     const BATCH_CAP = 16384;
     let count = fn(docId, idx, 0);
     if (count < BATCH_CAP) return copyBatchIndices(count);
-    const all: number[] = [];
-    let page = copyBatchIndices(count);
-    for (let i = 0; i < count; i++) all.push(page[i]);
+    const chunks: Uint32Array[] = [copyBatchIndices(count)];
     while (count === BATCH_CAP) {
       const resumeAt = new Uint32Array(engine.memory.buffer, batchAddr + BATCH_CAP * 4, 1)[0];
       count = fn(docId, idx, resumeAt);
-      page = copyBatchIndices(count);
-      for (let i = 0; i < count; i++) all.push(page[i]);
+      chunks.push(copyBatchIndices(count));
     }
-    return new Uint32Array(all);
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    const result = new Uint32Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+    return result;
   }
 
   // --- Per-document original input tracking (for ASCII fast-path) ---
@@ -605,8 +610,9 @@ export async function init(options?: {
           return val;
         }
         if (prop in Array.prototype) {
-          const materialized = deepMaterializeDoc(target._d, target._i) as unknown[];
-          return (materialized as unknown as Record<string, unknown>)[prop];
+          const materialized = (target as any)._mat || ((target as any)._mat = deepMaterializeDoc(target._d, target._i) as unknown[]);
+          const val = (materialized as unknown as Record<string, unknown>)[prop];
+          return typeof val === 'function' ? (val as Function).bind(materialized) : val;
         }
       }
       return undefined;
@@ -1000,7 +1006,7 @@ export async function init(options?: {
               if (!handle || typeof handle.docId !== "number") return true;
               const tag = engine.doc_get_tag(handle.docId, handle.index!);
               if (tag === TAG_OBJECT || tag === TAG_ARRAY) {
-                const closeIdx = engine.doc_get_close_index(handle.docId, handle.index!);
+                const closeIdx = engine.doc_get_close_index(handle.docId, handle.index!) - 1;
                 const closeSrcPos = engine.doc_get_src_pos(handle.docId, closeIdx) >>> 0;
                 return closeSrcPos < autocompleteBoundary;
               }
@@ -1357,7 +1363,7 @@ export async function init(options?: {
             if (c === 0x2C || c === 0x7D || c === 0x5D || c === 0x20 || c === 0x0A || c === 0x0D || c === 0x09) {
               // Scalar ended — fire value complete for the whole span
               const scalarLen = i - ptScalarStart;
-              fireValueComplete(buf.slice(ptScalarStart, i), ptScalarStart, scalarLen);
+              fireValueComplete(buf.subarray(ptScalarStart, i), ptScalarStart, scalarLen);
               // Live doc: finalize scalar
               try { ldSetValue(JSON.parse(ldScalarAccum)); } catch { ldSetValue(null); }
               ldScalarAccum = '';
@@ -1470,7 +1476,7 @@ export async function init(options?: {
                 // Fire value complete for the string
                 const start = ptStringValueStart;
                 const len = i + 1 - start;
-                fireValueComplete(buf.slice(start, i + 1), start, len);
+                fireValueComplete(buf.subarray(start, i + 1), start, len);
                 // Live doc: final update (value already in parent from ldSetValue('') at open)
                 ldUpdateString(ldStringAccum);
                 ldStringAccum = '';
@@ -1575,7 +1581,7 @@ export async function init(options?: {
               if (ptDepth >= 0 && ptSkipDepth < 0 && !wasSkipped) {
                 const start = ptValueStartStack[ptDepth];
                 const len = i + 1 - start;
-                fireValueComplete(buf.slice(start, i + 1), start, len);
+                fireValueComplete(buf.subarray(start, i + 1), start, len);
               }
               // Restore parent context
               if (ptDepth > 0) {
@@ -1657,7 +1663,7 @@ export async function init(options?: {
               if (format === "json5" && ptExpectingKey && isJson5IdentStart(c)) {
                 let j = i + 1;
                 while (j < to && isJson5IdentPart(buf[j])) j++;
-                const key = utf8Decoder.decode(buf.slice(i, j));
+                const key = utf8Decoder.decode(buf.subarray(i, j));
                 if (ptDepth > 0) ptKeyStack[ptDepth - 1] = key;
                 ldCurrentKey = key;
                 ptExpectingKey = false;
@@ -1677,14 +1683,14 @@ export async function init(options?: {
                       j++;
                     }
                     if (j < to) {
-                      fireValueComplete(buf.slice(i, j), i, j - i);
-                      const scalarStr = utf8Decoder.decode(buf.slice(i, j));
+                      fireValueComplete(buf.subarray(i, j), i, j - i);
+                      const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
                       try { ldSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { ldSetValue(null); }
                       i = j - 1;
                     } else {
                       ptInScalar = true;
                       ptScalarStart = i;
-                      ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
+                      ldScalarAccum = utf8Decoder.decode(buf.subarray(i, to));
                       i = to;
                     }
                   }
@@ -2194,12 +2200,26 @@ export async function init(options?: {
                 default: decoded = B2C[c]; break;
               }
               ldStringAccum += decoded;
-            } else if (scanAccumulatingKey && c === 0x75) {
-              spUnicodeRemaining = 4;
-              spUnicodeAccum = 0;
-              continue;
+            } else if (scanAccumulatingKey) {
+              if (c === 0x75) {
+                spUnicodeRemaining = 4;
+                spUnicodeAccum = 0;
+                continue;
+              }
+              let keyDecoded: string;
+              switch (c) {
+                case 0x6E: keyDecoded = '\n'; break;
+                case 0x72: keyDecoded = '\r'; break;
+                case 0x74: keyDecoded = '\t'; break;
+                case 0x22: keyDecoded = '"'; break;
+                case 0x5C: keyDecoded = '\\'; break;
+                case 0x2F: keyDecoded = '/'; break;
+                case 0x62: keyDecoded = '\b'; break;
+                case 0x66: keyDecoded = '\f'; break;
+                default: keyDecoded = B2C[c]; break;
+              }
+              scanKeyAccum += keyDecoded;
             }
-            if (scanAccumulatingKey) scanKeyAccum += B2C[c];
             continue;
           }
 
@@ -2349,7 +2369,7 @@ export async function init(options?: {
               if (format === "json5" && scanExpectingKey && isJson5IdentStart(c)) {
                 let j = i + 1;
                 while (j < to && isJson5IdentPart(buf[j])) j++;
-                const key = utf8Decoder.decode(buf.slice(i, j));
+                const key = utf8Decoder.decode(buf.subarray(i, j));
                 ldCurrentKey = key;
                 if (picking && scanDepth > 0) spKeyStack[scanDepth - 1] = key;
                 scanExpectingKey = false;
@@ -2368,12 +2388,12 @@ export async function init(options?: {
                     j++;
                   }
                   if (j < to) {
-                    const hexStr = utf8Decoder.decode(buf.slice(i, j));
+                    const hexStr = utf8Decoder.decode(buf.subarray(i, j));
                     spSetValue(parseInt(hexStr, 16));
                     i = j - 1;
                   } else {
                     scanInScalar = true;
-                    ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
+                    ldScalarAccum = utf8Decoder.decode(buf.subarray(i, to));
                     i = to;
                   }
                   scanAfterColon = false;
@@ -2389,12 +2409,12 @@ export async function init(options?: {
                     j++;
                   }
                   if (j < to) {
-                    const scalarStr = utf8Decoder.decode(buf.slice(i, j));
+                    const scalarStr = utf8Decoder.decode(buf.subarray(i, j));
                     try { spSetValue(format === "json5" ? parseJson5Scalar(scalarStr) : JSON.parse(scalarStr)); } catch { spSetValue(null); }
                     i = j - 1;
                   } else {
                     scanInScalar = true;
-                    ldScalarAccum = utf8Decoder.decode(buf.slice(i, to));
+                    ldScalarAccum = utf8Decoder.decode(buf.subarray(i, to));
                     i = to;
                   }
                   scanAfterColon = false;
@@ -2661,6 +2681,9 @@ export async function init(options?: {
   };
 
   return _instance;
+
+  })();
+  return _initPromise;
 }
 
 // --- Top-level await: auto-initialize with embedded WASM ---

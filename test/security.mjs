@@ -278,5 +278,84 @@ await test("createParser: feed empty string does not crash", async () => {
   p.destroy();
 });
 
+// --- Key escape decoding in createParser live document ---
+
+await test("createParser: escaped chars in object keys decoded correctly", async () => {
+  const p = createParser();
+  p.feed('{"key\\nname":"val1","key\\ttab":"val2"}');
+  const val = p.getValue();
+  assertEqual(val["key\nname"], "val1");
+  assertEqual(val["key\ttab"], "val2");
+  p.destroy();
+});
+
+await test("createParser: backslash-escaped chars in keys via live doc", async () => {
+  const p = createParser();
+  p.feed('{"a\\/b":"slash","c\\\\"d":"bs"}');
+  // key is a/b (escaped slash) and c\ (escaped backslash) — but the second key
+  // has invalid JSON. Use a valid case instead.
+  p.destroy();
+
+  const p2 = createParser();
+  p2.feed('{"a\\/b":"slash","c\\\\d":"backslash"}');
+  const val = p2.getValue();
+  assertEqual(val["a/b"], "slash");
+  assertEqual(val["c\\d"], "backslash");
+  p2.destroy();
+});
+
+// --- Array method binding on lazy proxy arrays ---
+
+await test("parse: lazy array .map() works correctly", async () => {
+  const result = parse('[1, 2, 3, 4, 5]');
+  const arr = result.value;
+  const doubled = arr.map(x => x * 2);
+  assertEqual(doubled, [2, 4, 6, 8, 10]);
+  result.value.free();
+});
+
+await test("parse: lazy array .filter() works correctly", async () => {
+  const result = parse('[1, 2, 3, 4, 5]');
+  const arr = result.value;
+  const evens = arr.filter(x => x % 2 === 0);
+  assertEqual(evens, [2, 4]);
+  result.value.free();
+});
+
+await test("parse: lazy array .find() works correctly", async () => {
+  const result = parse('[{"id":1},{"id":2},{"id":3}]');
+  const arr = result.value;
+  const found = arr.find(x => x.id === 2);
+  assertEqual(found.id, 2);
+  result.value.free();
+});
+
+// --- isComplete on last container in document ---
+
+await test("parse: isComplete on last nested container", async () => {
+  // When the container is the last thing in the tape,
+  // isComplete should still return true for complete parses
+  const result = parse('{"a":{"b":{"c":1}}}');
+  assert(result.isComplete(result.value) === true, "root should be complete");
+  assert(result.isComplete(result.value.a) === true, "nested a should be complete");
+  assert(result.isComplete(result.value.a.b) === true, "deeply nested a.b should be complete");
+  result.value.free();
+});
+
+// --- createParser with schema-driven pick fields ---
+
+await test("createParser: schema pick fields filter correctly", async () => {
+  const schema = { shape: { name: {}, age: {} }, safeParse: (v) => ({ success: true, data: v }) };
+  const p = createParser(schema);
+  p.feed('{"name":"Alice","city":"NYC","age":30,"extra":"x"}');
+  const val = p.getValue();
+  assertEqual(val.name, "Alice");
+  assertEqual(val.age, 30);
+  // city and extra should not be present since they're not in schema
+  assertEqual(val.city, undefined);
+  assertEqual(val.extra, undefined);
+  p.destroy();
+});
+
 console.log(`\n\uD83D\uDD12 Security Tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);
