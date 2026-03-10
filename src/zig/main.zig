@@ -1199,6 +1199,8 @@ export fn autocomplete_input(ptr: [*]u8, len: u32, buf_cap: u32) u32 {
                     if (atom.len <= kw.len and std.mem.eql(u8, atom, kw[0..atom.len]))
                         break kw[atom.len..];
                 } else @as(?[]const u8, null)) |suffix| {
+                    // Write suffix immediately after atom (skip any trailing whitespace)
+                    write_pos = atom_end;
                     w.append(suffix);
                 } else if (atom.len > 0) {
                     // Strip trailing incomplete number chars iteratively:

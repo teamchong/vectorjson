@@ -236,6 +236,32 @@ test("valid sci notation not modified: 1e5", () => {
   assertEqual(r.toJSON(), { a: 100000 });
 });
 
+console.log("\n--- Partial atoms: trailing whitespace in containers ---");
+
+test("partial keyword with trailing space: {\"a\": tru ", () => {
+  const r = parse('{"a": tru ');
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), { a: true });
+});
+
+test("partial keyword 'fal' with trailing space", () => {
+  const r = parse('{"a": fal ');
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), { a: false });
+});
+
+test("partial keyword 'nu' with trailing space", () => {
+  const r = parse('{"a": nu ');
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), { a: null });
+});
+
+test("partial keyword in array with trailing space: [tru ", () => {
+  const r = parse("[tru ");
+  assertEqual(r.status, "incomplete");
+  assertEqual(r.toJSON(), [true]);
+});
+
 console.log("\n--- Partial atoms: root level ---");
 
 test("root partial 'tr' → incomplete", () => {
